@@ -22,16 +22,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: local-ai-acp-linux-amd64
+            artifact: acp-bridge-linux-amd64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: local-ai-acp-linux-arm64
+            artifact: acp-bridge-linux-arm64
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: local-ai-acp-darwin-amd64
+            artifact: acp-bridge-darwin-amd64
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: local-ai-acp-darwin-arm64
+            artifact: acp-bridge-darwin-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +54,7 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/local-ai-acp dist/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/acp-bridge dist/${{ matrix.artifact }}
           chmod +x dist/${{ matrix.artifact }}
 
       - name: Upload artifact
@@ -127,7 +127,7 @@ jobs:
           name: v${{ steps.version.outputs.version }}
           body_path: /tmp/release-notes.md
           files: |
-            dist/local-ai-acp-*
+            dist/acp-bridge-*
           generate_release_notes: ${{ steps.changelog.outputs.has_notes == 'false' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

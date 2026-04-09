@@ -8,12 +8,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [0.2.0] - 2026-04-09
 
 ### Added
-- **Structured logging** — replaced `eprintln` with `tracing`. Control verbosity via `RUST_LOG` env var (default: `local_ai_acp=info`).
+- **Structured logging** — replaced `eprintln` with `tracing`. Control verbosity via `RUST_LOG` env var (default: `acp_bridge=info`).
 - **Structured error types** — `AcpError` enum with proper JSON-RPC error codes (`-32602` invalid params, `-32001` unknown session, `-32601` method not found, `-32003` LLM error).
 - **Conversation history auto-trim** — `LLM_MAX_HISTORY_TURNS` (default 50) prevents memory growth in long sessions. System prompt is always preserved.
 - **LLM HTTP retry with exponential backoff** — transient errors (408, 429, 500-504) and connection timeouts retried up to 3 times (500ms, 1s, 2s).
 - **Graceful shutdown** — handles SIGINT/SIGTERM and stdin EOF, drains sessions cleanly.
-- **TOML config file support** — `./local-ai-acp config.toml`. Priority: env var > config file > defaults.
+- **TOML config file support** — `./acp-bridge config.toml`. Priority: env var > config file > defaults.
 - **Dockerfile** — multi-stage build, non-root user, ~15MB image.
 - **GitHub Actions CI** — `cargo check` + `cargo test` + `cargo clippy` + `cargo fmt`.
 - **Unit tests** — 14 test cases covering JSON-RPC parsing, history trimming, error codes, config loading.

@@ -1,4 +1,4 @@
-# local-ai-acp configuration
+# acp-bridge configuration
 # All values can be overridden by environment variables.
 # When spawned by openab, env vars are sufficient — this file is optional.
 

@@ -1,4 +1,4 @@
-//! local-ai-acp — Library for building ACP adapters on local AI.
+//! acp-bridge — Library for building ACP adapters on local AI.
 //!
 //! Provides:
 //! - `llm` — OpenAI-compatible streaming HTTP client

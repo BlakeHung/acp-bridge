@@ -1,19 +1,19 @@
 [package]
-name = "local-ai-acp"
+name = "acp-bridge"
 version = "0.2.0"
 edition = "2021"
 description = "ACP adapter for local AI — bridges any OpenAI-compatible API (Ollama, LocalAI, vLLM, llama.cpp, LM Studio) to Agent Client Protocol"
 license = "MIT"
-repository = "https://github.com/BlakeHung/local-ai-acp"
+repository = "https://github.com/BlakeHung/acp-bridge"
 keywords = ["acp", "ollama", "local-ai", "agent-client-protocol", "openab"]
 categories = ["command-line-utilities"]
 
 [lib]
-name = "local_ai_acp"
+name = "acp_bridge"
 path = "src/lib.rs"
 
 [[bin]]
-name = "local-ai-acp"
+name = "acp-bridge"
 path = "src/main.rs"
 
 [dependencies]

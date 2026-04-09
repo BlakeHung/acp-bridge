@@ -1,4 +1,4 @@
-use local_ai_acp::llm::LlmConfig;
+use acp_bridge::llm::LlmConfig;
 
 #[test]
 fn config_defaults() {

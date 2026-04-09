@@ -1,4 +1,4 @@
-use local_ai_acp::protocol::{AcpError, JsonRpcRequest, Session};
+use acp_bridge::protocol::{AcpError, JsonRpcRequest, Session};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------

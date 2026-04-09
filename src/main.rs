@@ -1,4 +1,4 @@
-//! local-ai-acp — ACP adapter for local AI services.
+//! acp-bridge — ACP adapter for local AI services.
 //!
 //! Bridges any OpenAI-compatible API (Ollama, LocalAI, vLLM, llama.cpp,
 //! LM Studio, text-generation-webui) to Agent Client Protocol (ACP).
@@ -8,10 +8,10 @@
 //!
 //! Compatible with openab and any ACP-compliant harness.
 
-use local_ai_acp::acp;
-use local_ai_acp::config::ConfigFile;
-use local_ai_acp::llm;
-use local_ai_acp::protocol::{AcpError, JsonRpcRequest, Session};
+use acp_bridge::acp;
+use acp_bridge::config::ConfigFile;
+use acp_bridge::llm;
+use acp_bridge::protocol::{AcpError, JsonRpcRequest, Session};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -36,7 +36,7 @@ fn handle_initialize(id: u64, config: &llm::LlmConfig) {
         id,
         json!({
             "agentInfo": {
-                "name": format!("local-ai-acp ({})", config.model),
+                "name": format!("acp-bridge ({})", config.model),
                 "version": env!("CARGO_PKG_VERSION")
             },
             "capabilities": {}
@@ -211,17 +211,17 @@ async fn main() {
     // Handle --version / -V before anything else
     if let Some(arg) = std::env::args().nth(1) {
         if arg == "--version" || arg == "-V" {
-            println!("local-ai-acp {}", env!("CARGO_PKG_VERSION"));
+            println!("acp-bridge {}", env!("CARGO_PKG_VERSION"));
             return;
         }
     }
 
     // Initialize tracing — writes to stderr, respects RUST_LOG env.
-    // Default level: info. Example: RUST_LOG=local_ai_acp=debug
+    // Default level: info. Example: RUST_LOG=acp_bridge=debug
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "local_ai_acp=info".parse().unwrap()),
+                .unwrap_or_else(|_| "acp_bridge=info".parse().unwrap()),
         )
         .with_target(true)
         .with_writer(std::io::stderr)
@@ -241,7 +241,7 @@ async fn main() {
         model = %config.model,
         base_url = %config.base_url,
         max_history_turns = config.max_history_turns,
-        "Starting local-ai-acp"
+        "Starting acp-bridge"
     );
 
     let stdin = tokio::io::stdin();
