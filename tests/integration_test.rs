@@ -95,6 +95,55 @@ async fn mock_chat_completions(req: Request<Body>) -> impl IntoResponse {
     }
 }
 
+/// Mock that sends SSE with \r\n line endings (HTTP standard).
+fn mock_llm_crlf_router() -> Router {
+    Router::new()
+        .route("/v1/models", get(mock_models))
+        .route("/v1/chat/completions", post(mock_chat_completions_crlf))
+        .route("/api/tags", get(mock_ollama_tags))
+}
+
+async fn mock_chat_completions_crlf(req: Request<Body>) -> impl IntoResponse {
+    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if stream {
+        // Use \r\n line endings instead of \n
+        let chunks = vec![
+            format!(
+                "data: {}\r\n\r\n",
+                json!({"choices":[{"delta":{"content":"CRLF"},"index":0}]})
+            ),
+            format!(
+                "data: {}\r\n\r\n",
+                json!({"choices":[{"delta":{"content":" works"},"index":0}]})
+            ),
+            "data: [DONE]\r\n\r\n".to_string(),
+        ];
+
+        let stream =
+            futures_lite::stream::iter(chunks.into_iter().map(Ok::<_, std::convert::Infallible>));
+
+        axum::response::Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+            .into_response()
+    } else {
+        axum::Json(json!({
+            "choices": [{"message": {"role": "assistant", "content": "CRLF works"}, "finish_reason": "stop"}]
+        }))
+        .into_response()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
@@ -111,6 +160,10 @@ impl TestHarness {
     }
 
     async fn start_with_router(port: u16, app: Router) -> Self {
+        Self::start_with_router_and_env(port, app, &[]).await
+    }
+
+    async fn start_with_router_and_env(port: u16, app: Router, extra_env: &[(&str, &str)]) -> Self {
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
@@ -120,8 +173,8 @@ impl TestHarness {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_acp-bridge"))
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_acp-bridge"));
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
@@ -129,9 +182,11 @@ impl TestHarness {
             .env("LLM_API_KEY", "test-key")
             .env("LLM_TIMEOUT", "10")
             .env("LLM_MAX_HISTORY_TURNS", "5")
-            .env("RUST_LOG", "acp_bridge=debug")
-            .spawn()
-            .expect("Failed to spawn acp-bridge");
+            .env("RUST_LOG", "acp_bridge=debug");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("Failed to spawn acp-bridge");
 
         let stdout = child.stdout.take().expect("stdout not available");
         let reader = BufReader::new(stdout);
@@ -506,6 +561,109 @@ async fn test_llm_error_returns_response() {
             .unwrap_or(false)
     });
     assert!(has_error_text, "Should notify error text to client");
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 2: SSE \r\n parsing
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sse_crlf_line_endings() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router(port, mock_llm_crlf_router()).await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"test"}]}
+    }));
+
+    let (notifications, response) = h.read_until_response(2);
+
+    let text_chunks: Vec<String> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|m| {
+            m["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(String::from)
+        })
+        .collect();
+    let full_text: String = text_chunks.join("");
+    assert_eq!(full_text, "CRLF works", "Should parse \\r\\n SSE correctly");
+    assert_eq!(response["result"]["status"], "completed");
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 2: max_sessions limit
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_max_sessions_limit() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_router(),
+        &[("LLM_MAX_SESSIONS", "2")],
+    )
+    .await;
+
+    // Create session 1
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    assert!(resp["result"]["sessionId"].is_string());
+
+    // Create session 2
+    h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    assert!(resp["result"]["sessionId"].is_string());
+
+    // Create session 3 — should be rejected
+    h.send(&json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    assert_eq!(
+        resp["error"]["code"], -32004,
+        "Should reject with session limit error"
+    );
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 2: temperature validation
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_nan_temperature_ignored() {
+    let port = free_port();
+    // NaN temperature should be filtered out (treated as None)
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_router(),
+        &[("LLM_TEMPERATURE", "nan")],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"test"}]}
+    }));
+    let (_, resp) = h.read_until_response(2);
+    assert_eq!(
+        resp["result"]["status"], "completed",
+        "Should work even with nan temperature"
+    );
 
     h.shutdown();
 }

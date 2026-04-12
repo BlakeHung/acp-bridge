@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
+use std::time::Instant;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -10,6 +11,21 @@ pub struct JsonRpcRequest {
 
 pub struct Session {
     pub messages: Vec<Value>,
+    /// Last activity timestamp for idle timeout.
+    pub last_active: Instant,
+}
+
+impl Session {
+    pub fn new(system_message: Value) -> Self {
+        Self {
+            messages: vec![system_message],
+            last_active: Instant::now(),
+        }
+    }
+
+    pub fn touch(&mut self) {
+        self.last_active = Instant::now();
+    }
 }
 
 impl Session {
@@ -42,6 +58,9 @@ pub enum AcpError {
 
     #[error("LLM communication error: {reason}")]
     LlmError { reason: String },
+
+    #[error("Session limit reached (max: {max})")]
+    SessionLimitReached { max: usize },
 }
 
 impl AcpError {
@@ -52,6 +71,7 @@ impl AcpError {
             AcpError::UnknownSession { .. } => -32001, // Application error
             AcpError::MethodNotFound { .. } => -32601, // Method not found
             AcpError::LlmError { .. } => -32003,       // Application error
+            AcpError::SessionLimitReached { .. } => -32004, // Application error
         }
     }
 }

@@ -15,6 +15,7 @@ use acp_bridge::protocol::{AcpError, JsonRpcRequest, Session};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -25,6 +26,45 @@ use uuid::Uuid;
 
 static SESSIONS: std::sync::LazyLock<RwLock<HashMap<String, Session>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+// ---------------------------------------------------------------------------
+// Session helpers
+// ---------------------------------------------------------------------------
+
+fn sessions_write() -> std::sync::RwLockWriteGuard<'static, HashMap<String, Session>> {
+    match SESSIONS.write() {
+        Ok(s) => s,
+        Err(p) => {
+            warn!("Session lock poisoned, recovering");
+            p.into_inner()
+        }
+    }
+}
+
+fn sessions_read() -> std::sync::RwLockReadGuard<'static, HashMap<String, Session>> {
+    match SESSIONS.read() {
+        Ok(s) => s,
+        Err(p) => {
+            warn!("Session lock poisoned, recovering");
+            p.into_inner()
+        }
+    }
+}
+
+/// Evict sessions that have been idle longer than the timeout.
+fn evict_idle_sessions(timeout_secs: u64) {
+    if timeout_secs == 0 {
+        return;
+    }
+    let timeout = Duration::from_secs(timeout_secs);
+    let mut sessions = sessions_write();
+    let before = sessions.len();
+    sessions.retain(|_id, session| session.last_active.elapsed() < timeout);
+    let evicted = before - sessions.len();
+    if evicted > 0 {
+        info!(evicted, remaining = sessions.len(), "Evicted idle sessions");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ACP method handlers
@@ -45,6 +85,18 @@ fn handle_initialize(id: u64, config: &llm::LlmConfig) {
 }
 
 fn handle_session_new(id: u64, params: &Value, config: &llm::LlmConfig) {
+    // Enforce max_sessions limit
+    if config.max_sessions > 0 {
+        let count = sessions_read().len();
+        if count >= config.max_sessions {
+            let err = AcpError::SessionLimitReached {
+                max: config.max_sessions,
+            };
+            acp::send_error(id, err.code(), &err.to_string());
+            return;
+        }
+    }
+
     let raw_cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or("/tmp");
 
     // Sanitize cwd: only allow typical path characters to prevent prompt injection.
@@ -59,20 +111,8 @@ fn handle_session_new(id: u64, params: &Value, config: &llm::LlmConfig) {
         format!("You are a helpful coding assistant. The user's working directory is: {cwd}")
     });
 
-    let session = Session {
-        messages: vec![json!({"role": "system", "content": system_prompt})],
-    };
-
-    match SESSIONS.write() {
-        Ok(mut sessions) => {
-            sessions.insert(session_id.clone(), session);
-        }
-        Err(poisoned) => {
-            warn!("Session lock was poisoned, recovering");
-            let mut sessions = poisoned.into_inner();
-            sessions.insert(session_id.clone(), session);
-        }
-    }
+    let session = Session::new(json!({"role": "system", "content": system_prompt}));
+    sessions_write().insert(session_id.clone(), session);
 
     info!(session_id = %session_id, max_history = config.max_history_turns, "New session");
     acp::send_response(id, json!({"sessionId": session_id}));
@@ -102,15 +142,9 @@ async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig)
         })
         .unwrap_or_default();
 
-    // Add user message and trim history
+    // Add user message, touch session, and trim history
     {
-        let mut sessions = match SESSIONS.write() {
-            Ok(s) => s,
-            Err(p) => {
-                warn!("Session lock poisoned, recovering");
-                p.into_inner()
-            }
-        };
+        let mut sessions = sessions_write();
         let session = match sessions.get_mut(&session_id) {
             Some(s) => s,
             None => {
@@ -121,11 +155,11 @@ async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig)
                 return;
             }
         };
+        session.touch();
         session
             .messages
             .push(json!({"role": "user", "content": user_text}));
 
-        // Trim to max_history_turns if configured
         if config.max_history_turns > 0 {
             let before = session.messages.len();
             session.trim_history(config.max_history_turns);
@@ -140,13 +174,7 @@ async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig)
     acp::notify_tool_start("llm_chat");
 
     let messages = {
-        let sessions = match SESSIONS.read() {
-            Ok(s) => s,
-            Err(p) => {
-                warn!("Session lock poisoned, recovering");
-                p.into_inner()
-            }
-        };
+        let sessions = sessions_read();
         sessions
             .get(&session_id)
             .map(|s| s.messages.clone())
@@ -183,13 +211,7 @@ async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig)
     }
 
     if !full_response.is_empty() {
-        let mut sessions = match SESSIONS.write() {
-            Ok(s) => s,
-            Err(p) => {
-                warn!("Session lock poisoned, recovering");
-                p.into_inner()
-            }
-        };
+        let mut sessions = sessions_write();
         if let Some(session) = sessions.get_mut(&session_id) {
             session
                 .messages
@@ -214,13 +236,7 @@ fn handle_session_end(id: u64, params: &Value) {
         }
     };
 
-    let removed = match SESSIONS.write() {
-        Ok(mut s) => s.remove(&session_id).is_some(),
-        Err(p) => {
-            warn!("Session lock poisoned, recovering");
-            p.into_inner().remove(&session_id).is_some()
-        }
-    };
+    let removed = sessions_write().remove(&session_id).is_some();
 
     if removed {
         info!(session_id = %session_id, "Session ended");
@@ -246,7 +262,6 @@ async fn main() {
     }
 
     // Initialize tracing — writes to stderr, respects RUST_LOG env.
-    // Default level: info. Example: RUST_LOG=acp_bridge=debug
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -270,10 +285,12 @@ async fn main() {
         model = %config.model,
         base_url = %config.base_url,
         max_history_turns = config.max_history_turns,
+        max_sessions = config.max_sessions,
+        session_idle_timeout_secs = config.session_idle_timeout_secs,
         "Starting acp-bridge"
     );
 
-    // Probe backend: check connectivity and list available models
+    // Probe backend
     match llm::probe_backend(&config).await {
         Ok(models) if models.is_empty() => {
             info!("Connected to backend (no models listed)");
@@ -299,13 +316,24 @@ async fn main() {
         }
     }
 
+    // Spawn idle session cleanup task
+    let idle_timeout = config.session_idle_timeout_secs;
+    if idle_timeout > 0 {
+        tokio::spawn(async move {
+            let interval = Duration::from_secs(idle_timeout.min(60));
+            loop {
+                tokio::time::sleep(interval).await;
+                evict_idle_sessions(idle_timeout);
+            }
+        });
+    }
+
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
 
     loop {
         tokio::select! {
-            // Read next line from stdin
             line_result = lines.next_line() => {
                 match line_result {
                     Ok(Some(line)) => {
@@ -340,7 +368,6 @@ async fn main() {
                         }
                     }
                     Ok(None) => {
-                        // stdin closed (EOF) — parent process (openab) terminated
                         info!("stdin closed, shutting down gracefully");
                         break;
                     }
@@ -350,7 +377,6 @@ async fn main() {
                     }
                 }
             }
-            // Handle SIGTERM / SIGINT for graceful shutdown
             _ = tokio::signal::ctrl_c() => {
                 info!("Received shutdown signal, exiting");
                 break;
@@ -358,19 +384,12 @@ async fn main() {
         }
     }
 
-    // Cleanup: drop all sessions
-    let session_count = match SESSIONS.write() {
-        Ok(mut s) => {
-            let n = s.len();
-            s.clear();
-            n
-        }
-        Err(p) => {
-            let mut s = p.into_inner();
-            let n = s.len();
-            s.clear();
-            n
-        }
+    // Cleanup
+    let session_count = {
+        let mut s = sessions_write();
+        let n = s.len();
+        s.clear();
+        n
     };
     if session_count > 0 {
         info!(sessions = session_count, "Cleaned up sessions on exit");

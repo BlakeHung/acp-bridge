@@ -11,10 +11,7 @@ use tracing::{debug, error, info, warn};
 /// Returns Ok(model_list) on success, Err(reason) on failure.
 /// Non-fatal — callers should log the result but not abort.
 pub async fn probe_backend(config: &LlmConfig) -> Result<Vec<String>, String> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let client = &config.client;
 
     // Try Ollama-native /api/tags first (works on localhost:11434)
     let base = config
@@ -80,10 +77,27 @@ pub struct LlmConfig {
     pub timeout_secs: u64,
     /// Maximum conversation turns to keep (0 = unlimited).
     pub max_history_turns: usize,
+    /// Maximum number of concurrent sessions (0 = unlimited).
+    pub max_sessions: usize,
+    /// Session idle timeout in seconds (0 = no timeout).
+    pub session_idle_timeout_secs: u64,
+    /// Shared HTTP client for connection pooling.
+    pub client: Client,
 }
 
 impl LlmConfig {
     pub fn from_env() -> Self {
+        let timeout_secs = std::env::var("LLM_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("Failed to create HTTP client");
+
         Self {
             base_url: std::env::var("LLM_BASE_URL")
                 .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
@@ -96,18 +110,25 @@ impl LlmConfig {
                 .unwrap_or_else(|_| "local-ai".into()),
             temperature: std::env::var("LLM_TEMPERATURE")
                 .ok()
-                .and_then(|v| v.parse().ok()),
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|t| t.is_finite()),
             max_tokens: std::env::var("LLM_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok()),
-            timeout_secs: std::env::var("LLM_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+            timeout_secs,
             max_history_turns: std::env::var("LLM_MAX_HISTORY_TURNS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
+            max_sessions: std::env::var("LLM_MAX_SESSIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            session_idle_timeout_secs: std::env::var("LLM_SESSION_IDLE_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            client,
         }
     }
 }
@@ -138,7 +159,8 @@ fn build_body(
         "stream": stream,
     });
     if let Some(temp) = config.temperature {
-        body["temperature"] = json!(temp);
+        // Clamp to valid OpenAI range 0.0–2.0
+        body["temperature"] = json!(temp.clamp(0.0, 2.0));
     }
     if let Some(max) = config.max_tokens {
         body["max_tokens"] = json!(max);
@@ -158,10 +180,7 @@ pub async fn chat(
 ) -> Result<Value, String> {
     let url = format!("{}/chat/completions", config.base_url);
     let model = model_override.unwrap_or(&config.model);
-    let client = Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let client = &config.client;
 
     let body = build_body(config, messages, model, false, tools);
 
@@ -228,10 +247,7 @@ pub async fn stream_chat(
 ) -> Result<mpsc::Receiver<StreamChunk>, String> {
     let url = format!("{}/chat/completions", config.base_url);
     let model = model_override.unwrap_or(&config.model);
-    let client = Client::builder()
-        .timeout(Duration::from_secs(config.timeout_secs))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let client = &config.client;
 
     let body = build_body(config, messages, model, true, None);
 
@@ -315,9 +331,16 @@ pub async fn stream_chat(
                     }
                     buffer.push_str(&chunk_str);
 
-                    while let Some(newline_pos) = buffer.find('\n') {
-                        let line = buffer[..newline_pos].trim().to_string();
-                        buffer = buffer[newline_pos + 1..].to_string();
+                    // Handle both \r\n (HTTP standard) and \n line endings.
+                    while let Some(newline_pos) = buffer.find('\n').or_else(|| buffer.find('\r')) {
+                        let line = buffer[..newline_pos].trim_end().to_string();
+                        // Skip past \r\n or \n
+                        let skip = if buffer[newline_pos..].starts_with("\r\n") {
+                            2
+                        } else {
+                            1
+                        };
+                        buffer = buffer[newline_pos + skip..].to_string();
 
                         if line.is_empty() || !line.starts_with("data: ") {
                             continue;
