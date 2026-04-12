@@ -9,6 +9,8 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::llm::LlmConfig;
+use reqwest::Client;
+use std::time::Duration;
 
 /// On-disk config file structure.
 #[derive(Debug, Deserialize, Default)]
@@ -27,6 +29,8 @@ pub struct LlmSection {
     pub max_tokens: Option<u64>,
     pub timeout_secs: Option<u64>,
     pub max_history_turns: Option<usize>,
+    pub max_sessions: Option<usize>,
+    pub session_idle_timeout_secs: Option<u64>,
 }
 
 impl ConfigFile {
@@ -72,8 +76,9 @@ impl ConfigFile {
 
         let temperature = std::env::var("LLM_TEMPERATURE")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .or(file.temperature);
+            .and_then(|v| v.parse::<f64>().ok())
+            .or(file.temperature)
+            .filter(|t| t.is_finite());
 
         let max_tokens = std::env::var("LLM_MAX_TOKENS")
             .ok()
@@ -92,6 +97,24 @@ impl ConfigFile {
             .or(file.max_history_turns)
             .unwrap_or(50);
 
+        let max_sessions = std::env::var("LLM_MAX_SESSIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.max_sessions)
+            .unwrap_or(0);
+
+        let session_idle_timeout_secs = std::env::var("LLM_SESSION_IDLE_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.session_idle_timeout_secs)
+            .unwrap_or(0);
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("Failed to create HTTP client");
+
         LlmConfig {
             base_url,
             model,
@@ -100,6 +123,9 @@ impl ConfigFile {
             max_tokens,
             timeout_secs,
             max_history_turns,
+            max_sessions,
+            session_idle_timeout_secs,
+            client,
         }
     }
 }

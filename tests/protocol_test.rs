@@ -36,35 +36,39 @@ fn parse_session_prompt_request() {
 // Session history trimming
 // ---------------------------------------------------------------------------
 
+fn make_session(messages: Vec<serde_json::Value>) -> Session {
+    let mut session = Session::new(messages[0].clone());
+    for msg in &messages[1..] {
+        session.messages.push(msg.clone());
+    }
+    session
+}
+
 #[test]
 fn trim_history_no_op_when_under_limit() {
-    let mut session = Session {
-        messages: vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hi"}),
-            json!({"role": "assistant", "content": "hello"}),
-        ],
-    };
+    let mut session = make_session(vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "hello"}),
+    ]);
     session.trim_history(5); // max 5 turns = 10 messages + system
     assert_eq!(session.messages.len(), 3);
 }
 
 #[test]
 fn trim_history_keeps_system_and_last_n_turns() {
-    let mut session = Session {
-        messages: vec![
-            json!({"role": "system", "content": "sys"}),
-            // Turn 1
-            json!({"role": "user", "content": "q1"}),
-            json!({"role": "assistant", "content": "a1"}),
-            // Turn 2
-            json!({"role": "user", "content": "q2"}),
-            json!({"role": "assistant", "content": "a2"}),
-            // Turn 3
-            json!({"role": "user", "content": "q3"}),
-            json!({"role": "assistant", "content": "a3"}),
-        ],
-    };
+    let mut session = make_session(vec![
+        json!({"role": "system", "content": "sys"}),
+        // Turn 1
+        json!({"role": "user", "content": "q1"}),
+        json!({"role": "assistant", "content": "a1"}),
+        // Turn 2
+        json!({"role": "user", "content": "q2"}),
+        json!({"role": "assistant", "content": "a2"}),
+        // Turn 3
+        json!({"role": "user", "content": "q3"}),
+        json!({"role": "assistant", "content": "a3"}),
+    ]);
     session.trim_history(2); // keep last 2 turns
 
     assert_eq!(session.messages.len(), 5); // system + 2 turns
@@ -77,13 +81,11 @@ fn trim_history_keeps_system_and_last_n_turns() {
 
 #[test]
 fn trim_history_exactly_at_limit() {
-    let mut session = Session {
-        messages: vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "q1"}),
-            json!({"role": "assistant", "content": "a1"}),
-        ],
-    };
+    let mut session = make_session(vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "q1"}),
+        json!({"role": "assistant", "content": "a1"}),
+    ]);
     session.trim_history(1); // max 1 turn = exactly what we have
     assert_eq!(session.messages.len(), 3);
 }
@@ -95,7 +97,7 @@ fn trim_history_large_conversation() {
         messages.push(json!({"role": "user", "content": format!("q{i}")}));
         messages.push(json!({"role": "assistant", "content": format!("a{i}")}));
     }
-    let mut session = Session { messages };
+    let mut session = make_session(messages);
     session.trim_history(10);
 
     // system + 10 turns (20 messages) = 21
@@ -104,6 +106,20 @@ fn trim_history_large_conversation() {
     // Last turn should be q99/a99
     assert_eq!(session.messages[19]["content"], "q99");
     assert_eq!(session.messages[20]["content"], "a99");
+}
+
+// ---------------------------------------------------------------------------
+// Session touch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_touch_updates_last_active() {
+    let session = Session::new(json!({"role": "system", "content": "sys"}));
+    let first = session.last_active;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let mut session = session;
+    session.touch();
+    assert!(session.last_active > first);
 }
 
 // ---------------------------------------------------------------------------
@@ -132,4 +148,8 @@ fn acp_error_codes() {
         reason: "timeout".into(),
     };
     assert_eq!(llm.code(), -32003);
+
+    let limit = AcpError::SessionLimitReached { max: 10 };
+    assert_eq!(limit.code(), -32004);
+    assert!(limit.to_string().contains("10"));
 }

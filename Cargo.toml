@@ -1,6 +1,6 @@
 [package]
 name = "acp-bridge"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "ACP adapter for local AI — bridges any OpenAI-compatible API (Ollama, LocalAI, vLLM, llama.cpp, LM Studio) to Agent Client Protocol"
 license = "MIT"
