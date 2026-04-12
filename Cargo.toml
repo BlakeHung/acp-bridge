@@ -30,3 +30,6 @@ toml = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
+axum = "0.8"
+hyper = "1"
+futures-lite = "2"

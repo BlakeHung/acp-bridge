@@ -45,11 +45,16 @@ fn handle_initialize(id: u64, config: &llm::LlmConfig) {
 }
 
 fn handle_session_new(id: u64, params: &Value, config: &llm::LlmConfig) {
-    let cwd = params
+    let raw_cwd = params
         .get("cwd")
         .and_then(|v| v.as_str())
-        .unwrap_or("/tmp")
-        .to_string();
+        .unwrap_or("/tmp");
+
+    // Sanitize cwd: only allow typical path characters to prevent prompt injection.
+    let cwd: String = raw_cwd
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ' ' | '~'))
+        .collect();
 
     let session_id = Uuid::new_v4().to_string();
 
@@ -152,6 +157,7 @@ async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig)
     };
 
     let mut full_response = String::new();
+    let mut had_error = false;
 
     match llm::stream_chat(config, &messages, None).await {
         Ok(mut rx) => {
@@ -164,6 +170,8 @@ async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig)
                     llm::StreamChunk::Error(err) => {
                         error!(error = %err, "Stream error from LLM");
                         acp::notify_text(&format!("\n\n**Error:** {err}\n"));
+                        had_error = true;
+                        break;
                     }
                     llm::StreamChunk::Done => break,
                 }
@@ -173,9 +181,7 @@ async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig)
             let err = AcpError::LlmError { reason: e };
             error!(error = %err, "LLM communication failed");
             acp::notify_text(&format!("\n\n**Error:** {err}\n"));
-            acp::notify_tool_done("llm_chat", "failed");
-            acp::send_response(id, json!({"status": "completed"}));
-            return;
+            had_error = true;
         }
     }
 
@@ -194,8 +200,9 @@ async fn handle_session_prompt(id: u64, params: &Value, config: &llm::LlmConfig)
         }
     }
 
-    acp::notify_tool_done("llm_chat", "completed");
-    acp::send_response(id, json!({"status": "completed"}));
+    let status = if had_error { "failed" } else { "completed" };
+    acp::notify_tool_done("llm_chat", status);
+    acp::send_response(id, json!({"status": status}));
 }
 
 fn handle_session_end(id: u64, params: &Value) {

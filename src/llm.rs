@@ -295,12 +295,20 @@ pub async fn stream_chat(
     tokio::spawn(async move {
         let mut response = response;
         let mut buffer = String::new();
+        /// Maximum stream buffer size (10 MB) to prevent unbounded memory growth.
+        const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 
         loop {
             let chunk_result: Result<Option<bytes::Bytes>, reqwest::Error> = response.chunk().await;
             match chunk_result {
                 Ok(Some(bytes)) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    let chunk_str = String::from_utf8_lossy(&bytes);
+                    if buffer.len() + chunk_str.len() > MAX_BUFFER_SIZE {
+                        error!("Stream buffer exceeded {}MB limit, aborting", MAX_BUFFER_SIZE / 1024 / 1024);
+                        let _ = tx.send(StreamChunk::Error("Stream buffer overflow".into())).await;
+                        return;
+                    }
+                    buffer.push_str(&chunk_str);
 
                     while let Some(newline_pos) = buffer.find('\n') {
                         let line = buffer[..newline_pos].trim().to_string();
