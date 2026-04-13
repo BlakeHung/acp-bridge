@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-13
+
+### Added
+- **Session limits** — `LLM_MAX_SESSIONS` env var to cap concurrent sessions (default 0 = unlimited). Returns JSON-RPC error `-32004` when limit is reached.
+- **Session idle timeout** — `LLM_SESSION_IDLE_TIMEOUT` env var to auto-evict idle sessions after N seconds (default 0 = disabled). Background task periodically cleans up.
+- **HTTP connection pooling** — reuses a shared `reqwest::Client` across all requests, reducing TCP/TLS handshake overhead.
+- **Security and Limitations sections in README**.
+
+### Fixed
+- **SSE `\r\n` parsing** — handles both `\r\n` (HTTP standard) and `\n` line endings, fixing silent message loss with some LLM backends.
+- **Temperature validation** — clamped to valid 0.0–2.0 range; NaN/Infinity values are filtered out.
+
+### Changed
+- Session state tracks `last_active` timestamp for idle timeout support.
+- Session access refactored into `sessions_read()` / `sessions_write()` helpers.
+- `Session::new()` constructor replaces direct struct initialization.
+
+## [0.2.1] - 2026-04-12
+
+### Fixed
+- **CWD prompt injection** — `cwd` parameter in `session/new` is now sanitized to only allow typical path characters, preventing prompt injection attacks.
+- **Missing JSON-RPC response on LLM failure** — stream errors and connection failures now always send a JSON-RPC response with `status: "failed"`, preventing client hangs.
+- **Unbounded stream buffer** — SSE stream buffer capped at 10MB to prevent OOM from malicious or buggy backends.
+- **Flaky env var tests** — config tests now use a mutex to prevent parallel test pollution.
+
+### Added
+- **Integration test suite** — 14 tests with a mock LLM server covering the full stdin/stdout JSON-RPC pipeline.
+
 ## [0.2.0] - 2026-04-09
 
 ### Added

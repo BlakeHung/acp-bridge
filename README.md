@@ -126,6 +126,8 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_MAX_TOKENS` | (model default) | Maximum tokens to generate |
 | `LLM_TIMEOUT` | `300` | HTTP request timeout in seconds |
 | `LLM_MAX_HISTORY_TURNS` | `50` | Max conversation turns to keep (0 = unlimited) |
+| `LLM_MAX_SESSIONS` | `0` | Max concurrent sessions (0 = unlimited) |
+| `LLM_SESSION_IDLE_TIMEOUT` | `0` | Evict idle sessions after N seconds (0 = disabled) |
 | `RUST_LOG` | `acp_bridge=info` | Log level (`debug`, `info`, `warn`, `error`) |
 
 Also supports `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_API_KEY` as aliases.
@@ -265,7 +267,23 @@ When spawned by openab, logs go to the child process's stderr. To capture them, 
 - **Retry with exponential backoff** — transient errors (408, 429, 500, 502, 503, 504) and connection timeouts are retried up to 3 times with exponential backoff (500ms, 1s, 2s)
 - **Graceful shutdown** — handles SIGINT/SIGTERM and stdin EOF cleanly, drains in-flight requests
 - **Memory-bounded sessions** — conversation history auto-trims to `LLM_MAX_HISTORY_TURNS` (default 50 turns), preventing OOM in long sessions
+- **Session limits** — configurable `LLM_MAX_SESSIONS` to cap concurrent sessions, and `LLM_SESSION_IDLE_TIMEOUT` to auto-evict idle sessions
+- **Stream buffer cap** — SSE stream buffer capped at 10MB to prevent unbounded memory growth from malicious or buggy backends
+- **HTTP connection pooling** — reuses a shared HTTP client across all requests, reducing TCP/TLS handshake overhead
+- **Robust SSE parsing** — handles both `\r\n` (HTTP standard) and `\n` line endings
 - **Poison recovery** — RwLock poisoning is handled gracefully instead of panicking
+
+## Security
+
+- **CWD sanitization** — the `cwd` parameter in `session/new` is sanitized to prevent prompt injection attacks
+- **Temperature validation** — clamped to valid 0.0–2.0 range; NaN/Infinity values are filtered
+- **Error response guarantee** — JSON-RPC response is always sent even when the LLM backend fails, preventing client hangs
+
+## Limitations
+
+- No authentication or authorization — intended to run behind a trusted harness (openab, Zed)
+- No persistent storage — all state is in-memory, lost on restart
+- Single-process — not designed for horizontal scaling
 
 ## License
 
