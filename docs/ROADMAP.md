@@ -7,22 +7,41 @@
 
 ---
 
+## 背景
+
+```
+  Ollama 在 2026 年開始往雲端發展 (Ollama Cloud + GLM-5.1 on Blackwell)
+  同時開放更多整合生態。
+
+  我們從 openab 社群開發中發現地端 AI 的缺口，做了 acp-bridge
+  填補「local LLM → agent protocol」這段最後一哩路。
+
+  現在 Ollama 自己也要做這塊了 —
+  我們已經準備好了，acp-bridge + openab 的串接已驗證可用。
+  是時候讓 Ollama 知道我們存在。
+```
+
+---
+
 ## 全局時間軸
 
 ```
-  現在 (v0.3.0)                          你在這裡 ★
+  v0.1.0  初始版本
+  v0.2.0  結構化 logging / retry / graceful shutdown
+  v0.2.1  ✅ Sprint 1 — 安全性修復 (CWD injection, error response, buffer cap)
+  v0.3.0  ✅ Sprint 2 — 穩定性改善 (SSE parsing, connection pool, session TTL)
+  v0.4.0  ✅ Phase 1 — Ollama 原生整合 (/api/chat, /api/show, /api/ps)
     │
-    ├─ Phase 1: Ollama 原生整合 (v0.4.0)     ~1 週
-    │   └─ 目標: "不只是 OpenAI compatible，是 Ollama 原生"
+    │                                        你在這裡 ★
     │
-    ├─ Wave 1 宣傳                           Phase 1 完成後
+    ├─ Wave 1 宣傳                           現在開始
     │   └─ 目標: "讓人知道你存在"
     │
     ├─ Phase 2: MCP Server 模式 (v0.5.0)     ~2 週
-    │   └─ 目標: "Ollama model 變成 MCP tool"
+    │   └─ 目標: "Ollama model 變成 MCP tool，能讀檔案"
     │
     ├─ Wave 2 宣傳                           Phase 2 完成後
-    │   └─ 目標: "直接跟 Ollama 社群對話"
+    │   └─ 目標: "直接跟 Ollama 社群對話，提 PR 到 integrations"
     │
     ├─ Phase 3: A2A 遷移 (v0.6.0)           ~2 週
     │   └─ 目標: "跟上標準，ACP → A2A"
@@ -33,7 +52,7 @@
 
 ---
 
-## Phase 1: Ollama 原生整合 (v0.4.0)
+## Phase 1: Ollama 原生整合 (v0.4.0) ✅ 已完成
 
 ### 為什麼要做
 
@@ -118,12 +137,13 @@
 ### 完成標準
 
 ```
-  [ ] cargo test 全過 (含新的 Ollama native tests)
-  [ ] cargo fmt + clippy 乾淨
-  [ ] CHANGELOG 更新
-  [ ] README 更新 (Ollama native 說明)
-  [ ] cargo publish 到 crates.io
-  [ ] PR → merge → v0.4.0 tag + GitHub Release
+  [x] cargo test 全過 (38 tests, 含 3 個 Ollama native tests)
+  [x] cargo fmt + clippy 乾淨
+  [x] CHANGELOG 更新
+  [x] README 更新 (Ollama native 說明)
+  [x] PR #3 → merge → v0.4.0 tag + GitHub Release
+  [x] 手動測試: openab + acp-bridge + Ollama native mode 串接驗證
+  [ ] cargo publish 到 crates.io (待執行)
 ```
 
 ---
