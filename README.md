@@ -234,6 +234,18 @@ command = "acp-bridge"
 env = { LLM_MODEL = "gemma4:26b" }
 ```
 
+## Built-in tools
+
+When the LLM supports function calling (Ollama with compatible models, OpenAI-compatible APIs), acp-bridge provides built-in tools that let the LLM interact with your local filesystem:
+
+| Tool | Description | Limits |
+|------|-------------|--------|
+| `read_file` | Read file contents | Max 1MB, sandboxed to working dir |
+| `list_dir` | List directory tree | Max depth 3, max 200 entries |
+| `search_code` | Grep for patterns | Max 50 matches |
+
+All tools are **sandboxed** to the session's working directory — the LLM cannot access files outside it.
+
 ## ACP protocol support
 
 | Method | Status |

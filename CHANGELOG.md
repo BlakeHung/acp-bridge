@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-14
+
+### Added
+- **Built-in tools** — LLM can now call tools to interact with the local filesystem:
+  - `read_file`: read file contents (max 1MB, sandboxed to working directory)
+  - `list_dir`: list directory tree (max depth 3, max 200 entries)
+  - `search_code`: grep for patterns in source files (max 50 matches)
+- **Tool call loop** — when LLM requests tool calls, acp-bridge executes them locally and feeds results back, up to 5 rounds.
+- **Security sandbox** — all tool paths are canonicalized and validated against the working directory. Symlink traversal, path escape (`../`), and oversized files are blocked.
+- **5 new integration tests** — tool call round-trip, sandbox escape prevention, read_file, search_code, unknown tool handling.
+
+### Changed
+- `session/prompt` now sends tool definitions to the LLM and handles tool call responses via non-streaming `chat()`.
+- Session stores `working_dir` for tool sandboxing.
+- Streaming is used for final text response; tool call detection uses non-streaming for reliability.
+
 ## [0.4.0] - 2026-04-14
 
 ### Added

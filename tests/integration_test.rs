@@ -3,7 +3,7 @@
 
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{Request, State},
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -876,4 +878,196 @@ async fn test_ollama_openai_compat_still_works() {
     assert_eq!(response["result"]["status"], "completed");
 
     h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Tool calling mocks and tests
+// ---------------------------------------------------------------------------
+
+/// Mock LLM that returns a tool_call on first request, then text on second.
+/// Uses OpenAI-compatible format (non-streaming for tool calls).
+fn mock_llm_tool_call_router() -> Router {
+    let call_count = Arc::new(AtomicUsize::new(0));
+    Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(mock_chat_completions_with_tools),
+        )
+        .route("/api/tags", get(mock_ollama_tags))
+        .with_state(call_count)
+}
+
+async fn mock_chat_completions_with_tools(
+    State(call_count): State<Arc<AtomicUsize>>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    let count = call_count.fetch_add(1, Ordering::SeqCst);
+
+    // Check if messages contain a tool result
+    let has_tool_result = body["messages"]
+        .as_array()
+        .map(|msgs| msgs.iter().any(|m| m["role"] == "tool"))
+        .unwrap_or(false);
+
+    if count == 0 && !has_tool_result {
+        // First call: return a tool_call for list_dir
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "list_dir",
+                            "arguments": "{\"path\": \".\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .into_response()
+    } else {
+        // Second call (after tool result): return text
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "I can see the project structure. It looks like a Rust project."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .into_response()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_call_list_dir() {
+    let port = free_port();
+    // Use /tmp as working dir since it always exists
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_tool_call_router(),
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    // Create session with a real directory as cwd
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Send prompt that will trigger tool call
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"show me the project structure"}]}
+    }));
+
+    let (notifications, response) = h.read_until_response(2);
+
+    // Should have tool_call notifications (list_dir)
+    let tool_notifications: Vec<&Value> = notifications
+        .iter()
+        .filter(|m| {
+            let update = &m["params"]["update"]["sessionUpdate"];
+            update == "tool_call" || update == "tool_call_update"
+        })
+        .collect();
+    assert!(
+        !tool_notifications.is_empty(),
+        "Should have tool call notifications"
+    );
+
+    // Should have text response from LLM after tool execution
+    let text_chunks: Vec<String> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|m| {
+            m["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(String::from)
+        })
+        .collect();
+    let full_text: String = text_chunks.join("");
+    assert!(
+        full_text.contains("Rust project"),
+        "Should get final text response after tool call, got: {full_text}"
+    );
+
+    assert_eq!(response["result"]["status"], "completed");
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_sandbox_prevents_escape() {
+    // Test that tools can't read outside working directory
+    use acp_bridge::tools;
+    use std::path::Path;
+
+    let result = tools::execute_tool(
+        Path::new("/tmp"),
+        "read_file",
+        &json!({"path": "../../etc/passwd"}),
+    );
+    assert!(
+        result.contains("Error") || result.contains("outside"),
+        "Should reject path traversal, got: {result}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_read_file() {
+    use acp_bridge::tools;
+
+    // Create a temp file to read
+    let dir = std::env::temp_dir().join("acp-bridge-test-tools");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("test.txt"), "hello from test file").unwrap();
+
+    let result = tools::execute_tool(&dir, "read_file", &json!({"path": "test.txt"}));
+    assert_eq!(result, "hello from test file");
+
+    // Cleanup
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_search_code() {
+    use acp_bridge::tools;
+
+    let dir = std::env::temp_dir().join("acp-bridge-test-search");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("main.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    )
+    .unwrap();
+
+    let result = tools::execute_tool(&dir, "search_code", &json!({"pattern": "println"}));
+    assert!(
+        result.contains("main.rs") && result.contains("println"),
+        "Should find pattern in file, got: {result}"
+    );
+
+    // Cleanup
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_unknown() {
+    use acp_bridge::tools;
+    use std::path::Path;
+
+    let result = tools::execute_tool(Path::new("/tmp"), "hack_the_planet", &json!({}));
+    assert!(result.contains("Unknown tool"));
 }
