@@ -5,7 +5,7 @@ edition = "2021"
 description = "ACP adapter for local AI — bridges any OpenAI-compatible API (Ollama, LocalAI, vLLM, llama.cpp, LM Studio) to Agent Client Protocol"
 license = "MIT"
 repository = "https://github.com/BlakeHung/acp-bridge"
-keywords = ["acp", "ollama", "local-ai", "agent-client-protocol", "openab"]
+keywords = ["acp", "ollama", "local-ai", "agent-protocol", "openab"]
 categories = ["command-line-utilities"]
 
 [lib]
