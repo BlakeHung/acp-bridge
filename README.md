@@ -1,16 +1,72 @@
 # ACP-Bridge
 
-ACP ([Agent Client Protocol](https://agentclientprotocol.com)) adapter for **local AI** — bridges any OpenAI-compatible API to ACP-compliant harnesses like [openab](https://github.com/openabdev/openab), Zed, and JetBrains IDEs.
+ACP ([Agent Client Protocol](https://agentclientprotocol.com)) adapter for **self-hosted AI** — the zero-cloud, zero-dependency bridge for air-gapped and enterprise environments.
+
+When OpenCode can't reach the internet, acp-bridge can still run.
 
 Written in Rust. Single ~5MB binary. Zero runtime dependencies. Fully offline.
 
-## Why
+## Project status — feature-complete at v0.7
 
-- **Zero API cost** — all inference runs on your hardware
-- **Data never leaves your network** — code, prompts, responses stay local
-- **One binary, any backend** — Ollama, vLLM, LocalAI, llama.cpp, LM Studio, and more
+acp-bridge is in **maintenance mode**. The protocol surface (ACP server + client/orchestrator modes), backend coverage (Ollama native + OpenAI-compatible: vLLM, llama.cpp, LocalAI, LM Studio, TGI, Jan, Tabby), and security model (sandboxed read-only tools, no outbound network beyond the configured LLM endpoint) are considered **complete for the air-gapped / self-hosted use case**.
+
+Future updates are limited to:
+
+- Security fixes
+- ACP spec compatibility (when the upstream protocol evolves)
+- Critical bug fixes
+
+**No new features are planned.** This is deliberate — see "Relationship to OpenCode" below.
+
+## Relationship to OpenCode
+
+[OpenCode](https://opencode.ai) now supports ACP natively via the `acp` subcommand and ships with the Vercel AI SDK supporting 75+ providers (Ollama Cloud, OpenAI, Anthropic, AWS Bedrock, GitHub Copilot, Groq, OpenRouter, …). For the **cloud-leaning** use case — bring your own provider, full agent toolkit, marketplace, OAuth flow — OpenCode is the right tool.
+
+acp-bridge stays focused on what OpenCode structurally cannot do as a Node.js product with daily releases and a phone-home update path:
+
+| Concern | OpenCode | acp-bridge |
+|---------|----------|-----------|
+| Provider breadth | **75+ via AI SDK** | OpenAI-compatible only (+ Ollama native) |
+| Built-in toolkit | Full agent (edit, shell, web) | 3 sandboxed read-only tools (`read_file`, `list_dir`, `search_code`) |
+| Tool authorization | `--trust-all-tools` equivalent | Structurally read-only, cannot escalate |
+| Network footprint | binary may check updates / OAuth / marketplace | Outbound only to the configured LLM endpoint |
+| Runtime | Node.js + npm | Single 5MB static Rust binary |
+| Release cadence | Often daily | Stable, security-fix only |
+| Air-gap audit | Requires confirmation per release | Binary is small enough to audit once |
+
+**Use OpenCode when** you want a complete agent with broad provider choice. **Use acp-bridge when** the deployment requires a fully offline, minimal-attack-surface, audit-friendly bridge — air-gapped sites, regulated industries, edge / embedded ACP harnesses, CI runners with strict egress policies.
+
+The two projects are complementary, not competing. See [When to use acp-bridge vs OpenCode](#when-to-use-acp-bridge-vs-opencode) below for a per-scenario breakdown.
+
+## Why acp-bridge
+
+```
+OpenCode, Claude Code, Codex CLI — 都需要連外網拿 API key 或 cloud model。
+acp-bridge 解決的是「不能連外」或「不想連外」的場景。
+```
+
+- **Air-gapped / 內網部署** — 資料不出機器，適合合規要求嚴格的企業環境
+- **Zero cloud dependency** — 所有推論跑在你的硬體上，不需要 API key
+- **Special backends** — vLLM, llama.cpp, TGI 等 OpenCode 不直接支援的推論引擎
 - **Ollama native integration** — auto-detects Ollama and uses native `/api/chat` with NDJSON streaming, model info query, and VRAM status check
+- **Embeddable** — 5MB binary，可嵌入 Docker Compose, CI/CD pipeline, 或任何 ACP harness
 - **Enterprise-ready** — structured logging, retry with backoff, graceful shutdown, configurable history limits
+
+## When to use acp-bridge vs OpenCode
+
+```
+┌──────────────────────────┬──────────────┬──────────────┐
+│ 場景                      │ OpenCode     │ acp-bridge   │
+├──────────────────────────┼──────────────┼──────────────┤
+│ 有網路 + Ollama Cloud    │ ✓ 首選       │ 可以但沒必要  │
+│ 有網路 + Claude/GPT API  │ ✓ 首選       │ ✗            │
+│ 內網 + Ollama local      │ 可以         │ ✓ 首選       │
+│ Air-gapped 環境          │ ✗            │ ✓ 唯一選擇   │
+│ vLLM / TGI / llama.cpp   │ ✗            │ ✓ 唯一選擇   │
+│ Docker Compose 嵌入      │ 可以但偏重    │ ✓ 5MB binary │
+│ 合規：資料不能出內網      │ 需自行確認    │ ✓ 保證離線   │
+└──────────────────────────┴──────────────┴──────────────┘
+```
 
 ## Architecture
 
@@ -185,6 +241,28 @@ Team member B ──┤── Discord ──▶ openab ──▶ acp-bridge ─�
 Team member C ──┘                          (your machine)
 ```
 
+### Multi-agent with OpenCode
+
+openab supports spawning different agents per channel. Combine acp-bridge (local/sensitive) with OpenCode (cloud) for the best of both worlds:
+
+```
+Discord → openab ─┬─▶ OpenCode     (cloud tasks, Ollama Cloud)
+                   │
+                   └─▶ acp-bridge   (local/sensitive tasks, internal GPU)
+```
+
+```toml
+# config-cloud.toml — general dev (OpenCode + Ollama Cloud)
+[agent]
+command = "opencode"
+args = ["acp"]
+
+# config-secure.toml — sensitive projects (acp-bridge + internal GPU)
+[agent]
+command = "acp-bridge"
+env = { LLM_BASE_URL = "http://internal-gpu:11434", LLM_MODEL = "qwen2.5:32b" }
+```
+
 ### Setup
 
 ```bash
@@ -216,22 +294,6 @@ EOF
 # 4. Run openab
 export DISCORD_BOT_TOKEN="your-token"
 cargo run -- config.toml
-```
-
-### Multi-bot setup
-
-Run multiple Discord bots with different models:
-
-```toml
-# config-coder.toml — fast coding model
-[agent]
-command = "acp-bridge"
-env = { LLM_MODEL = "qwen2.5:32b" }
-
-# config-reviewer.toml — analytical model
-[agent]
-command = "acp-bridge"
-env = { LLM_MODEL = "gemma4:26b" }
 ```
 
 ## Built-in tools
