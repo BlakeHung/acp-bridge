@@ -41,31 +41,31 @@ The two projects are complementary, not competing. See [When to use acp-bridge v
 ## Why acp-bridge
 
 ```
-OpenCode, Claude Code, Codex CLI — 都需要連外網拿 API key 或 cloud model。
-acp-bridge 解決的是「不能連外」或「不想連外」的場景。
+OpenCode, Claude Code, Codex CLI — all need internet access for API keys or cloud models.
+acp-bridge addresses the "can't go online" and "won't go online" cases.
 ```
 
-- **Air-gapped / 內網部署** — 資料不出機器，適合合規要求嚴格的企業環境
-- **Zero cloud dependency** — 所有推論跑在你的硬體上，不需要 API key
-- **Special backends** — vLLM, llama.cpp, TGI 等 OpenCode 不直接支援的推論引擎
+- **Air-gapped / internal deployment** — data never leaves the machine; suitable for strict-compliance enterprise environments
+- **Zero cloud dependency** — all inference runs on your hardware, no API key required
+- **Special backends** — vLLM, llama.cpp, TGI, and other inference engines OpenCode doesn't directly support
 - **Ollama native integration** — auto-detects Ollama and uses native `/api/chat` with NDJSON streaming, model info query, and VRAM status check
-- **Embeddable** — 5MB binary，可嵌入 Docker Compose, CI/CD pipeline, 或任何 ACP harness
+- **Embeddable** — 5MB binary; drop into Docker Compose, CI/CD pipelines, or any ACP harness
 - **Enterprise-ready** — structured logging, retry with backoff, graceful shutdown, configurable history limits
 
 ## When to use acp-bridge vs OpenCode
 
 ```
-┌──────────────────────────┬──────────────┬──────────────┐
-│ 場景                      │ OpenCode     │ acp-bridge   │
-├──────────────────────────┼──────────────┼──────────────┤
-│ 有網路 + Ollama Cloud    │ ✓ 首選       │ 可以但沒必要  │
-│ 有網路 + Claude/GPT API  │ ✓ 首選       │ ✗            │
-│ 內網 + Ollama local      │ 可以         │ ✓ 首選       │
-│ Air-gapped 環境          │ ✗            │ ✓ 唯一選擇   │
-│ vLLM / TGI / llama.cpp   │ ✗            │ ✓ 唯一選擇   │
-│ Docker Compose 嵌入      │ 可以但偏重    │ ✓ 5MB binary │
-│ 合規：資料不能出內網      │ 需自行確認    │ ✓ 保證離線   │
-└──────────────────────────┴──────────────┴──────────────┘
+┌─────────────────────────────┬──────────────────┬──────────────────────┐
+│ Scenario                    │ OpenCode         │ acp-bridge           │
+├─────────────────────────────┼──────────────────┼──────────────────────┤
+│ Online + Ollama Cloud       │ ✓ preferred      │ works, redundant     │
+│ Online + Claude/GPT API     │ ✓ preferred      │ ✗                    │
+│ Internal + Ollama local     │ works            │ ✓ preferred          │
+│ Air-gapped                  │ ✗                │ ✓ only choice        │
+│ vLLM / TGI / llama.cpp      │ ✗                │ ✓ only choice        │
+│ Docker Compose embed        │ works, heavy     │ ✓ 5MB binary         │
+│ Strict offline compliance   │ verify yourself  │ ✓ guaranteed offline │
+└─────────────────────────────┴──────────────────┴──────────────────────┘
 ```
 
 ## Architecture
