@@ -3,6 +3,7 @@
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tracing::{debug, warn};
 
 /// Maximum file size to read (1 MB).
@@ -70,6 +71,23 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a bash command and return its output. Use this for running scripts, git commands, or any shell operation. The command runs in the working directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The bash command to execute (e.g. 'ls -la', '/workspace/gbrain-cli.sh list', 'gh pr list')"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
     ]
 }
 
@@ -124,6 +142,13 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
                 .unwrap_or("");
             let file_glob = arguments.get("file_glob").and_then(|v| v.as_str());
             execute_search_code(working_dir, pattern, file_glob)
+        }
+        "bash" => {
+            let command = arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            execute_bash(working_dir, command)
         }
         _ => format!("Unknown tool: {name}"),
     }
@@ -351,5 +376,48 @@ fn search_dir(
                 }
             }
         }
+    }
+}
+
+/// Execute a bash command in the working directory with a timeout.
+fn execute_bash(working_dir: &Path, command: &str) -> String {
+    if command.is_empty() {
+        return "Error: command is empty".to_string();
+    }
+
+    debug!(command, "bash");
+
+    match Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut result = String::new();
+            if !stdout.is_empty() {
+                result.push_str(&stdout);
+            }
+            if !stderr.is_empty() {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str("[stderr] ");
+                result.push_str(&stderr);
+            }
+            if result.is_empty() {
+                "(no output)".to_string()
+            } else {
+                // Truncate very long output
+                if result.len() > 50_000 {
+                    result.truncate(50_000);
+                    result.push_str("\n... (truncated)");
+                }
+                result
+            }
+        }
+        Err(e) => format!("Error executing command: {e}"),
     }
 }

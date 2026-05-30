@@ -6,37 +6,48 @@ When OpenCode can't reach the internet, acp-bridge can still run.
 
 Written in Rust. Single ~5MB binary. Zero runtime dependencies. Fully offline.
 
-## Project status — feature-complete at v0.7
+## Project status — active development
 
-acp-bridge is in **maintenance mode**. The protocol surface (ACP server + client/orchestrator modes), backend coverage (Ollama native + OpenAI-compatible: vLLM, llama.cpp, LocalAI, LM Studio, TGI, Jan, Tabby), and security model (sandboxed read-only tools, no outbound network beyond the configured LLM endpoint) are considered **complete for the air-gapped / self-hosted use case**.
+acp-bridge is actively maintained, focused on a niche neither OpenCode nor Cline currently fills: **fully air-gapped local AI coding agents that speak ACP**. v0.7.x delivers a working subset of the ACP server surface (`initialize`, `session/new`, `session/prompt`, `session/end`) with streaming notifications and tool calling, and advertises `agentCapabilities` so editors like Zed and Neovim can feature-detect correctly.
 
-Future updates are limited to:
+Roadmap (2026-Q3):
 
-- Security fixes
-- ACP spec compatibility (when the upstream protocol evolves)
-- Critical bug fixes
-
-**No new features are planned.** This is deliberate — see "Relationship to OpenCode" below.
+- Full ACP spec compliance — `session/load`, `session/resume`, `session/set_mode`
+- Integration tests against thinking-on chat templates (Qwen3, DeepSeek-R1, GLM, Kimi-K2) that currently break in mainstream alternatives
+- Optional audit log mode for regulated deployments
 
 ## Relationship to OpenCode
 
-[OpenCode](https://opencode.ai) now supports ACP natively via the `acp` subcommand and ships with the Vercel AI SDK supporting 75+ providers (Ollama Cloud, OpenAI, Anthropic, AWS Bedrock, GitHub Copilot, Groq, OpenRouter, …). For the **cloud-leaning** use case — bring your own provider, full agent toolkit, marketplace, OAuth flow — OpenCode is the right tool.
+[OpenCode](https://opencode.ai) is a feature-rich coding agent with an ACP surface (`opencode acp`) and a broad provider matrix via the Vercel AI SDK. For online, cloud-leaning workflows it is the right tool.
 
-acp-bridge stays focused on what OpenCode structurally cannot do as a Node.js product with daily releases and a phone-home update path:
+For the air-gapped local-AI path, however, OpenCode has several open issues as of mid-2026:
+
+- ACP server `newSession` returns `Method not found` ([opencode#24846])
+- `opencode acp --port` exits immediately on start ([opencode#22795])
+- Ollama / vLLM / llama.cpp / LM Studio adapters have unresolved tool-calling bugs across thinking-on templates ([opencode#22132], [opencode#27920], [opencode#25351])
+- Air-gap mode still leaks network calls to models.dev, LSP manifests, and ripgrep binary fetch ([opencode#18492])
+
+acp-bridge targets the same protocol but a narrower scope: **air-gap clean, local-first, ACP-compliant**.
 
 | Concern | OpenCode | acp-bridge |
 |---------|----------|-----------|
-| Provider breadth | **75+ via AI SDK** | OpenAI-compatible only (+ Ollama native) |
-| Built-in toolkit | Full agent (edit, shell, web) | 3 sandboxed read-only tools (`read_file`, `list_dir`, `search_code`) |
-| Tool authorization | `--trust-all-tools` equivalent | Structurally read-only, cannot escalate |
-| Network footprint | binary may check updates / OAuth / marketplace | Outbound only to the configured LLM endpoint |
+| Provider breadth | 75+ via AI SDK (cloud-leaning) | OpenAI-compatible + Ollama native |
+| Network footprint | models.dev, LSP, update, ripgrep fetches | Outbound only to configured LLM endpoint |
 | Runtime | Node.js + npm | Single 5MB static Rust binary |
-| Release cadence | Often daily | Stable, security-fix only |
-| Air-gap audit | Requires confirmation per release | Binary is small enough to audit once |
+| Tool surface | Full agent (edit, shell, web) | 3 sandboxed read-only tools |
+| Air-gap audit | Per-release verification | Binary small enough to audit once |
+| ACP server stability | Active issues on `newSession`, `--port` | Spec-compliant `initialize` + session lifecycle |
 
-**Use OpenCode when** you want a complete agent with broad provider choice. **Use acp-bridge when** the deployment requires a fully offline, minimal-attack-surface, audit-friendly bridge — air-gapped sites, regulated industries, edge / embedded ACP harnesses, CI runners with strict egress policies.
+**Use OpenCode** when you want the full cloud-and-local agent toolkit. **Use acp-bridge** when the deployment requires a fully offline, audit-friendly bridge — air-gapped sites, regulated industries, edge / embedded ACP harnesses, CI runners with strict egress policies.
 
-The two projects are complementary, not competing. See [When to use acp-bridge vs OpenCode](#when-to-use-acp-bridge-vs-opencode) below for a per-scenario breakdown.
+See [When to use acp-bridge vs OpenCode](#when-to-use-acp-bridge-vs-opencode) below for a per-scenario breakdown.
+
+[opencode#24846]: https://github.com/anomalyco/opencode/issues/24846
+[opencode#22795]: https://github.com/anomalyco/opencode/issues/22795
+[opencode#22132]: https://github.com/anomalyco/opencode/issues/22132
+[opencode#27920]: https://github.com/anomalyco/opencode/issues/27920
+[opencode#25351]: https://github.com/anomalyco/opencode/issues/25351
+[opencode#18492]: https://github.com/anomalyco/opencode/issues/18492
 
 ## Why acp-bridge
 
@@ -312,10 +323,13 @@ All tools are **sandboxed** to the session's working directory — the LLM canno
 
 | Method | Status |
 |--------|--------|
-| `initialize` | Supported |
-| `session/new` | Multi-session with conversation history |
-| `session/prompt` | Streaming via SSE |
+| `initialize` | Supported — advertises `agentCapabilities.promptCapabilities.image: true`, `protocolVersion: 1`, `authMethods: []` |
+| `session/new` | Multi-session with conversation history; `mcpServers` param accepted but ignored in v0.7 |
+| `session/prompt` | Streaming via SSE; supports image content blocks |
 | `session/end` | Session cleanup |
+| `session/load` | Not yet — roadmap |
+| `session/resume` | Not yet — roadmap |
+| `session/set_mode` | Not yet — roadmap |
 
 | Notification | Status |
 |--------------|--------|

@@ -8,8 +8,10 @@ use serde::Deserialize;
 use std::path::Path;
 use tracing::{info, warn};
 
+use crate::a2a::A2aConfig;
 use crate::llm::LlmConfig;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// On-disk config file structure.
@@ -17,6 +19,18 @@ use std::time::Duration;
 pub struct ConfigFile {
     #[serde(default)]
     pub llm: LlmSection,
+    #[serde(default)]
+    pub a2a: A2aSection,
+    #[serde(default)]
+    pub agent: Option<AgentSection>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct A2aSection {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub agent_name: Option<String>,
+    pub agent_description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -31,6 +45,41 @@ pub struct LlmSection {
     pub max_history_turns: Option<usize>,
     pub max_sessions: Option<usize>,
     pub session_idle_timeout_secs: Option<u64>,
+}
+
+/// Config for an external ACP agent to spawn (in client mode).
+#[derive(Debug, Deserialize, Default)]
+pub struct AgentSection {
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+}
+
+/// Runtime config for spawning an external ACP agent.
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub working_dir: String,
+    pub env: HashMap<String, String>,
+}
+
+impl AgentConfig {
+    /// Build from environment variables only (no config file).
+    pub fn from_env() -> Option<Self> {
+        let command = std::env::var("AGENT_COMMAND").ok()?;
+        Some(Self {
+            command,
+            args: std::env::var("AGENT_ARGS")
+                .ok()
+                .map(|a| a.split_whitespace().map(String::from).collect())
+                .unwrap_or_default(),
+            working_dir: std::env::var("AGENT_WORKING_DIR").unwrap_or_else(|_| "/tmp".into()),
+            env: HashMap::new(),
+        })
+    }
 }
 
 impl ConfigFile {
@@ -48,6 +97,59 @@ impl ConfigFile {
                 }
             },
             Err(_) => Self::default(),
+        }
+    }
+
+    /// Build AgentConfig from file + env vars. Returns None if no agent configured.
+    pub fn agent_config(&self) -> Option<AgentConfig> {
+        let section = self.agent.as_ref();
+
+        let command = std::env::var("AGENT_COMMAND")
+            .ok()
+            .or_else(|| section.and_then(|s| s.command.clone()))?;
+
+        let args = std::env::var("AGENT_ARGS")
+            .ok()
+            .map(|a| a.split_whitespace().map(String::from).collect())
+            .or_else(|| section.and_then(|s| s.args.clone()))
+            .unwrap_or_default();
+
+        let working_dir = std::env::var("AGENT_WORKING_DIR")
+            .ok()
+            .or_else(|| section.and_then(|s| s.working_dir.clone()))
+            .unwrap_or_else(|| "/tmp".into());
+
+        let env = section.and_then(|s| s.env.clone()).unwrap_or_default();
+
+        Some(AgentConfig {
+            command,
+            args,
+            working_dir,
+            env,
+        })
+    }
+
+    /// Build A2aConfig from file + env vars.
+    pub fn a2a_config(&self) -> A2aConfig {
+        let defaults = A2aConfig::default();
+        A2aConfig {
+            host: std::env::var("A2A_HOST")
+                .ok()
+                .or_else(|| self.a2a.host.clone())
+                .unwrap_or(defaults.host),
+            port: std::env::var("A2A_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(self.a2a.port)
+                .unwrap_or(defaults.port),
+            agent_name: std::env::var("A2A_AGENT_NAME")
+                .ok()
+                .or_else(|| self.a2a.agent_name.clone())
+                .unwrap_or(defaults.agent_name),
+            agent_description: std::env::var("A2A_AGENT_DESCRIPTION")
+                .ok()
+                .or_else(|| self.a2a.agent_description.clone())
+                .unwrap_or(defaults.agent_description),
         }
     }
 

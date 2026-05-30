@@ -1,11 +1,11 @@
 [package]
 name = "acp-bridge"
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
-description = "ACP adapter for local AI — bridges any OpenAI-compatible API (Ollama, LocalAI, vLLM, llama.cpp, LM Studio) to Agent Client Protocol"
+description = "ACP/A2A adapter for self-hosted AI — bridges local LLM backends to Agent Client Protocol and Agent-to-Agent protocol"
 license = "MIT"
 repository = "https://github.com/BlakeHung/acp-bridge"
-keywords = ["acp", "ollama", "local-ai", "agent-protocol", "openab"]
+keywords = ["acp", "a2a", "ollama", "local-ai", "agent-protocol"]
 categories = ["command-line-utilities"]
 
 [lib]
@@ -27,9 +27,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 toml = "0.8"
+axum = "0.8"
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
-axum = "0.8"
 hyper = "1"
 futures-lite = "2"
