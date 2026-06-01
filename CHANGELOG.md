@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-06-01
+
+### Fixed
+- **`session/cancel` notification was silently dropped** — `JsonRpcRequest.id` was typed `u64`, so any message without an `id` field (i.e. any ACP notification) failed to deserialize and was logged at `debug!` then skipped. `id` is now `Option<u64>`, and the stdin loop splits dispatch into a request branch (id present, response expected) and a notification branch with a `session/cancel` arm that logs the cancellation. Unknown notifications are debug-logged and ignored per JSON-RPC 2.0. Reviewer-flagged by Armin.
+
+### Changed
+- **`main.rs`** — `RunMode::Bench` arm in the final mode dispatch changed from `todo!()` to `unreachable!("Bench mode handled above")`. Bench is handled by an earlier return, so `todo!()` was misleading. Reviewer-flagged by Armin.
+- **`bench.rs`** — the TOTAL row's tok/s is now followed by an explanatory line noting that the aggregate is wall-clock based and not directly comparable to per-fixture decode tok/s. Reviewer-flagged by Armin.
+
+### Internal
+- `Cargo.lock` synced to track the version bump so `cargo publish` does not see a dirty working tree in CI (this blocked the v0.7.1 release workflow).
+- Removed two ad-hoc `eprintln!` debug lines from `handle_acp_prompt` that printed the raw prompt and a 200-char prefix of user text to stderr. Use `tracing::debug!` with `RUST_LOG=acp_bridge=debug` instead.
+
+### Notes
+- v0.7.1 was tagged but its release workflow failed at the `cargo publish` step (Cargo.lock dirty). No v0.7.1 GitHub Release exists; v0.7.2 is the next published release after v0.7.0.
+- Reviewer coverage: Armin/Kiro reviewed `main.rs`, `protocol.rs`, `bench.rs`, `client.rs`, `engine.rs`, `a2a.rs`. `hardware.rs` was not deep-reviewed; the seven unit tests covering parser paths are the safety net, and the ROCm path remains marked as untested without AMD hardware.
+
 ## [0.7.1] - 2026-06-01
 
 ### Added
