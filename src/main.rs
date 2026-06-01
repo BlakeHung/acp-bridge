@@ -421,10 +421,7 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
         .cloned()
         .unwrap_or_default();
 
-    eprintln!("[acp-bridge] prompt_blocks count: {}, raw: {}", prompt_blocks.len(), serde_json::to_string(&prompt_blocks).unwrap_or_default());
-
     let user_text = engine::extract_text_parts(&prompt_blocks);
-    eprintln!("[acp-bridge] user_text len: {}, content: {:?}", user_text.len(), &user_text[..user_text.len().min(200)]);
     let user_images = engine::extract_image_parts(&prompt_blocks);
 
     // Set up notification channel for ACP streaming
