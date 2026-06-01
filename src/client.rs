@@ -454,19 +454,18 @@ impl AcpConnection {
         }
 
         let timeout_secs = if method == "session/new" { 120 } else { 30 };
-        let resp = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
-            .await
-        {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(_)) => {
-                self.pending.lock().await.remove(&id);
-                return Err(format!("Channel closed waiting for {method}").into());
-            }
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                return Err(format!("Timeout waiting for {method} response").into());
-            }
-        };
+        let resp =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(_)) => {
+                    self.pending.lock().await.remove(&id);
+                    return Err(format!("Channel closed waiting for {method}").into());
+                }
+                Err(_) => {
+                    self.pending.lock().await.remove(&id);
+                    return Err(format!("Timeout waiting for {method} response").into());
+                }
+            };
 
         if let Some(err) = &resp.error {
             return Err(format!("{err}").into());
