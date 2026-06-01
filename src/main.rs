@@ -416,16 +416,14 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
     };
 
     let prompt_value = params.get("prompt").cloned().unwrap_or(Value::Null);
-    debug!(
-        prompt_kind = match &prompt_value {
-            Value::Null => "null",
-            Value::String(_) => "string",
-            Value::Array(_) => "array",
-            Value::Object(_) => "object",
-            _ => "other",
-        },
-        "session/prompt input shape"
-    );
+    let prompt_kind = match &prompt_value {
+        Value::Null => "null",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        _ => "other",
+    };
+    debug!(prompt_kind, "session/prompt input shape");
 
     let user_text = engine::extract_user_text_from_prompt(&prompt_value);
     let user_images = engine::extract_user_images_from_prompt(&prompt_value);
