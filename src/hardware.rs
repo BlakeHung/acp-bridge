@@ -139,9 +139,13 @@ fn parse_rocm_smi(text: &str) -> Vec<GpuInfo> {
             continue;
         }
         let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        // The first column is the card identifier (`card0`, `card1`, …). The
+        // earlier filter "skip anything that equals `card`" never matched
+        // those identifiers, so the parser was picking `card0` as the GPU
+        // name. Take the second column as the product name when present.
         let name = fields
-            .iter()
-            .find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("card"))
+            .get(1)
+            .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "AMD GPU".to_string());
         let vram_mb = fields
@@ -291,6 +295,26 @@ mod tests {
         let sample = "Garbage line without comma\n";
         let gpus = parse_nvidia_smi(sample);
         assert!(gpus.is_empty());
+    }
+
+    #[test]
+    fn parses_rocm_smi_takes_product_name_not_card_id() {
+        let sample = "card0, AMD Radeon RX 6800 XT, 17163091968\ncard1, AMD Radeon Pro W6800, 34326183936\n";
+        let gpus = parse_rocm_smi(sample);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].name, "AMD Radeon RX 6800 XT");
+        assert_eq!(gpus[1].name, "AMD Radeon Pro W6800");
+        assert_eq!(gpus[0].accel, Accel::Rocm);
+        // VRAM bytes → MB conversion: 17163091968 / 1024 / 1024 = 16368
+        assert_eq!(gpus[0].vram_mb, Some(16368));
+    }
+
+    #[test]
+    fn parses_rocm_smi_falls_back_when_name_missing() {
+        let sample = "card0,,17163091968\n";
+        let gpus = parse_rocm_smi(sample);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "AMD GPU");
     }
 
     #[test]
