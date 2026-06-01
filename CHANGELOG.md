@@ -8,7 +8,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [0.7.2] - 2026-06-01
 
 ### Fixed
+- **`session/prompt` with non-array `prompt` parameter dropped the user message** — acp-bridge previously parsed `prompt` strictly as `Array<ContentBlock>` and used `unwrap_or_default()` on the cast, so a `prompt: "查大腦"` (string) or `prompt: {"type":"text","text":"…"}` (single block, not wrapped in an array) collapsed to an empty `Vec`, the user content became `""`, and the LLM had no message to act on. Symptom on the OpenAB side: "the agent doesn't reply". `engine::extract_user_text_from_prompt` and `extract_user_images_from_prompt` now tolerate all three shapes (array / single object / plain string). `handle_acp_prompt` rejects an entirely empty prompt (no text, no images) with `-32602` instead of forwarding empty content to the LLM. `RUST_LOG=acp_bridge=debug` now prints the JSON shape at dispatch entry. Eight unit tests cover the parser; the integration test for empty prompts was updated to assert the rejection.
 - **`session/cancel` notification was silently dropped** — `JsonRpcRequest.id` was typed `u64`, so any message without an `id` field (i.e. any ACP notification) failed to deserialize and was logged at `debug!` then skipped. `id` is now `Option<u64>`, and the stdin loop splits dispatch into a request branch (id present, response expected) and a notification branch with a `session/cancel` arm that logs the cancellation. Unknown notifications are debug-logged and ignored per JSON-RPC 2.0. Reviewer-flagged by Armin.
+- **`parse_rocm_smi` returned the card identifier instead of the GPU product name** — the filter `find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("card"))` matched `card0` / `card1` (not exact "card"), so the parser always picked the card slot as the name. `fields.get(1)` is the correct column. Reviewer-flagged by Armin in a follow-up pass on `hardware.rs`.
 
 ### Changed
 - **`main.rs`** — `RunMode::Bench` arm in the final mode dispatch changed from `todo!()` to `unreachable!("Bench mode handled above")`. Bench is handled by an earlier return, so `todo!()` was misleading. Reviewer-flagged by Armin.
@@ -20,7 +22,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Notes
 - v0.7.1 was tagged but its release workflow failed at the `cargo publish` step (Cargo.lock dirty). No v0.7.1 GitHub Release exists; v0.7.2 is the next published release after v0.7.0.
-- Reviewer coverage: Armin/Kiro reviewed `main.rs`, `protocol.rs`, `bench.rs`, `client.rs`, `engine.rs`, `a2a.rs`. `hardware.rs` was not deep-reviewed; the seven unit tests covering parser paths are the safety net, and the ROCm path remains marked as untested without AMD hardware.
+- Reviewer coverage: Armin/Kiro reviewed `main.rs`, `protocol.rs`, `bench.rs`, `client.rs`, `engine.rs`, `a2a.rs`, `hardware.rs` (the latter in a follow-up). Eren and Mikasa did not respond.
 
 ## [0.7.1] - 2026-06-01
 
