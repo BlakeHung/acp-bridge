@@ -122,6 +122,18 @@ ACP Harness          │  ┌───────────────┐  �
 - **Retry with exponential backoff** — survives LLM server restarts (Ollama, vLLM rolling updates)
 - **Structured logging** — `tracing` with `RUST_LOG` support, writes to stderr (not mixed with JSON-RPC on stdout)
 
+### Offline-first guarantee
+
+acp-bridge makes **zero outbound network calls** beyond the user-configured LLM endpoint:
+
+- No telemetry, no update checks, no anonymous usage stats
+- No remote model registry lookups (no calls to `models.dev` or similar)
+- No automatic MCP server fetching — `mcpServers` in `session/new` is logged but not executed
+- The only HTTP traffic is to `LLM_BASE_URL` (default `http://localhost:11434/v1`)
+- The only socket bind is the optional `--a2a` HTTP server (off by default; you opt in)
+
+This makes acp-bridge safe to run on truly air-gapped networks: the binary will work identically with a local Ollama instance on a disconnected machine, and there is no failure path that depends on internet reachability.
+
 ## Supported backends
 
 Ollama is supported natively via `/api/chat` (NDJSON streaming). All other backends use the OpenAI-compatible `/v1/chat/completions` (SSE streaming). The backend type is auto-detected from the URL:
