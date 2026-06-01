@@ -310,9 +310,8 @@ pub async fn session_prompt(
                     debug!(tool = name, result_len = result.len(), "Tool executed");
 
                     {
-                        let tool_call_id = tc.get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                        let tool_call_id =
+                            tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
                         let mut sessions = state.sessions_write();
                         if let Some(session) = sessions.get_mut(session_id) {
                             session.messages.push(json!({
