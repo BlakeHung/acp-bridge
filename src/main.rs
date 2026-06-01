@@ -198,6 +198,7 @@ async fn main() {
             }
         }
         RunMode::Client => unreachable!("Client mode handled above"),
+        RunMode::Bench => todo!(),
     }
 }
 
