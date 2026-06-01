@@ -98,9 +98,12 @@ fn parse_nvidia_smi(text: &str) -> Vec<GpuInfo> {
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| {
-            let mut parts = line.splitn(2, ',').map(str::trim);
-            let name = parts.next()?.to_string();
+            // Split from the right: rocm-smi / nvidia-smi product names can
+            // legitimately contain commas (e.g. "NVIDIA GeForce RTX 4090,
+            // Ada"). The last comma always separates name from VRAM.
+            let mut parts = line.rsplitn(2, ',').map(str::trim);
             let vram_mb = parts.next()?.parse::<u64>().ok();
+            let name = parts.next()?.to_string();
             Some(GpuInfo {
                 vendor: GpuVendor::Nvidia,
                 name,
@@ -148,11 +151,15 @@ fn parse_rocm_smi(text: &str) -> Vec<GpuInfo> {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "AMD GPU".to_string());
+        // rocm-smi versions differ on the VRAM unit: older ones emit bytes
+        // (e.g. 17163091968), newer ones can emit MB (e.g. 16368). Take the
+        // largest parseable number on the row and convert if it looks like
+        // bytes (> 100 MB worth).
         let vram_mb = fields
             .iter()
             .filter_map(|s| s.parse::<u64>().ok())
-            .find(|n| *n > 100_000_000)
-            .map(|bytes| bytes / 1024 / 1024);
+            .max()
+            .map(|v| if v > 100_000_000 { v / 1024 / 1024 } else { v });
         gpus.push(GpuInfo {
             vendor: GpuVendor::Amd,
             name,
@@ -181,7 +188,10 @@ fn scan_sysfs_amd() -> Vec<GpuInfo> {
         let Ok(vendor_raw) = std::fs::read_to_string(&vendor_path) else {
             continue;
         };
-        if vendor_raw.trim() == "0x1002" {
+        // Some kernel versions write the vendor ID without the `0x` prefix
+        // or in upper case. Normalize before comparing.
+        let vendor = vendor_raw.trim().to_lowercase();
+        if vendor == "0x1002" || vendor == "1002" {
             gpus.push(GpuInfo {
                 vendor: GpuVendor::Amd,
                 name: format!("AMD GPU ({n}, ROCm not installed — Vulkan only)"),
@@ -298,6 +308,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_nvidia_smi_preserves_commas_in_name() {
+        // rsplitn keeps the trailing VRAM column even when the product name
+        // contains commas. With splitn the name would be truncated and the
+        // remainder would fail to parse as u64.
+        let sample = "NVIDIA GeForce RTX 4090, Ada, 24576\n";
+        let gpus = parse_nvidia_smi(sample);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "NVIDIA GeForce RTX 4090, Ada");
+        assert_eq!(gpus[0].vram_mb, Some(24576));
+    }
+
+    #[test]
     fn parses_rocm_smi_takes_product_name_not_card_id() {
         let sample =
             "card0, AMD Radeon RX 6800 XT, 17163091968\ncard1, AMD Radeon Pro W6800, 34326183936\n";
@@ -316,6 +338,16 @@ mod tests {
         let gpus = parse_rocm_smi(sample);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].name, "AMD GPU");
+    }
+
+    #[test]
+    fn parses_rocm_smi_accepts_mb_unit_when_bytes_not_emitted() {
+        // Some newer rocm-smi builds emit VRAM in MB rather than bytes. The
+        // parser should keep the value as-is instead of returning None.
+        let sample = "card0, AMD Radeon RX 7900 XTX, 24576\n";
+        let gpus = parse_rocm_smi(sample);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].vram_mb, Some(24576));
     }
 
     #[test]
