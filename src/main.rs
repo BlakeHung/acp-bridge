@@ -6,6 +6,7 @@
 
 use acp_bridge::a2a::{self, A2aConfig};
 use acp_bridge::acp;
+use acp_bridge::bench;
 use acp_bridge::client;
 use acp_bridge::config::{AgentConfig, ConfigFile};
 use acp_bridge::engine::{self, AppState, Notification};
@@ -30,6 +31,8 @@ enum RunMode {
     A2a,
     /// Client mode — spawn and interact with an external ACP agent
     Client,
+    /// Benchmark mode — run fixture prompts against the configured LLM, print stats, exit.
+    Bench,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +62,7 @@ async fn main() {
         println!("  (default)    ACP mode — stdin/stdout JSON-RPC (act as agent)");
         println!("  --a2a        A2A mode — HTTP server with Agent Card");
         println!("  --client     Client mode — spawn and interact with an external ACP agent");
+        println!("  --bench      Benchmark mode — run fixture prompts against LLM, print stats, exit");
         println!();
         println!("OPTIONS:");
         println!("  --version    Print version");
@@ -72,7 +76,9 @@ async fn main() {
         return;
     }
 
-    let mode = if args.iter().any(|a| a == "--client") {
+    let mode = if args.iter().any(|a| a == "--bench") {
+        RunMode::Bench
+    } else if args.iter().any(|a| a == "--client") {
         RunMode::Client
     } else if args.iter().any(|a| a == "--a2a") {
         RunMode::A2a
@@ -128,10 +134,25 @@ async fn main() {
         None => (llm::LlmConfig::from_env(), A2aConfig::from_env()),
     };
 
+    if let RunMode::Bench = mode {
+        for line in hardware::detect().report_lines() {
+            info!("{line}");
+        }
+        info!(
+            base_url = %config.base_url,
+            model = %config.model,
+            "Running benchmark"
+        );
+        let results = bench::run(&config, &bench::default_fixtures()).await;
+        bench::print_report(&config, &results);
+        return;
+    }
+
     let mode_str = match mode {
         RunMode::Acp => "acp",
         RunMode::A2a => "a2a",
         RunMode::Client => unreachable!(),
+        RunMode::Bench => unreachable!(),
     };
     info!(
         version = env!("CARGO_PKG_VERSION"),

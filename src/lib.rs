@@ -11,6 +11,7 @@
 
 pub mod a2a;
 pub mod acp;
+pub mod bench;
 pub mod client;
 pub mod config;
 pub mod engine;
