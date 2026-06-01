@@ -32,12 +32,33 @@ pub fn extract_text_parts(parts: &[Value]) -> String {
         .join("\n")
 }
 
-/// Extract base64 image data from a slice of ACP content parts.
-pub fn extract_image_parts(parts: &[Value]) -> Vec<String> {
+/// A multi-modal image block — base64 data plus the MIME type the client
+/// declared. Default fallback is `image/jpeg` for clients that omit the
+/// MIME (older or out-of-spec).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBlock {
+    pub data: String,
+    pub mime_type: String,
+}
+
+const DEFAULT_IMAGE_MIME: &str = "image/jpeg";
+
+/// Extract base64 image content blocks from a slice of ACP/A2A content parts.
+/// Preserves the per-block `mimeType` so multimodal LLM payloads round-trip
+/// correctly (PNG, WebP, GIF, etc. — not just JPEG).
+pub fn extract_image_parts(parts: &[Value]) -> Vec<ImageBlock> {
     parts
         .iter()
         .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("image"))
-        .filter_map(|p| p.get("data").and_then(|d| d.as_str()).map(String::from))
+        .filter_map(|p| {
+            let data = p.get("data").and_then(|d| d.as_str())?.to_string();
+            let mime_type = p
+                .get("mimeType")
+                .and_then(|m| m.as_str())
+                .unwrap_or(DEFAULT_IMAGE_MIME)
+                .to_string();
+            Some(ImageBlock { data, mime_type })
+        })
         .collect()
 }
 
@@ -68,18 +89,24 @@ pub fn extract_user_text_from_prompt(prompt: &Value) -> String {
 
 /// Pull image content blocks out of a `session/prompt` `prompt` parameter
 /// across the same three shapes recognized by
-/// [`extract_user_text_from_prompt`].
-pub fn extract_user_images_from_prompt(prompt: &Value) -> Vec<String> {
+/// [`extract_user_text_from_prompt`]. MIME type is preserved per block.
+pub fn extract_user_images_from_prompt(prompt: &Value) -> Vec<ImageBlock> {
     match prompt {
         Value::Array(arr) => extract_image_parts(arr),
         Value::Object(_) => {
             if prompt.get("type").and_then(|t| t.as_str()) == Some("image") {
-                prompt
-                    .get("data")
-                    .and_then(|d| d.as_str())
-                    .map(String::from)
-                    .into_iter()
-                    .collect()
+                let Some(data) = prompt.get("data").and_then(|d| d.as_str()) else {
+                    return Vec::new();
+                };
+                let mime_type = prompt
+                    .get("mimeType")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(DEFAULT_IMAGE_MIME)
+                    .to_string();
+                vec![ImageBlock {
+                    data: data.to_string(),
+                    mime_type,
+                }]
             } else {
                 Vec::new()
             }
@@ -225,7 +252,7 @@ pub async fn session_prompt(
     state: &Arc<AppState>,
     session_id: &str,
     user_text: &str,
-    user_images: &[String],
+    user_images: &[ImageBlock],
     notify_tx: Option<mpsc::UnboundedSender<Notification>>,
 ) -> PromptResult {
     let notify = |n: Notification| {
@@ -258,21 +285,26 @@ pub async fn session_prompt(
             // Ollama native API: images are base64 strings in "images" array
             // OpenAI compat API: images are in content array with type "image_url"
             if state.config.is_ollama_native() {
+                // Ollama native takes base64 strings in `images`; no MIME field.
+                let images: Vec<&str> = user_images.iter().map(|i| i.data.as_str()).collect();
                 session.messages.push(json!({
                     "role": "user",
                     "content": user_text,
-                    "images": user_images
+                    "images": images
                 }));
             } else {
                 // OpenAI-compat multimodal: text + image_url parts in a
                 // content array. user_images is guaranteed non-empty here
-                // by the outer branch.
+                // by the outer branch. Use each block's declared MIME type
+                // so PNG/WebP/GIF aren't misencoded as JPEG.
                 let mut content_parts: Vec<Value> =
                     vec![json!({"type": "text", "text": user_text})];
                 for img in user_images {
                     content_parts.push(json!({
                         "type": "image_url",
-                        "image_url": {"url": format!("data:image/jpeg;base64,{img}")}
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", img.mime_type, img.data)
+                        }
                     }));
                 }
                 session
@@ -518,18 +550,48 @@ mod tests {
     fn extract_user_images_handles_acp_array_shape() {
         let prompt = serde_json::json!([
             {"type": "text", "text": "describe"},
-            {"type": "image", "data": "AAAA"},
+            {"type": "image", "data": "AAAA", "mimeType": "image/png"},
             {"type": "image", "data": "BBBB"}
         ]);
         let images = extract_user_images_from_prompt(&prompt);
-        assert_eq!(images, vec!["AAAA".to_string(), "BBBB".to_string()]);
+        assert_eq!(
+            images,
+            vec![
+                ImageBlock {
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into()
+                },
+                ImageBlock {
+                    data: "BBBB".into(),
+                    mime_type: "image/jpeg".into()
+                },
+            ]
+        );
     }
 
     #[test]
     fn extract_user_images_handles_single_image_object() {
-        let prompt = serde_json::json!({"type": "image", "data": "AAAA"});
+        let prompt = serde_json::json!({
+            "type": "image",
+            "data": "AAAA",
+            "mimeType": "image/webp"
+        });
         let images = extract_user_images_from_prompt(&prompt);
-        assert_eq!(images, vec!["AAAA".to_string()]);
+        assert_eq!(
+            images,
+            vec![ImageBlock {
+                data: "AAAA".into(),
+                mime_type: "image/webp".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_user_images_defaults_to_jpeg_when_mime_missing() {
+        let prompt = serde_json::json!([{"type": "image", "data": "AAAA"}]);
+        let images = extract_user_images_from_prompt(&prompt);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/jpeg");
     }
 
     #[test]

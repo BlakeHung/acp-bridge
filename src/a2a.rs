@@ -199,15 +199,25 @@ async fn handle_a2a_dispatch(
 async fn handle_message_send(state: &A2aState, req: A2aRequest) -> (StatusCode, Json<Value>) {
     let params = req.params.unwrap_or(json!({}));
 
-    let user_text = params
+    let parts = params
         .get("message")
         .and_then(|m| m.get("parts"))
-        .and_then(|p| p.as_array())
-        .map(|arr| engine::extract_text_parts(arr))
-        .unwrap_or_default();
+        .and_then(|p| p.as_array());
 
-    if user_text.is_empty() {
-        let resp = jsonrpc_error(req.id.as_ref(), -32602, "Missing or empty message text");
+    let (user_text, user_images) = match parts {
+        Some(arr) => (
+            engine::extract_text_parts(arr),
+            engine::extract_image_parts(arr),
+        ),
+        None => (String::new(), Vec::new()),
+    };
+
+    if user_text.is_empty() && user_images.is_empty() {
+        let resp = jsonrpc_error(
+            req.id.as_ref(),
+            -32602,
+            "Missing or empty message — expected at least one text or image part",
+        );
         return (StatusCode::OK, Json(resp));
     }
 
@@ -230,7 +240,14 @@ async fn handle_message_send(state: &A2aState, req: A2aRequest) -> (StatusCode, 
     info!(task_id = %task_id, session_id = %session_id, "A2A message/send");
 
     // Run prompt (no notification channel — A2A is request-response)
-    let result = engine::session_prompt(&state.app, &session_id, &user_text, &[], None).await;
+    let result = engine::session_prompt(
+        &state.app,
+        &session_id,
+        &user_text,
+        &user_images,
+        None,
+    )
+    .await;
 
     // Clean up session
     let _ = engine::session_end(&state.app, &session_id);

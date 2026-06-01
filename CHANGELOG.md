@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] - 2026-06-01
+
+### Fixed
+- **Inbound image MIME type was discarded and rewritten as JPEG** — both `engine::extract_image_parts` and the per-block path inside `session_prompt` had only kept the base64 data and hard-coded `data:image/jpeg;base64,…` when forwarding to OpenAI-compatible backends. Any ACP/A2A client sending PNG/WebP/GIF content was therefore mislabeled, which can break vision-model decoding or yield undefined multi-modal behaviour. Image extraction now returns a new `ImageBlock { data, mime_type }`, the per-block `mimeType` is threaded through, and `session_prompt` emits `data:<mime>;base64,<data>` using the client's declared MIME (with `image/jpeg` only as a fallback for clients that omit the field). Reviewer-flagged by Eren.
+- **A2A transport silently dropped image inputs** — `handle_message_send` only extracted text from `message.parts` and always called `engine::session_prompt(..., &[], None)`, so text+image A2A requests lost their images and image-only A2A requests were rejected as empty. `initialize()` already advertises `agentCapabilities.promptCapabilities.image: true`, so the A2A path now honors it: both text and image parts are extracted, an empty prompt is rejected only when *both* are absent, and images are forwarded to `session_prompt`. Reviewer-flagged by Eren.
+
 ## [0.7.4] - 2026-06-01
 
 ### Fixed
