@@ -448,13 +448,25 @@ impl AcpConnection {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
-        self.send_raw(&data).await?;
+        if let Err(e) = self.send_raw(&data).await {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
 
         let timeout_secs = if method == "session/new" { 120 } else { 30 };
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
             .await
-            .map_err(|_| format!("Timeout waiting for {method} response"))?
-            .map_err(|_| format!("Channel closed waiting for {method}"))?;
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(_)) => {
+                self.pending.lock().await.remove(&id);
+                return Err(format!("Channel closed waiting for {method}").into());
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(format!("Timeout waiting for {method} response").into());
+            }
+        };
 
         if let Some(err) = &resp.error {
             return Err(format!("{err}").into());
@@ -552,7 +564,10 @@ impl AcpConnection {
         let (resp_tx, _resp_rx) = oneshot::channel();
         self.pending.lock().await.insert(id, resp_tx);
 
-        self.send_raw(&data).await?;
+        if let Err(e) = self.send_raw(&data).await {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
         Ok((rx, id))
     }
 
