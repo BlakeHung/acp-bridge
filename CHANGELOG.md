@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-06-01
+
+### Added
+- **Windows binary** — release workflow now also builds `acp-bridge-windows-amd64.exe` (x86_64-pc-windows-msvc). AMD Ryzen AI / Strix Halo laptops are largely Windows, so the binary tier needed it.
+- **`--bench` mode** — `acp-bridge --bench` runs a fixed set of fixture prompts (hello / short code / explain concept / refactor / summarize) against the configured LLM endpoint and prints wall time, prompt/completion tokens, and decode tokens/sec per prompt. Reads OpenAI-style `usage` or Ollama-native `eval_count` / `eval_duration` stats.
+- **Best-effort hardware detection at startup** — `src/hardware.rs` probes platform and GPU(s) using `nvidia-smi`, `rocm-smi`, and `/sys/class/drm` sysfs scan; logs Metal / CUDA / ROCm / Vulkan and operator-facing tuning hints. All offline, no network.
+- **`docs/apple-silicon.md`** and **`docs/nvidia.md`** — practical setup guides covering memory tiers, model size recommendations, Ollama vs MLX vs vLLM vs llama.cpp trade-offs, and reference rigs (Mac mini M4 Pro, 2× RTX 3090 Ti).
+- **Offline-first guarantee** — README now explicitly documents that `acp-bridge` makes no outbound network calls beyond the user-configured LLM endpoint (no telemetry, no update checks, no model registry lookups).
+
+### Changed
+- **Release profile** — `Cargo.toml` adds thin-LTO, `codegen-units = 1`, and `strip = true` for smaller / faster release binaries on edge deployments. Unwinding stays default.
+- **a2a / engine / main code dedupe** — extracted `jsonrpc_error()` in `a2a.rs` (replaced 3 inline error envelopes) and `engine::extract_text_parts()` / `engine::extract_image_parts()` shared by both ACP and A2A prompt handlers; saved one redundant `String::clone()` in the prompt success path.
+- **Spec-gap error responses** — `session/load`, `session/resume`, and `session/set_mode` now return descriptive `-32001` / `-32602` errors explaining the actual constraint (no persistence, no modes advertised) instead of a bare `-32601` method-not-found.
+- **OpenAI-compat text-only prompts** — when there are no images, text content is sent as a plain string rather than a single-element array, which improves compatibility with some OpenAI-compatible backends.
+
+### Fixed
+- **`client.rs` pending HashMap leak** — three error paths in `send_request` / `send_prompt` now clean up the pending entry before returning (previously timeout / `send_raw` failure / channel closed could leave stale oneshot Senders).
+
 ## [0.7.0] - 2026-06-01
 
 ### Added
