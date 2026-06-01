@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-06-01
+
+### Fixed
+- **`bench.rs` TOTAL aggregate was dragged down by error fixtures** — when a fixture timed out or failed, its `wall_ms` was still summed into the aggregate even though its completion-token count was absent. The aggregate tok/s now skips error rows. Reviewer-flagged by Mikasa.
+- **OpenAI-mode `tok/s` was not labelled as wall-clock-derived** — Ollama-native mode computes tok/s from `eval_duration` (decode only), while OpenAI-compat mode divides by wall_ms (which includes TTFT and transit). The column header now shows `tok/s*` in OpenAI mode and a footnote explains the difference, so readers don't conclude OpenAI backends are slower than they actually are. Reviewer-flagged by Mikasa.
+
+### Changed
+- **`bench::Fixture` gains an `Option<&'static str> system_prompt` field** — decode-heavy fixtures (`explain_concept`, `summarize`) now run without a "concise" system prompt so they produce enough tokens to make the timing meaningful. Other fixtures keep a tight prompt because they're intentionally short. Reviewer-flagged by Mikasa.
+
+### Internal
+- **`engine.rs` user-message path** — removed a dead inner `if user_images.is_empty()` inside the OpenAI-compat else arm. The outer branch already guarantees the slice is non-empty there; the inner check could never fire. Reviewer-flagged by Eren.
+
 ## [0.7.3] - 2026-06-01
 
 ### Important
