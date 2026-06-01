@@ -240,14 +240,8 @@ async fn handle_message_send(state: &A2aState, req: A2aRequest) -> (StatusCode, 
     info!(task_id = %task_id, session_id = %session_id, "A2A message/send");
 
     // Run prompt (no notification channel — A2A is request-response)
-    let result = engine::session_prompt(
-        &state.app,
-        &session_id,
-        &user_text,
-        &user_images,
-        None,
-    )
-    .await;
+    let result =
+        engine::session_prompt(&state.app, &session_id, &user_text, &user_images, None).await;
 
     // Clean up session
     let _ = engine::session_end(&state.app, &session_id);
