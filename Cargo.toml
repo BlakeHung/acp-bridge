@@ -1,6 +1,6 @@
 [package]
 name = "acp-bridge"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 authors = ["Blake Labs"]
 description = "ACP/A2A adapter for self-hosted AI — bridges local LLM backends to Agent Client Protocol and Agent-to-Agent protocol"

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-06-01
+
+### Important
+- **Skip 0.7.2 on crates.io — it is the buggy pre-fix code from a cancelled release run.** The 0.7.2 git tag and Docker image at `ghcr.io/blakehung/acp-bridge:0.7.2` point at the fixed code (commit `fc0b9c7`), but crates.io permanently locked the version at the earlier `b253172` snapshot before the cancel landed. Use 0.7.3+ from crates.io. The 0.7.2 entry below still describes the intended contents; 0.7.3 ships those plus the second-round reviewer findings.
+
+### Fixed
+- **NVIDIA product names containing commas were truncated** — `parse_nvidia_smi` now splits with `rsplitn(2, ',')` (from the right) instead of `splitn(2, ',')`, so names like "NVIDIA GeForce RTX 4090, Ada" parse correctly and the VRAM column lines up. Reviewer-flagged by Mikasa.
+- **`parse_rocm_smi` rejected MB-unit VRAM** — older `rocm-smi` versions emit VRAM in bytes, newer ones emit MB. The old `> 100_000_000` filter discarded MB values entirely. Now takes the max parseable number on the row and converts only when it looks like bytes. Reviewer-flagged by Mikasa.
+- **AMD Vulkan-only fallback missed cards with unprefixed / upper-case vendor IDs** — `scan_sysfs_amd` now normalizes the sysfs vendor string and accepts both `0x1002` and `1002`. Reviewer-flagged by Mikasa.
+- **First fixture in `--bench` ate the cold-start cost** — `bench::run` now does a discarded warm-up `chat()` before the first measured fixture to prime model load + cache. Reviewer-flagged by Mikasa and Armin.
+
+### Changed
+- **`session/load`, `session/resume`, `session/set_mode` now return `-32601`** — these are not supported (we don't advertise `loadSession`, sessions are created without `modes`), so ACP capability-based negotiation calls for method-not-found rather than the `-32001`/`-32602` codes the previous patch used. Message strings still explain the underlying reason. Reviewer-flagged by Armin.
+
 ## [0.7.2] - 2026-06-01
 
 ### Fixed
