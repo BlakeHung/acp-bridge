@@ -5,17 +5,7 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-- **`initialize` response is now spec-compliant** — returns `protocolVersion: 1`, `agentCapabilities.promptCapabilities.image: true`, and `authMethods: []` at the top level. Previously returned only `agentInfo` and an empty `capabilities: {}` field, which prevented ACP clients (Zed, Neovim) from feature-detecting image-prompt support.
-- **`session/new` accepts `mcpServers` parameter** — previously the param was silently dropped. v0.7.x logs it at debug level and otherwise no-ops (MCP server support is not yet implemented). This unblocks clients that send the spec-required field.
-
-### Notes
-- These changes are server-side only; backward-compatible with all existing clients. The new top-level fields are additive — clients that ignored `capabilities: {}` will ignore `agentCapabilities` the same way, and clients that read it gain useful information.
-- `session/load`, `session/resume`, and `session/set_mode` remain unimplemented (roadmap 2026-Q3).
-
-## [0.7.0] - 2026-04-16
+## [0.7.0] - 2026-06-01
 
 ### Added
 - **ACP Client mode** (`--client`) — acp-bridge can now act as an **ACP client/orchestrator**, spawning external ACP agents (OpenCode, Claude Code, Kiro, Codex, Gemini, etc.) as child processes and communicating via stdin/stdout JSON-RPC 2.0.
@@ -30,10 +20,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Interactive CLI wrapper** — `--client` mode provides an interactive REPL for any ACP agent.
 
 ### Changed
+- **`initialize` response is now spec-compliant** — returns `protocolVersion: 1`, `agentCapabilities.promptCapabilities.image: true`, and `authMethods: []` at the top level. Previously returned only `agentInfo` and an empty `capabilities: {}` field, which prevented ACP clients (Zed, Neovim) from feature-detecting image-prompt support.
+- **`session/new` accepts `mcpServers` parameter** — previously the param was silently dropped. v0.7.0 logs it at debug level and otherwise no-ops (MCP server support is not yet implemented). This unblocks clients that send the spec-required field.
 - Version bump to 0.7.0.
 - `lib.rs` exports new `client` module.
 - `config.toml.example` includes `[agent]` section documentation.
 - Help text updated with `--client` mode and agent environment variables.
+
+### Notes
+- Spec-compliance changes are server-side only; backward-compatible with all existing clients. The new top-level fields are additive — clients that ignored `capabilities: {}` will ignore `agentCapabilities` the same way, and clients that read it gain useful information.
+- `session/load`, `session/resume`, and `session/set_mode` remain unimplemented (roadmap 2026-Q3).
 
 ## [0.5.0] - 2026-04-14
 
