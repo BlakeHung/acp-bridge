@@ -192,7 +192,10 @@ fn scan_sysfs_amd() -> Vec<GpuInfo> {
 fn build_recommendations(os: &str, gpus: &[GpuInfo]) -> Vec<String> {
     let mut hints = Vec::new();
 
-    let nv_count = gpus.iter().filter(|g| g.vendor == GpuVendor::Nvidia).count();
+    let nv_count = gpus
+        .iter()
+        .filter(|g| g.vendor == GpuVendor::Nvidia)
+        .count();
     let nv_vram_mb: u64 = gpus
         .iter()
         .filter(|g| g.vendor == GpuVendor::Nvidia)
