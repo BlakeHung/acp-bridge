@@ -41,6 +41,53 @@ pub fn extract_image_parts(parts: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Pull user text out of a `session/prompt` `prompt` parameter, tolerating
+/// the three shapes we have seen in the wild:
+///
+/// 1. ACP spec: `Array<ContentBlock>` — handled by `extract_text_parts`.
+/// 2. A single ContentBlock object (some clients send the block directly,
+///    not wrapped in a one-element array).
+/// 3. A plain string (legacy or simplified clients that put the whole
+///    prompt directly in the `prompt` field).
+///
+/// Returns an empty string when the shape matches none of the above. The
+/// caller is responsible for rejecting an empty result with a clear error
+/// rather than handing an empty message to the LLM.
+pub fn extract_user_text_from_prompt(prompt: &Value) -> String {
+    match prompt {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => extract_text_parts(arr),
+        Value::Object(_) => prompt
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Pull image content blocks out of a `session/prompt` `prompt` parameter
+/// across the same three shapes recognized by
+/// [`extract_user_text_from_prompt`].
+pub fn extract_user_images_from_prompt(prompt: &Value) -> Vec<String> {
+    match prompt {
+        Value::Array(arr) => extract_image_parts(arr),
+        Value::Object(_) => {
+            if prompt.get("type").and_then(|t| t.as_str()) == Some("image") {
+                prompt
+                    .get("data")
+                    .and_then(|d| d.as_str())
+                    .map(String::from)
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Notification — transport-agnostic events emitted during prompt processing
 // ---------------------------------------------------------------------------
@@ -429,4 +476,70 @@ fn extract_response_text(response: &Value) -> String {
     }
 
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_user_text_handles_acp_array_shape() {
+        let prompt = serde_json::json!([
+            {"type": "text", "text": "查大腦"},
+            {"type": "text", "text": "查 X 的看法"}
+        ]);
+        let text = extract_user_text_from_prompt(&prompt);
+        assert_eq!(text, "查大腦\n查 X 的看法");
+    }
+
+    #[test]
+    fn extract_user_text_handles_single_block_object() {
+        let prompt = serde_json::json!({"type": "text", "text": "hello"});
+        assert_eq!(extract_user_text_from_prompt(&prompt), "hello");
+    }
+
+    #[test]
+    fn extract_user_text_handles_plain_string() {
+        let prompt = serde_json::json!("hello world");
+        assert_eq!(extract_user_text_from_prompt(&prompt), "hello world");
+    }
+
+    #[test]
+    fn extract_user_text_returns_empty_on_null() {
+        let prompt = serde_json::Value::Null;
+        assert_eq!(extract_user_text_from_prompt(&prompt), "");
+    }
+
+    #[test]
+    fn extract_user_text_ignores_non_text_array_entries() {
+        let prompt = serde_json::json!([
+            {"type": "image", "data": "iVBORw0K..."},
+            {"type": "text", "text": "describe this"}
+        ]);
+        assert_eq!(extract_user_text_from_prompt(&prompt), "describe this");
+    }
+
+    #[test]
+    fn extract_user_images_handles_acp_array_shape() {
+        let prompt = serde_json::json!([
+            {"type": "text", "text": "describe"},
+            {"type": "image", "data": "AAAA"},
+            {"type": "image", "data": "BBBB"}
+        ]);
+        let images = extract_user_images_from_prompt(&prompt);
+        assert_eq!(images, vec!["AAAA".to_string(), "BBBB".to_string()]);
+    }
+
+    #[test]
+    fn extract_user_images_handles_single_image_object() {
+        let prompt = serde_json::json!({"type": "image", "data": "AAAA"});
+        let images = extract_user_images_from_prompt(&prompt);
+        assert_eq!(images, vec!["AAAA".to_string()]);
+    }
+
+    #[test]
+    fn extract_user_images_empty_on_string_prompt() {
+        let prompt = serde_json::json!("just text");
+        assert!(extract_user_images_from_prompt(&prompt).is_empty());
+    }
 }

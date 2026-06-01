@@ -415,14 +415,28 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
         }
     };
 
-    let prompt_blocks = params
-        .get("prompt")
-        .and_then(|p| p.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let prompt_value = params.get("prompt").cloned().unwrap_or(Value::Null);
+    debug!(
+        prompt_kind = match &prompt_value {
+            Value::Null => "null",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+            _ => "other",
+        },
+        "session/prompt input shape"
+    );
 
-    let user_text = engine::extract_text_parts(&prompt_blocks);
-    let user_images = engine::extract_image_parts(&prompt_blocks);
+    let user_text = engine::extract_user_text_from_prompt(&prompt_value);
+    let user_images = engine::extract_user_images_from_prompt(&prompt_value);
+
+    if user_text.trim().is_empty() && user_images.is_empty() {
+        let err = AcpError::MissingParam {
+            field: "prompt (expected non-empty text or image content)".into(),
+        };
+        acp::send_error(id, err.code(), &err.to_string());
+        return;
+    }
 
     // Set up notification channel for ACP streaming
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Notification>();
