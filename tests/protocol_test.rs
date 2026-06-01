@@ -9,7 +9,7 @@ use serde_json::json;
 fn parse_initialize_request() {
     let input = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let req: JsonRpcRequest = serde_json::from_str(input).unwrap();
-    assert_eq!(req.id, 1);
+    assert_eq!(req.id, Some(1));
     assert_eq!(req.method, "initialize");
     assert!(req.params.is_some());
 }
@@ -18,7 +18,7 @@ fn parse_initialize_request() {
 fn parse_request_without_params() {
     let input = r#"{"jsonrpc":"2.0","id":42,"method":"session/end"}"#;
     let req: JsonRpcRequest = serde_json::from_str(input).unwrap();
-    assert_eq!(req.id, 42);
+    assert_eq!(req.id, Some(42));
     assert_eq!(req.method, "session/end");
     assert!(req.params.is_none());
 }
@@ -30,6 +30,14 @@ fn parse_session_prompt_request() {
     assert_eq!(req.method, "session/prompt");
     let params = req.params.unwrap();
     assert_eq!(params["sessionId"], "abc");
+}
+
+#[test]
+fn parse_notification_has_no_id() {
+    let input = r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"abc"}}"#;
+    let req: JsonRpcRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(req.id, None);
+    assert_eq!(req.method, "session/cancel");
 }
 
 // ---------------------------------------------------------------------------

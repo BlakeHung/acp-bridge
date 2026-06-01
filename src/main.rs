@@ -200,7 +200,7 @@ async fn main() {
             }
         }
         RunMode::Client => unreachable!("Client mode handled above"),
-        RunMode::Bench => todo!(),
+        RunMode::Bench => unreachable!("Bench mode handled above"),
     }
 }
 
@@ -286,11 +286,34 @@ async fn run_acp_loop(state: Arc<AppState>) {
                             }
                         };
 
-                        let id = msg.id;
+                        let id_opt = msg.id;
                         let method = msg.method.as_str();
                         let params = msg.params.clone().unwrap_or(json!({}));
 
-                        debug!(id, method, "Received request");
+                        debug!(?id_opt, method, "Received message");
+
+                        // Notifications (no id, no response expected per JSON-RPC 2.0).
+                        let id = match id_opt {
+                            Some(id) => id,
+                            None => {
+                                match method {
+                                    "session/cancel" => {
+                                        let sid = params
+                                            .get("sessionId")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        info!(
+                                            session_id = %sid,
+                                            "Received session/cancel notification (acknowledged; in-flight cancel not yet implemented)"
+                                        );
+                                    }
+                                    _ => {
+                                        debug!(method, "Ignoring unknown notification");
+                                    }
+                                }
+                                continue;
+                            }
+                        };
 
                         match method {
                             "initialize" => {
@@ -398,7 +421,10 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
         .cloned()
         .unwrap_or_default();
 
+    eprintln!("[acp-bridge] prompt_blocks count: {}, raw: {}", prompt_blocks.len(), serde_json::to_string(&prompt_blocks).unwrap_or_default());
+
     let user_text = engine::extract_text_parts(&prompt_blocks);
+    eprintln!("[acp-bridge] user_text len: {}, content: {:?}", user_text.len(), &user_text[..user_text.len().min(200)]);
     let user_images = engine::extract_image_parts(&prompt_blocks);
 
     // Set up notification channel for ACP streaming

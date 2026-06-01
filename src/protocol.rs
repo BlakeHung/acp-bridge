@@ -5,7 +5,8 @@ use std::time::Instant;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
-    pub id: u64,
+    /// Present for requests, absent for notifications (e.g. `session/cancel`).
+    pub id: Option<u64>,
     pub method: String,
     pub params: Option<Value>,
 }

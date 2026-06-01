@@ -184,6 +184,7 @@ pub fn print_report(config: &LlmConfig, results: &[RunResult]) {
         total_completion,
         agg_tps,
     );
+    println!("(TOTAL tok/s is a wall-clock aggregate — not directly comparable to per-fixture decode tok/s.)");
     println!();
 }
 
