@@ -264,25 +264,20 @@ pub async fn session_prompt(
                     "images": user_images
                 }));
             } else {
-                if user_images.is_empty() {
-                    // Plain text — use string content (required by Ollama native API)
-                    session
-                        .messages
-                        .push(json!({"role": "user", "content": user_text}));
-                } else {
-                    // Multimodal — use array content with images
-                    let mut content_parts: Vec<Value> =
-                        vec![json!({"type": "text", "text": user_text})];
-                    for img in user_images {
-                        content_parts.push(json!({
-                            "type": "image_url",
-                            "image_url": {"url": format!("data:image/jpeg;base64,{img}")}
-                        }));
-                    }
-                    session
-                        .messages
-                        .push(json!({"role": "user", "content": content_parts}));
+                // OpenAI-compat multimodal: text + image_url parts in a
+                // content array. user_images is guaranteed non-empty here
+                // by the outer branch.
+                let mut content_parts: Vec<Value> =
+                    vec![json!({"type": "text", "text": user_text})];
+                for img in user_images {
+                    content_parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:image/jpeg;base64,{img}")}
+                    }));
                 }
+                session
+                    .messages
+                    .push(json!({"role": "user", "content": content_parts}));
             }
         }
 
