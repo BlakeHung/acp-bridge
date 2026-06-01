@@ -296,6 +296,27 @@ async fn run_acp_loop(state: Arc<AppState>) {
                                     }
                                 }
                             }
+                            "session/load" | "session/resume" => {
+                                // We don't advertise loadSession in agentCapabilities, so
+                                // a well-behaved client won't call this. Return a clear
+                                // error explaining the reason rather than a bare
+                                // method-not-found, so debugging is easier.
+                                acp::send_error(
+                                    id,
+                                    -32001,
+                                    "acp-bridge does not persist sessions; session/load and session/resume are unavailable",
+                                );
+                            }
+                            "session/set_mode" => {
+                                // session/new responses do not include a `modes` array,
+                                // so per ACP spec this method is not applicable to
+                                // sessions created by acp-bridge.
+                                acp::send_error(
+                                    id,
+                                    -32602,
+                                    "session/set_mode is not applicable; sessions created by acp-bridge have no modes",
+                                );
+                            }
                             _ => {
                                 let err = AcpError::MethodNotFound { method: method.to_string() };
                                 acp::send_error(id, err.code(), &err.to_string());
