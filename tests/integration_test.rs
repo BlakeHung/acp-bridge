@@ -454,7 +454,12 @@ async fn test_full_conversation_flow() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_empty_prompt_text() {
+async fn test_empty_prompt_rejected() {
+    // v0.7.3+: an entirely empty prompt (no text content, no images) is
+    // rejected with -32602 rather than silently forwarded as an empty
+    // user message to the LLM. Previous versions returned status:
+    // "completed" with empty content, which surfaced as "the agent
+    // doesn't respond" when upstream clients sent malformed payloads.
     let port = free_port();
     let mut h = TestHarness::start(port).await;
 
@@ -467,7 +472,7 @@ async fn test_empty_prompt_text() {
         "params":{"sessionId":&sid,"prompt":[]}
     }));
     let (_, resp) = h.read_until_response(2);
-    assert_eq!(resp["result"]["status"], "completed");
+    assert_eq!(resp["error"]["code"], -32602);
 
     h.shutdown();
 }

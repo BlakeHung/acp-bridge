@@ -299,7 +299,8 @@ mod tests {
 
     #[test]
     fn parses_rocm_smi_takes_product_name_not_card_id() {
-        let sample = "card0, AMD Radeon RX 6800 XT, 17163091968\ncard1, AMD Radeon Pro W6800, 34326183936\n";
+        let sample =
+            "card0, AMD Radeon RX 6800 XT, 17163091968\ncard1, AMD Radeon Pro W6800, 34326183936\n";
         let gpus = parse_rocm_smi(sample);
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].name, "AMD Radeon RX 6800 XT");
