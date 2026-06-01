@@ -19,6 +19,28 @@ use uuid::Uuid;
 /// Maximum number of tool call rounds to prevent infinite loops.
 const MAX_TOOL_ROUNDS: usize = 5;
 
+/// Extract concatenated text from a slice of ACP/A2A content parts.
+///
+/// Each part is expected to be an object with `"type": "text"` and `"text": "..."`.
+/// Non-text parts and malformed entries are skipped.
+pub fn extract_text_parts(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extract base64 image data from a slice of ACP content parts.
+pub fn extract_image_parts(parts: &[Value]) -> Vec<String> {
+    parts
+        .iter()
+        .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("image"))
+        .filter_map(|p| p.get("data").and_then(|d| d.as_str()).map(String::from))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Notification — transport-agnostic events emitted during prompt processing
 // ---------------------------------------------------------------------------
@@ -245,14 +267,16 @@ pub async fn session_prompt(
                 if tool_calls.is_empty() {
                     let text = extract_response_text(&response);
                     if !text.is_empty() {
-                        notify(Notification::TextChunk(text.clone()));
                         final_text = text.clone();
-                        let mut sessions = state.sessions_write();
-                        if let Some(session) = sessions.get_mut(session_id) {
-                            session
-                                .messages
-                                .push(json!({"role": "assistant", "content": text}));
+                        {
+                            let mut sessions = state.sessions_write();
+                            if let Some(session) = sessions.get_mut(session_id) {
+                                session
+                                    .messages
+                                    .push(json!({"role": "assistant", "content": &text}));
+                            }
                         }
+                        notify(Notification::TextChunk(text));
                     }
                     break;
                 }
@@ -286,11 +310,15 @@ pub async fn session_prompt(
                     debug!(tool = name, result_len = result.len(), "Tool executed");
 
                     {
+                        let tool_call_id = tc.get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
                         let mut sessions = state.sessions_write();
                         if let Some(session) = sessions.get_mut(session_id) {
                             session.messages.push(json!({
                                 "role": "tool",
-                                "content": result
+                                "content": result,
+                                "tool_call_id": tool_call_id
                             }));
                         }
                     }

@@ -345,19 +345,8 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
         .cloned()
         .unwrap_or_default();
 
-    let user_text = prompt_blocks
-        .iter()
-        .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Extract base64 images from prompt blocks
-    let user_images: Vec<String> = prompt_blocks
-        .iter()
-        .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("image"))
-        .filter_map(|p| p.get("data").and_then(|d| d.as_str()).map(String::from))
-        .collect();
+    let user_text = engine::extract_text_parts(&prompt_blocks);
+    let user_images = engine::extract_image_parts(&prompt_blocks);
 
     // Set up notification channel for ACP streaming
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Notification>();

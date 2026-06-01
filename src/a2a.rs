@@ -143,6 +143,14 @@ struct A2aState {
 // Handlers
 // ---------------------------------------------------------------------------
 
+fn jsonrpc_error(id: Option<&Value>, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message.into() }
+    })
+}
+
 /// GET /.well-known/agent.json — Agent Card for service discovery.
 async fn handle_agent_card(State(state): State<Arc<A2aState>>) -> Json<AgentCard> {
     let card = AgentCard {
@@ -175,14 +183,11 @@ async fn handle_a2a_dispatch(
     match req.method.as_str() {
         "message/send" => handle_message_send(&state, req).await,
         _ => {
-            let resp = json!({
-                "jsonrpc": "2.0",
-                "id": req.id,
-                "error": {
-                    "code": -32601,
-                    "message": format!("Method not found: {}", req.method)
-                }
-            });
+            let resp = jsonrpc_error(
+                req.id.as_ref(),
+                -32601,
+                format!("Method not found: {}", req.method),
+            );
             (StatusCode::OK, Json(resp))
         }
     }
@@ -194,30 +199,15 @@ async fn handle_a2a_dispatch(
 async fn handle_message_send(state: &A2aState, req: A2aRequest) -> (StatusCode, Json<Value>) {
     let params = req.params.unwrap_or(json!({}));
 
-    // Extract user text from params.message.parts
     let user_text = params
         .get("message")
         .and_then(|m| m.get("parts"))
         .and_then(|p| p.as_array())
-        .map(|parts| {
-            parts
-                .iter()
-                .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
+        .map(|arr| engine::extract_text_parts(arr))
         .unwrap_or_default();
 
     if user_text.is_empty() {
-        let resp = json!({
-            "jsonrpc": "2.0",
-            "id": req.id,
-            "error": {
-                "code": -32602,
-                "message": "Missing or empty message text"
-            }
-        });
+        let resp = jsonrpc_error(req.id.as_ref(), -32602, "Missing or empty message text");
         return (StatusCode::OK, Json(resp));
     }
 
@@ -231,14 +221,7 @@ async fn handle_message_send(state: &A2aState, req: A2aRequest) -> (StatusCode, 
     let session_id = match engine::session_new(&state.app, cwd) {
         Ok(id) => id,
         Err(e) => {
-            let resp = json!({
-                "jsonrpc": "2.0",
-                "id": req.id,
-                "error": {
-                    "code": e.code(),
-                    "message": e.to_string()
-                }
-            });
+            let resp = jsonrpc_error(req.id.as_ref(), e.code(), e.to_string());
             return (StatusCode::OK, Json(resp));
         }
     };
