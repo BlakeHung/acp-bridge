@@ -9,6 +9,7 @@ use acp_bridge::acp;
 use acp_bridge::client;
 use acp_bridge::config::{AgentConfig, ConfigFile};
 use acp_bridge::engine::{self, AppState, Notification};
+use acp_bridge::hardware;
 use acp_bridge::llm;
 use acp_bridge::protocol::{AcpError, JsonRpcRequest};
 use serde_json::{json, Value};
@@ -105,6 +106,9 @@ async fn main() {
 
         match agent_config {
             Some(ac) => {
+                for line in hardware::detect().report_lines() {
+                    info!("{line}");
+                }
                 client::run_client_mode(&ac).await;
                 return;
             }
@@ -140,6 +144,10 @@ async fn main() {
         session_idle_timeout_secs = config.session_idle_timeout_secs,
         "Starting acp-bridge"
     );
+
+    for line in hardware::detect().report_lines() {
+        info!("{line}");
+    }
 
     // Probe backend
     probe_backend(&config).await;
