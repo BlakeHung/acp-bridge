@@ -352,24 +352,28 @@ async fn run_acp_loop(state: Arc<AppState>) {
                                 }
                             }
                             "session/load" | "session/resume" => {
-                                // We don't advertise loadSession in agentCapabilities, so
-                                // a well-behaved client won't call this. Return a clear
-                                // error explaining the reason rather than a bare
-                                // method-not-found, so debugging is easier.
+                                // ACP uses capability-based negotiation: a client should
+                                // only call `session/load` when the agent advertises
+                                // `loadSession` in `agentCapabilities`. acp-bridge does
+                                // not advertise it, so the correct response is -32601
+                                // (method not found) — the keep-the-message-helpful
+                                // string is preserved for operators debugging stray
+                                // calls.
                                 acp::send_error(
                                     id,
-                                    -32001,
-                                    "acp-bridge does not persist sessions; session/load and session/resume are unavailable",
+                                    -32601,
+                                    "session/load and session/resume are not supported by acp-bridge (no persistence layer; loadSession capability is not advertised)",
                                 );
                             }
                             "session/set_mode" => {
                                 // session/new responses do not include a `modes` array,
                                 // so per ACP spec this method is not applicable to
-                                // sessions created by acp-bridge.
+                                // sessions created by acp-bridge. Capability-based
+                                // negotiation: respond with -32601 method-not-found.
                                 acp::send_error(
                                     id,
-                                    -32602,
-                                    "session/set_mode is not applicable; sessions created by acp-bridge have no modes",
+                                    -32601,
+                                    "session/set_mode is not supported by acp-bridge (sessions are created without a `modes` array)",
                                 );
                             }
                             _ => {

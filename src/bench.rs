@@ -56,7 +56,19 @@ pub struct RunResult {
 }
 
 /// Run all fixtures sequentially and return the per-fixture results.
+///
+/// A single warm-up request runs first and its result is discarded. This
+/// pulls model weights into RAM/VRAM, primes the prompt cache, and
+/// settles the LLM serving stack so the first measured fixture isn't
+/// penalised by cold-start cost.
 pub async fn run(config: &LlmConfig, fixtures: &[Fixture]) -> Vec<RunResult> {
+    println!("Warm-up: priming model cache (result discarded)…");
+    let warmup_messages = vec![
+        json!({"role": "system", "content": "Respond with one word."}),
+        json!({"role": "user", "content": "Say 'ready'."}),
+    ];
+    let _ = llm::chat(config, &warmup_messages, None, None).await;
+
     let mut results = Vec::with_capacity(fixtures.len());
     for fx in fixtures {
         let messages = vec![
