@@ -62,7 +62,9 @@ async fn main() {
         println!("  (default)    ACP mode — stdin/stdout JSON-RPC (act as agent)");
         println!("  --a2a        A2A mode — HTTP server with Agent Card");
         println!("  --client     Client mode — spawn and interact with an external ACP agent");
-        println!("  --bench      Benchmark mode — run fixture prompts against LLM, print stats, exit");
+        println!(
+            "  --bench      Benchmark mode — run fixture prompts against LLM, print stats, exit"
+        );
         println!();
         println!("OPTIONS:");
         println!("  --version    Print version");
