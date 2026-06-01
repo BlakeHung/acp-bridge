@@ -13,10 +13,15 @@ use crate::llm::{self, LlmConfig};
 use serde_json::{json, Value};
 use std::time::Instant;
 
-/// A single benchmark fixture — a name + the user message text.
+/// A single benchmark fixture — a name + the user message text, plus an
+/// optional per-fixture system prompt. `None` means no system message is
+/// sent; the model's natural answer length is preserved so decode-heavy
+/// fixtures (summarize, explain_concept) produce enough tokens for the
+/// timing to be meaningful.
 pub struct Fixture {
     pub name: &'static str,
     pub user_text: &'static str,
+    pub system_prompt: Option<&'static str>,
 }
 
 pub fn default_fixtures() -> Vec<Fixture> {
@@ -24,22 +29,27 @@ pub fn default_fixtures() -> Vec<Fixture> {
         Fixture {
             name: "hello",
             user_text: "Hello! Respond with a one-line greeting.",
+            system_prompt: Some("You are a concise assistant. Answer briefly."),
         },
         Fixture {
             name: "short_code",
             user_text: "Write a Rust function `fn add(a: i32, b: i32) -> i32` that returns a + b. Only the function, no commentary.",
+            system_prompt: Some("You are a concise coding assistant. Output only the code."),
         },
         Fixture {
             name: "explain_concept",
-            user_text: "Explain in 3-4 sentences why Rust requires explicit lifetime annotations on some struct definitions.",
+            user_text: "Explain in detail why Rust requires explicit lifetime annotations on some struct definitions. Cover the borrow checker rationale and give an example.",
+            system_prompt: None,
         },
         Fixture {
             name: "refactor",
             user_text: "Given `fn f(v: Vec<String>) -> usize { v.len() }`, rewrite so the function does not take ownership of `v`. Show only the new signature and body.",
+            system_prompt: Some("You are a concise coding assistant."),
         },
         Fixture {
             name: "summarize",
-            user_text: "Summarize the trade-off between Ollama and vLLM for serving a 32B model on consumer hardware in 5 bullet points.",
+            user_text: "Summarize the trade-off between Ollama and vLLM for serving a 32B model on consumer hardware. Cover throughput, batching, memory footprint, ops complexity, and quantization support.",
+            system_prompt: None,
         },
     ]
 }
@@ -71,10 +81,11 @@ pub async fn run(config: &LlmConfig, fixtures: &[Fixture]) -> Vec<RunResult> {
 
     let mut results = Vec::with_capacity(fixtures.len());
     for fx in fixtures {
-        let messages = vec![
-            json!({"role": "system", "content": "You are a concise coding assistant. Answer briefly."}),
-            json!({"role": "user", "content": fx.user_text}),
-        ];
+        let mut messages = Vec::with_capacity(2);
+        if let Some(sys) = fx.system_prompt {
+            messages.push(json!({"role": "system", "content": sys}));
+        }
+        messages.push(json!({"role": "user", "content": fx.user_text}));
 
         let start = Instant::now();
         let response = llm::chat(config, &messages, None, None).await;
@@ -140,9 +151,14 @@ pub fn print_report(config: &LlmConfig, results: &[RunResult]) {
         config.model,
         config.is_ollama_native()
     );
+    let tps_label = if config.is_ollama_native() {
+        "tok/s"
+    } else {
+        "tok/s*"
+    };
     println!(
         "{:<20} {:>10} {:>10} {:>10} {:>10}",
-        "fixture", "wall", "prompt_tok", "comp_tok", "tok/s"
+        "fixture", "wall", "prompt_tok", "comp_tok", tps_label
     );
     println!("{}", "-".repeat(64));
 
@@ -166,13 +182,13 @@ pub fn print_report(config: &LlmConfig, results: &[RunResult]) {
 
         if let Some(err) = &r.error {
             println!("{:<20} {:>10} ERROR: {err}", r.name, wall);
-        } else {
-            println!(
-                "{:<20} {:>10} {:>10} {:>10} {:>10}",
-                r.name, wall, prompt, completion, tps
-            );
+            // Don't pollute the aggregate with error timings.
+            continue;
         }
-
+        println!(
+            "{:<20} {:>10} {:>10} {:>10} {:>10}",
+            r.name, wall, prompt, completion, tps
+        );
         total_wall += r.wall_ms;
         if let Some(c) = r.completion_tokens {
             total_completion += c;
@@ -197,6 +213,12 @@ pub fn print_report(config: &LlmConfig, results: &[RunResult]) {
         agg_tps,
     );
     println!("(TOTAL tok/s is a wall-clock aggregate — not directly comparable to per-fixture decode tok/s.)");
+    if !config.is_ollama_native() {
+        println!(
+            "(* OpenAI-compatible mode uses HTTP wall-clock, so per-fixture tok/s includes \
+             prompt-eval (TTFT) and network transit; native Ollama uses eval_duration only.)"
+        );
+    }
     println!();
 }
 
