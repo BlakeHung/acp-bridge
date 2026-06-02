@@ -176,6 +176,10 @@ impl ConfigFile {
             .or(file.api_key)
             .unwrap_or_else(|| "local-ai".into());
 
+        let system_prompt = std::env::var("LLM_SYSTEM_PROMPT")
+            .ok()
+            .or(file.system_prompt);
+
         let temperature = std::env::var("LLM_TEMPERATURE")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -221,6 +225,7 @@ impl ConfigFile {
             base_url,
             model,
             api_key,
+            system_prompt,
             temperature,
             max_tokens,
             timeout_secs,
@@ -229,5 +234,44 @@ impl ConfigFile {
             session_idle_timeout_secs,
             client,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigFile, LlmSection};
+
+    #[test]
+    fn llm_config_uses_system_prompt_from_file_when_env_missing() {
+        std::env::remove_var("LLM_SYSTEM_PROMPT");
+
+        let cfg = ConfigFile {
+            llm: LlmSection {
+                system_prompt: Some("from file".into()),
+                ..LlmSection::default()
+            },
+            ..ConfigFile::default()
+        };
+
+        let llm = cfg.into_llm_config();
+        assert_eq!(llm.system_prompt.as_deref(), Some("from file"));
+    }
+
+    #[test]
+    fn llm_config_env_system_prompt_overrides_file() {
+        std::env::set_var("LLM_SYSTEM_PROMPT", "from env");
+
+        let cfg = ConfigFile {
+            llm: LlmSection {
+                system_prompt: Some("from file".into()),
+                ..LlmSection::default()
+            },
+            ..ConfigFile::default()
+        };
+
+        let llm = cfg.into_llm_config();
+        assert_eq!(llm.system_prompt.as_deref(), Some("from env"));
+
+        std::env::remove_var("LLM_SYSTEM_PROMPT");
     }
 }

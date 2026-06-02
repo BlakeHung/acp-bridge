@@ -130,6 +130,7 @@ pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    pub system_prompt: Option<String>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub timeout_secs: u64,
@@ -180,6 +181,7 @@ impl LlmConfig {
             api_key: std::env::var("LLM_API_KEY")
                 .or_else(|_| std::env::var("OLLAMA_API_KEY"))
                 .unwrap_or_else(|_| "local-ai".into()),
+            system_prompt: std::env::var("LLM_SYSTEM_PROMPT").ok(),
             temperature: std::env::var("LLM_TEMPERATURE")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
