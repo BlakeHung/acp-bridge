@@ -429,7 +429,14 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
     };
     debug!(prompt_kind, "session/prompt input shape");
 
-    let user_text = engine::extract_user_text_from_prompt(&prompt_value);
+    let raw_user_text = engine::extract_user_text_from_prompt(&prompt_value);
+    let (user_text, sender_context) = engine::strip_sender_context(&raw_user_text);
+    if let Some(ctx) = &sender_context {
+        debug!(
+            sender_context_len = ctx.len(),
+            "Stripped <sender_context> block from user text"
+        );
+    }
     let user_images = engine::extract_user_images_from_prompt(&prompt_value);
 
     if user_text.trim().is_empty() && user_images.is_empty() {

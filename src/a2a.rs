@@ -204,13 +204,20 @@ async fn handle_message_send(state: &A2aState, req: A2aRequest) -> (StatusCode, 
         .and_then(|m| m.get("parts"))
         .and_then(|p| p.as_array());
 
-    let (user_text, user_images) = match parts {
+    let (raw_user_text, user_images) = match parts {
         Some(arr) => (
             engine::extract_text_parts(arr),
             engine::extract_image_parts(arr),
         ),
         None => (String::new(), Vec::new()),
     };
+    let (user_text, sender_context) = engine::strip_sender_context(&raw_user_text);
+    if let Some(ctx) = &sender_context {
+        debug!(
+            sender_context_len = ctx.len(),
+            "Stripped <sender_context> block from A2A message text"
+        );
+    }
 
     if user_text.is_empty() && user_images.is_empty() {
         let resp = jsonrpc_error(

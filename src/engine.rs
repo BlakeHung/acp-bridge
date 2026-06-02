@@ -87,6 +87,46 @@ pub fn extract_user_text_from_prompt(prompt: &Value) -> String {
     }
 }
 
+/// Strip a leading `<sender_context>…</sender_context>` block from user
+/// text, returning the cleaned text plus the captured inner string for
+/// observability.
+///
+/// OpenAB and similar harnesses prepend a metadata block of this shape:
+///
+/// ```text
+/// <sender_context>
+/// {"schema":"openab.sender.v1","user_id":"…",…}
+/// </sender_context>
+/// <actual user message>
+/// ```
+///
+/// Some LLMs interpret the XML tag as a directive and stall trying to
+/// reconcile the wrapper with their tool-calling instructions — the
+/// observed symptom is the model returning empty content with no tool
+/// calls. Strip the block before forwarding so the model sees only the
+/// real user text; the captured inner string is returned alongside so
+/// callers can log it at debug level for traceability.
+pub fn strip_sender_context(text: &str) -> (String, Option<String>) {
+    const OPEN: &str = "<sender_context>";
+    const CLOSE: &str = "</sender_context>";
+
+    let Some(start) = text.find(OPEN) else {
+        return (text.to_string(), None);
+    };
+    let after_open = start + OPEN.len();
+    let Some(rel_end) = text[after_open..].find(CLOSE) else {
+        return (text.to_string(), None);
+    };
+    let close_start = after_open + rel_end;
+    let close_end = close_start + CLOSE.len();
+
+    let inner = text[after_open..close_start].trim().to_string();
+    let cleaned = format!("{}{}", &text[..start], &text[close_end..])
+        .trim()
+        .to_string();
+    (cleaned, Some(inner))
+}
+
 /// Pull image content blocks out of a `session/prompt` `prompt` parameter
 /// across the same three shapes recognized by
 /// [`extract_user_text_from_prompt`]. MIME type is preserved per block.
@@ -230,8 +270,10 @@ pub fn session_new(state: &AppState, cwd: &str) -> Result<String, AcpError> {
 
     let session_id = Uuid::new_v4().to_string();
 
-    let system_prompt = std::env::var("LLM_SYSTEM_PROMPT").unwrap_or_else(|_| {
-        format!("You are a helpful coding assistant. The user's working directory is: {cwd}")
+    let system_prompt = state.config.system_prompt.clone().unwrap_or_else(|| {
+        std::env::var("LLM_SYSTEM_PROMPT").unwrap_or_else(|_| {
+            format!("You are a helpful coding assistant. The user's working directory is: {cwd}")
+        })
     });
 
     let session = Session::new(
@@ -598,5 +640,39 @@ mod tests {
     fn extract_user_images_empty_on_string_prompt() {
         let prompt = serde_json::json!("just text");
         assert!(extract_user_images_from_prompt(&prompt).is_empty());
+    }
+
+    #[test]
+    fn strip_sender_context_pulls_leading_block_and_returns_clean_text() {
+        let input = "<sender_context>\n{\"schema\":\"openab.sender.v1\",\"user_id\":\"729\"}\n</sender_context>查一下大腦";
+        let (cleaned, ctx) = strip_sender_context(input);
+        assert_eq!(cleaned, "查一下大腦");
+        assert!(ctx.is_some());
+        let ctx = ctx.unwrap();
+        assert!(ctx.contains("openab.sender.v1"));
+        assert!(ctx.contains("729"));
+    }
+
+    #[test]
+    fn strip_sender_context_passthrough_when_no_block() {
+        let (cleaned, ctx) = strip_sender_context("hello world");
+        assert_eq!(cleaned, "hello world");
+        assert!(ctx.is_none());
+    }
+
+    #[test]
+    fn strip_sender_context_handles_open_tag_without_close() {
+        let input = "<sender_context>unterminated";
+        let (cleaned, ctx) = strip_sender_context(input);
+        assert_eq!(cleaned, input);
+        assert!(ctx.is_none());
+    }
+
+    #[test]
+    fn strip_sender_context_when_block_is_whole_input_yields_empty_text() {
+        let input = "<sender_context>just metadata</sender_context>";
+        let (cleaned, ctx) = strip_sender_context(input);
+        assert_eq!(cleaned, "");
+        assert_eq!(ctx.unwrap(), "just metadata");
     }
 }

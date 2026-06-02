@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] - 2026-06-02
+
+### Fixed
+- **`<sender_context>` metadata in user prompts made models emit empty replies with no tool calls** — OpenAB-style harnesses prepend a `<sender_context>{…json…}</sender_context>` block to the user message. Several local LLMs (observed on Qwen3-Coder via Ollama) interpret the XML wrapper as a directive and stall — the model returns empty content with no tool calls, which surfaces upstream as "the agent doesn't reply" and "the agent doesn't know about brain/KB". `engine::strip_sender_context` now detects the block, removes it from the forwarded user text, and logs the captured inner string at debug level for traceability. Both the ACP (`handle_acp_prompt`) and A2A (`handle_message_send`) entry points strip before the empty-prompt guard and before passing to `session_prompt`. Four unit tests cover the leading-block case, the no-block passthrough, an unterminated open tag, and the all-metadata edge case. Reviewer-flagged by openab-rukawa.
+
 ## [0.7.5] - 2026-06-01
 
 ### Fixed
