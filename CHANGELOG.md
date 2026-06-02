@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] - 2026-06-02
+
+### Fixed
+- **`session/prompt` final response was missing the accumulated text** — `handle_acp_prompt` previously sent the assistant's final text exclusively through `Notification::TextChunk` and replied with `{"status": "completed"}`. Upstream pipelines that consume the final response (or that treat `ToolDone("llm_chat","completed")` as the turn boundary and stop reading further notifications) saw an empty reply even though the chunks had been streamed. The final response now also carries `text: result.text` so non-streaming consumers and edge-case race conditions still get the body. Reviewer-flagged by Eren.
+
 ## [0.7.6] - 2026-06-02
 
 ### Fixed

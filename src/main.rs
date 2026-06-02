@@ -484,6 +484,18 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
     if let Some(err) = &result.error {
         acp::send_error(id, err.code(), &err.to_string());
     } else {
-        acp::send_response(id, json!({"status": result.status}));
+        // Include the accumulated text in the final response as well as the
+        // streamed `TextChunk` notifications. Some upstream clients (e.g.
+        // OpenAB pipelines that treat `ToolDone("llm_chat","completed")`
+        // as the turn boundary) rely on the final response for the message
+        // body — without `text` here those clients show an empty reply
+        // even though the chunks were sent.
+        acp::send_response(
+            id,
+            json!({
+                "status": result.status,
+                "text": result.text,
+            }),
+        );
     }
 }
