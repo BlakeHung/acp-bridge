@@ -866,4 +866,147 @@ mod tests {
         assert_eq!(expand_env("literal"), "literal");
         std::env::remove_var("_ACP_TEST_VAR");
     }
+
+    #[test]
+    fn expand_env_missing_var_yields_empty() {
+        std::env::remove_var("_ACP_DEFINITELY_UNSET_VAR");
+        assert_eq!(expand_env("${_ACP_DEFINITELY_UNSET_VAR}"), "");
+    }
+
+    fn notify(update: Value) -> JsonRpcMessage {
+        JsonRpcMessage {
+            id: None,
+            method: Some("session/notify".into()),
+            result: None,
+            error: None,
+            params: Some(json!({ "update": update })),
+        }
+    }
+
+    #[test]
+    fn classify_thinking_notification() {
+        let msg = notify(json!({"sessionUpdate": "agent_thought_chunk"}));
+        assert!(matches!(
+            classify_notification(&msg),
+            Some(AcpEvent::Thinking)
+        ));
+    }
+
+    #[test]
+    fn classify_plan_maps_to_status() {
+        let msg = notify(json!({"sessionUpdate": "plan"}));
+        assert!(matches!(
+            classify_notification(&msg),
+            Some(AcpEvent::Status)
+        ));
+    }
+
+    #[test]
+    fn classify_in_progress_tool_update_is_tool_start() {
+        // A non-terminal status on tool_call_update classifies as ToolStart.
+        let msg = notify(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc9",
+            "title": "grep",
+            "status": "in_progress"
+        }));
+        match classify_notification(&msg) {
+            Some(AcpEvent::ToolStart { id, title }) => {
+                assert_eq!(id, "tc9");
+                assert_eq!(title, "grep");
+            }
+            other => panic!("Expected ToolStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_failed_tool_update_is_tool_done() {
+        let msg = notify(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc9",
+            "status": "failed"
+        }));
+        match classify_notification(&msg) {
+            Some(AcpEvent::ToolDone { status, title, .. }) => {
+                assert_eq!(status, "failed");
+                // Missing title defaults to empty string.
+                assert_eq!(title, "");
+            }
+            other => panic!("Expected ToolDone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_message_chunk_without_text_is_none() {
+        let msg = notify(json!({"sessionUpdate": "agent_message_chunk", "content": {}}));
+        assert!(classify_notification(&msg).is_none());
+    }
+
+    #[test]
+    fn classify_unknown_update_is_none() {
+        let msg = notify(json!({"sessionUpdate": "totally_unknown"}));
+        assert!(classify_notification(&msg).is_none());
+    }
+
+    #[test]
+    fn classify_without_params_is_none() {
+        let msg = JsonRpcMessage {
+            id: Some(1),
+            method: None,
+            result: Some(json!({"ok": true})),
+            error: None,
+            params: None,
+        };
+        assert!(classify_notification(&msg).is_none());
+    }
+
+    #[test]
+    fn content_block_text_to_json() {
+        let block = ContentBlock::text("hi");
+        assert_eq!(block.to_json(), json!({"type": "text", "text": "hi"}));
+    }
+
+    #[test]
+    fn content_block_image_to_json() {
+        let block = ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        assert_eq!(
+            block.to_json(),
+            json!({"type": "image", "data": "AAAA", "mimeType": "image/png"})
+        );
+    }
+
+    #[test]
+    fn jsonrpc_error_display() {
+        let err = JsonRpcError {
+            code: -32601,
+            message: "Method not found".into(),
+        };
+        assert_eq!(err.to_string(), "JSON-RPC error -32601: Method not found");
+    }
+
+    #[test]
+    fn jsonrpc_request_serializes_and_omits_none_params() {
+        let req = JsonRpcRequest::new(3, "session/new", None);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["method"], "session/new");
+        assert!(v.get("params").is_none());
+
+        let with_params = JsonRpcRequest::new(4, "session/prompt", Some(json!({"sessionId": "s"})));
+        let v2 = serde_json::to_value(&with_params).unwrap();
+        assert_eq!(v2["params"]["sessionId"], "s");
+    }
+
+    #[test]
+    fn jsonrpc_response_serializes() {
+        let resp = JsonRpcResponse::new(5, json!({"outcome": "ok"}));
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 5);
+        assert_eq!(v["result"]["outcome"], "ok");
+    }
 }

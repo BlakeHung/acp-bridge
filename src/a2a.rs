@@ -297,3 +297,203 @@ pub async fn serve(
     axum::serve(listener, router).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::LlmConfig;
+    use reqwest::Client;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Serialize env-var mutating tests so they don't race on `A2A_*`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_app_state() -> Arc<AppState> {
+        let config = LlmConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model: "test-model".into(),
+            api_key: "test-key".into(),
+            system_prompt: None,
+            temperature: None,
+            max_tokens: None,
+            timeout_secs: 5,
+            max_history_turns: 50,
+            max_sessions: 0,
+            session_idle_timeout_secs: 0,
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client"),
+        };
+        AppState::new(config)
+    }
+
+    /// Serve the A2A router on an ephemeral port; returns its base URL.
+    async fn serve_a2a() -> String {
+        let router = a2a_router(test_app_state(), A2aConfig::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    // -- config -------------------------------------------------------------
+
+    #[test]
+    fn config_default_values() {
+        let c = A2aConfig::default();
+        assert_eq!(c.host, "0.0.0.0");
+        assert_eq!(c.port, 8080);
+        assert_eq!(c.agent_name, "acp-bridge");
+        assert!(!c.agent_description.is_empty());
+    }
+
+    #[test]
+    fn config_from_env_overrides_and_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("A2A_HOST", "127.0.0.1");
+        std::env::set_var("A2A_PORT", "9999");
+        std::env::set_var("A2A_AGENT_NAME", "custom-agent");
+        std::env::remove_var("A2A_AGENT_DESCRIPTION");
+
+        let c = A2aConfig::from_env();
+        assert_eq!(c.host, "127.0.0.1");
+        assert_eq!(c.port, 9999);
+        assert_eq!(c.agent_name, "custom-agent");
+        // Falls back to default when the env var is absent.
+        assert_eq!(c.agent_description, A2aConfig::default().agent_description);
+
+        std::env::remove_var("A2A_HOST");
+        std::env::remove_var("A2A_PORT");
+        std::env::remove_var("A2A_AGENT_NAME");
+    }
+
+    #[test]
+    fn config_from_env_ignores_invalid_port() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("A2A_PORT", "not-a-number");
+        let c = A2aConfig::from_env();
+        assert_eq!(c.port, A2aConfig::default().port);
+        std::env::remove_var("A2A_PORT");
+    }
+
+    // -- serialization ------------------------------------------------------
+
+    #[test]
+    fn agent_card_serializes_camel_case() {
+        let card = AgentCard {
+            name: "n".into(),
+            description: "d".into(),
+            url: "http://x".into(),
+            version: "1.2.3".into(),
+            capabilities: AgentCapabilities {
+                streaming: false,
+                push_notifications: true,
+            },
+            skills: vec![AgentSkill {
+                id: "s".into(),
+                name: "S".into(),
+                description: "desc".into(),
+            }],
+        };
+        let v = serde_json::to_value(&card).unwrap();
+        assert_eq!(v["name"], "n");
+        assert_eq!(v["capabilities"]["pushNotifications"], true);
+        assert_eq!(v["skills"][0]["id"], "s");
+    }
+
+    #[test]
+    fn task_state_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(TaskState::Submitted).unwrap(),
+            json!("submitted")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskState::Completed).unwrap(),
+            json!("completed")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskState::Failed).unwrap(),
+            json!("failed")
+        );
+    }
+
+    #[test]
+    fn a2a_message_round_trips() {
+        let raw = json!({
+            "role": "user",
+            "parts": [{"type": "text", "text": "hello"}]
+        });
+        let msg: A2aMessage = serde_json::from_value(raw).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.parts.len(), 1);
+        assert_eq!(msg.parts[0].kind, "text");
+        assert_eq!(msg.parts[0].text, "hello");
+    }
+
+    #[test]
+    fn jsonrpc_error_shape() {
+        let id = json!(7);
+        let err = jsonrpc_error(Some(&id), -32601, "Method not found: x");
+        assert_eq!(err["jsonrpc"], "2.0");
+        assert_eq!(err["id"], 7);
+        assert_eq!(err["error"]["code"], -32601);
+        assert_eq!(err["error"]["message"], "Method not found: x");
+    }
+
+    // -- router -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn agent_card_endpoint_serves_discovery_document() {
+        let base = serve_a2a().await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("{base}/.well-known/agent.json"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let card: Value = resp.json().await.unwrap();
+        assert_eq!(card["name"], "acp-bridge");
+        assert_eq!(card["skills"][0]["id"], "coding-assistant");
+        assert_eq!(card["capabilities"]["streaming"], false);
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_method_returns_method_not_found() {
+        let base = serve_a2a().await;
+        let client = Client::new();
+        let resp = client
+            .post(&base)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "does/not/exist"}))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["id"], 1);
+        assert_eq!(body["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn message_send_rejects_empty_message() {
+        let base = serve_a2a().await;
+        let client = Client::new();
+        let resp = client
+            .post(&base)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "message/send",
+                "params": {"message": {"parts": []}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["id"], 2);
+        assert_eq!(body["error"]["code"], -32602);
+    }
+}
