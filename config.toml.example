@@ -29,6 +29,18 @@ timeout_secs = 300
 max_history_turns = 50
 
 # ---------------------------------------------------------------------------
+# A2A HTTP server (used with --a2a flag)
+# ---------------------------------------------------------------------------
+# [a2a]
+# host = "0.0.0.0"
+# port = 8080
+#
+# Require an "Authorization: Bearer <token>" header on all A2A requests.
+# STRONGLY recommended whenever the server is reachable beyond localhost.
+# Can also be set via the A2A_AUTH_TOKEN environment variable.
+# auth_token = "${A2A_AUTH_TOKEN}"
+
+# ---------------------------------------------------------------------------
 # Client mode — spawn an external ACP agent (used with --client flag)
 # ---------------------------------------------------------------------------
 # [agent]

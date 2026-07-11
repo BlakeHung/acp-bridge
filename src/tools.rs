@@ -1,5 +1,9 @@
-//! Built-in tools for acp-bridge — file reading, directory listing, code search.
-//! All tools are sandboxed to the working directory.
+//! Built-in tools for acp-bridge.
+//!
+//! The `read_file`, `list_dir`, and `search_code` tools are confined to the
+//! session working directory via [`resolve_sandboxed_path`]. The `bash` tool
+//! executes arbitrary shell commands and is therefore **not** sandboxed; it is
+//! disabled by default and only exposed when [`bash_enabled`] returns true.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -13,9 +17,32 @@ const MAX_LIST_DEPTH: usize = 3;
 /// Maximum entries in directory listing.
 const MAX_LIST_ENTRIES: usize = 200;
 
+/// Environment variable that opts in to the arbitrary-command `bash` tool.
+const ENABLE_BASH_ENV: &str = "ACP_BRIDGE_ENABLE_BASH";
+
+/// Whether the `bash` tool (arbitrary command execution) is enabled.
+///
+/// Disabled by default: the tool runs unrestricted shell commands and is
+/// reachable by the LLM on every transport, including the network-facing A2A
+/// HTTP server. Set `ACP_BRIDGE_ENABLE_BASH=1` (or `true`/`yes`) to opt in when
+/// the deployment explicitly trusts every source of prompts.
+pub fn bash_enabled() -> bool {
+    matches!(
+        std::env::var(ENABLE_BASH_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Tool definitions in OpenAI/Ollama function calling format.
+///
+/// The `bash` tool is only advertised when [`bash_enabled`] returns true so the
+/// LLM cannot request arbitrary command execution in the default configuration.
 pub fn tool_definitions() -> Vec<Value> {
-    vec![
+    let mut defs = vec![
         json!({
             "type": "function",
             "function": {
@@ -71,7 +98,10 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-        json!({
+    ];
+
+    if bash_enabled() {
+        defs.push(json!({
             "type": "function",
             "function": {
                 "name": "bash",
@@ -87,8 +117,10 @@ pub fn tool_definitions() -> Vec<Value> {
                     "required": ["command"]
                 }
             }
-        }),
-    ]
+        }));
+    }
+
+    defs
 }
 
 /// Resolve and validate a path within the sandbox.
@@ -144,6 +176,12 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
             execute_search_code(working_dir, pattern, file_glob)
         }
         "bash" => {
+            if !bash_enabled() {
+                warn!(
+                    "Rejected 'bash' tool call: disabled (set ACP_BRIDGE_ENABLE_BASH=1 to enable)"
+                );
+                return "Error: the 'bash' tool is disabled on this server".to_string();
+            }
             let command = arguments
                 .get("command")
                 .and_then(|v| v.as_str())

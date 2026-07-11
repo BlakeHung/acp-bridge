@@ -212,6 +212,8 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_MAX_HISTORY_TURNS` | `50` | Max conversation turns to keep (0 = unlimited) |
 | `LLM_MAX_SESSIONS` | `0` | Max concurrent sessions (0 = unlimited) |
 | `LLM_SESSION_IDLE_TIMEOUT` | `0` | Evict idle sessions after N seconds (0 = disabled) |
+| `A2A_AUTH_TOKEN` | (unset) | If set, A2A requests must send `Authorization: Bearer <token>` |
+| `ACP_BRIDGE_ENABLE_BASH` | (unset) | Set `1`/`true` to enable the arbitrary-command `bash` tool (off by default) |
 | `RUST_LOG` | `acp_bridge=info` | Log level (`debug`, `info`, `warn`, `error`) |
 
 Also supports `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_API_KEY` as aliases.
@@ -380,13 +382,18 @@ When spawned by openab, logs go to the child process's stderr. To capture them, 
 
 ## Security
 
-- **CWD sanitization** — the `cwd` parameter in `session/new` is sanitized to prevent prompt injection attacks
+- **CWD sanitization** — the `cwd` parameter in `session/new` is restricted to a safe character set and stripped of `..` parent-directory components, so a client cannot move the tool sandbox root above the requested directory
+- **Sandboxed file tools** — `read_file`, `list_dir`, and `search_code` are confined to the session working directory (paths are canonicalized and checked against the sandbox root)
+- **`bash` tool is opt-in** — the `bash` tool runs *arbitrary, unsandboxed* shell commands and is **disabled by default**. Enable it only when every source of prompts is trusted by setting `ACP_BRIDGE_ENABLE_BASH=1`
+- **Optional A2A authentication** — set `A2A_AUTH_TOKEN` to require an `Authorization: Bearer <token>` header on A2A JSON-RPC requests. When it is unset and the server binds a non-loopback address, a warning is logged at startup
 - **Temperature validation** — clamped to valid 0.0–2.0 range; NaN/Infinity values are filtered
 - **Error response guarantee** — JSON-RPC response is always sent even when the LLM backend fails, preventing client hangs
 
+> **A2A mode exposes an HTTP server.** By default it binds `0.0.0.0:8080` with no authentication. When exposing it beyond localhost, set `A2A_AUTH_TOKEN` (and/or place it behind a reverse proxy / network policy), and leave `ACP_BRIDGE_ENABLE_BASH` unset unless you fully trust every client.
+
 ## Limitations
 
-- No authentication or authorization — intended to run behind a trusted harness (openab, Zed)
+- Authentication is optional (`A2A_AUTH_TOKEN`) — otherwise intended to run behind a trusted harness (openab, Zed)
 - No persistent storage — all state is in-memory, lost on restart
 - Single-process — not designed for horizontal scaling
 

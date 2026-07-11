@@ -74,6 +74,8 @@ async fn main() {
         println!("  LLM_BASE_URL, LLM_MODEL, LLM_API_KEY, LLM_TIMEOUT, ...");
         println!("  A2A_HOST (default: 0.0.0.0), A2A_PORT (default: 8080)");
         println!("  A2A_AGENT_NAME, A2A_AGENT_DESCRIPTION");
+        println!("  A2A_AUTH_TOKEN (require 'Authorization: Bearer <token>' on A2A requests)");
+        println!("  ACP_BRIDGE_ENABLE_BASH (set 1 to enable the arbitrary-command bash tool)");
         println!("  AGENT_COMMAND, AGENT_ARGS, AGENT_WORKING_DIR (for --client mode)");
         return;
     }

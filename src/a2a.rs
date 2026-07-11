@@ -5,14 +5,14 @@
 
 use crate::engine::{self, AppState};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // A2A types
@@ -89,6 +89,9 @@ pub struct A2aConfig {
     pub port: u16,
     pub agent_name: String,
     pub agent_description: String,
+    /// Optional bearer token required on JSON-RPC requests. When `None`, the
+    /// server accepts unauthenticated requests (documented default).
+    pub auth_token: Option<String>,
 }
 
 impl Default for A2aConfig {
@@ -99,6 +102,7 @@ impl Default for A2aConfig {
             agent_name: "acp-bridge".into(),
             agent_description:
                 "Self-hosted AI agent bridge for air-gapped and enterprise environments".into(),
+            auth_token: None,
         }
     }
 }
@@ -115,8 +119,45 @@ impl A2aConfig {
             agent_name: std::env::var("A2A_AGENT_NAME").unwrap_or(defaults.agent_name),
             agent_description: std::env::var("A2A_AGENT_DESCRIPTION")
                 .unwrap_or(defaults.agent_description),
+            auth_token: normalize_token(std::env::var("A2A_AUTH_TOKEN").ok()),
         }
     }
+}
+
+/// Treat an empty/whitespace-only token as "no token configured".
+pub fn normalize_token(token: Option<String>) -> Option<String> {
+    token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Constant-time byte comparison to avoid leaking the token via timing.
+fn tokens_match(expected: &str, provided: &str) -> bool {
+    let a = expected.as_bytes();
+    let b = provided.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Validate the `Authorization: Bearer <token>` header against the configured
+/// token. Returns `true` when no token is configured (auth disabled).
+fn is_authorized(state: &A2aState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.config.auth_token.as_deref() else {
+        return true;
+    };
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    tokens_match(expected, provided)
 }
 
 // ---------------------------------------------------------------------------
@@ -176,9 +217,20 @@ async fn handle_agent_card(State(state): State<Arc<A2aState>>) -> Json<AgentCard
 /// POST / — A2A JSON-RPC dispatch.
 async fn handle_a2a_dispatch(
     State(state): State<Arc<A2aState>>,
+    headers: HeaderMap,
     Json(req): Json<A2aRequest>,
 ) -> impl IntoResponse {
     debug!(method = %req.method, "A2A request received");
+
+    if !is_authorized(&state, &headers) {
+        warn!(method = %req.method, "Rejected unauthorized A2A request");
+        let resp = jsonrpc_error(
+            req.id.as_ref(),
+            -32001,
+            "Unauthorized: invalid or missing bearer token",
+        );
+        return (StatusCode::UNAUTHORIZED, Json(resp));
+    }
 
     match req.method.as_str() {
         "message/send" => handle_message_send(&state, req).await,
@@ -292,8 +344,84 @@ pub async fn serve(
     let addr = format!("{}:{}", config.host, config.port);
     info!(addr = %addr, "Starting A2A HTTP server");
 
+    if config.auth_token.is_some() {
+        info!("A2A bearer-token authentication enabled");
+    } else {
+        let loopback =
+            config.host == "127.0.0.1" || config.host == "localhost" || config.host == "::1";
+        if !loopback {
+            warn!(
+                host = %config.host,
+                "A2A server is running WITHOUT authentication on a non-loopback address. \
+                 Anyone who can reach this port can send prompts. Set A2A_AUTH_TOKEN to require \
+                 a bearer token, or bind A2A_HOST=127.0.0.1."
+            );
+        }
+    }
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let router = a2a_router(state, config);
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::AppState;
+    use crate::llm::LlmConfig;
+    use axum::http::header::AUTHORIZATION;
+
+    fn state_with_token(token: Option<&str>) -> A2aState {
+        let config = A2aConfig {
+            auth_token: token.map(String::from),
+            ..A2aConfig::default()
+        };
+        A2aState {
+            app: AppState::new(LlmConfig::from_env()),
+            config,
+        }
+    }
+
+    fn headers_with_auth(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn is_authorized_allows_all_when_no_token_configured() {
+        let state = state_with_token(None);
+        assert!(is_authorized(&state, &HeaderMap::new()));
+        assert!(is_authorized(&state, &headers_with_auth("Bearer whatever")));
+    }
+
+    #[test]
+    fn is_authorized_requires_matching_bearer_when_token_set() {
+        let state = state_with_token(Some("s3cret"));
+        assert!(is_authorized(&state, &headers_with_auth("Bearer s3cret")));
+        assert!(!is_authorized(&state, &headers_with_auth("Bearer wrong")));
+        assert!(!is_authorized(&state, &headers_with_auth("s3cret")));
+        assert!(!is_authorized(&state, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn normalize_token_treats_blank_as_none() {
+        assert_eq!(normalize_token(None), None);
+        assert_eq!(normalize_token(Some("".into())), None);
+        assert_eq!(normalize_token(Some("   ".into())), None);
+        assert_eq!(
+            normalize_token(Some("  secret  ".into())),
+            Some("secret".into())
+        );
+    }
+
+    #[test]
+    fn tokens_match_compares_exactly() {
+        assert!(tokens_match("s3cret", "s3cret"));
+        assert!(!tokens_match("s3cret", "s3cre"));
+        assert!(!tokens_match("s3cret", "s3crett"));
+        assert!(!tokens_match("s3cret", "wrong!"));
+        assert!(!tokens_match("s3cret", ""));
+    }
 }

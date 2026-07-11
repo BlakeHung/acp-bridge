@@ -31,6 +31,7 @@ pub struct A2aSection {
     pub port: Option<u16>,
     pub agent_name: Option<String>,
     pub agent_description: Option<String>,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -150,6 +151,11 @@ impl ConfigFile {
                 .ok()
                 .or_else(|| self.a2a.agent_description.clone())
                 .unwrap_or(defaults.agent_description),
+            auth_token: crate::a2a::normalize_token(
+                std::env::var("A2A_AUTH_TOKEN")
+                    .ok()
+                    .or_else(|| self.a2a.auth_token.clone()),
+            ),
         }
     }
 

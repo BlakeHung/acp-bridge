@@ -250,6 +250,40 @@ pub fn initialize(config: &LlmConfig) -> Value {
     })
 }
 
+/// Sanitize a client-supplied `cwd`.
+///
+/// Filters to a conservative character set and removes `.`/`..` path
+/// components so the value cannot escape upward out of the requested
+/// directory. Preserves a leading `/` for absolute paths; a relative path
+/// that resolves to nothing collapses to `.`.
+fn sanitize_cwd(cwd: &str) -> String {
+    let filtered: String = cwd
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ' ' | '~'))
+        .collect();
+
+    let is_absolute = filtered.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in filtered.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+
+    let joined = parts.join("/");
+    if is_absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
 /// Handle `session/new` — creates a new session, returns session ID.
 pub fn session_new(state: &AppState, cwd: &str) -> Result<String, AcpError> {
     // Enforce max_sessions limit
@@ -262,11 +296,12 @@ pub fn session_new(state: &AppState, cwd: &str) -> Result<String, AcpError> {
         }
     }
 
-    // Sanitize cwd
-    let cwd: String = cwd
-        .chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ' ' | '~'))
-        .collect();
+    // Sanitize cwd: restrict to a conservative character set, then drop any
+    // parent-directory (`..`) components. Without the second step a client
+    // could pass `../../…` to move the tool sandbox root above the intended
+    // directory (read_file/list_dir/search_code and the bash working dir are
+    // all rooted at this path).
+    let cwd = sanitize_cwd(cwd);
 
     let session_id = Uuid::new_v4().to_string();
 
@@ -550,6 +585,32 @@ fn extract_response_text(response: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_cwd_preserves_normal_absolute_path() {
+        assert_eq!(
+            sanitize_cwd("/home/user/my-project/src"),
+            "/home/user/my-project/src"
+        );
+    }
+
+    #[test]
+    fn sanitize_cwd_strips_parent_traversal() {
+        assert_eq!(sanitize_cwd("/tmp/../../etc"), "/etc");
+        assert_eq!(sanitize_cwd("../../../root"), "root");
+        assert_eq!(sanitize_cwd("/a/b/../c"), "/a/c");
+    }
+
+    #[test]
+    fn sanitize_cwd_cannot_climb_above_root() {
+        assert_eq!(sanitize_cwd("/../../.."), "/");
+    }
+
+    #[test]
+    fn sanitize_cwd_collapses_dot_segments() {
+        assert_eq!(sanitize_cwd("/a/./b/./c"), "/a/b/c");
+        assert_eq!(sanitize_cwd("."), ".");
+    }
 
     #[test]
     fn extract_user_text_handles_acp_array_shape() {
