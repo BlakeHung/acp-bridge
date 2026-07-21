@@ -246,10 +246,20 @@ fn list_dir_recursive(
             continue;
         }
 
-        let file_type = entry
-            .file_type()
-            .unwrap_or_else(|_| std::fs::metadata(entry.path()).unwrap().file_type());
-        if file_type.is_dir() {
+        // Determine whether the entry is a directory. `file_type()` can fail
+        // for e.g. broken symlinks; fall back to `metadata()` (follows links)
+        // and skip the entry entirely if that also fails rather than panicking.
+        let is_dir = match entry.file_type() {
+            Ok(ft) => ft.is_dir(),
+            Err(_) => match std::fs::metadata(entry.path()) {
+                Ok(meta) => meta.is_dir(),
+                Err(e) => {
+                    warn!(entry = %name, error = %e, "Skipping entry: cannot stat");
+                    continue;
+                }
+            },
+        };
+        if is_dir {
             output.push_str(&format!("{prefix}{name}/\n"));
             *count += 1;
             list_dir_recursive(
