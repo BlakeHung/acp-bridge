@@ -531,3 +531,321 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
 
     let _ = tx.send(StreamChunk::Done).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Build an `LlmConfig` pointing at `base_url` with a short timeout so
+    /// error-path tests don't hang.
+    fn test_config(base_url: &str) -> LlmConfig {
+        LlmConfig {
+            base_url: base_url.to_string(),
+            model: "test-model".into(),
+            api_key: "test-key".into(),
+            system_prompt: None,
+            temperature: None,
+            max_tokens: None,
+            timeout_secs: 5,
+            max_history_turns: 50,
+            max_sessions: 0,
+            session_idle_timeout_secs: 0,
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client"),
+        }
+    }
+
+    /// Bind an ephemeral port, serve `router` in the background, and return the
+    /// base URL (e.g. `http://127.0.0.1:54321`).
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    // -- pure helpers -------------------------------------------------------
+
+    #[test]
+    fn is_ollama_native_detects_v1_suffix() {
+        assert!(test_config("http://localhost:11434").is_ollama_native());
+        assert!(!test_config("http://localhost:11434/v1").is_ollama_native());
+    }
+
+    #[test]
+    fn chat_url_switches_on_backend() {
+        assert_eq!(
+            test_config("http://host:11434").chat_url(),
+            "http://host:11434/api/chat"
+        );
+        assert_eq!(
+            test_config("http://host:8000/v1").chat_url(),
+            "http://host:8000/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn is_retryable_matches_transient_codes() {
+        for code in [408u16, 429, 500, 502, 503, 504] {
+            assert!(
+                is_retryable(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{code} should be retryable"
+            );
+        }
+        for code in [200u16, 400, 401, 403, 404, 501] {
+            assert!(
+                !is_retryable(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{code} should not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn build_body_includes_core_fields_only_by_default() {
+        let cfg = test_config("http://host/v1");
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let body = build_body(&cfg, &messages, "m", true, None);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"], json!(messages));
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn build_body_clamps_temperature() {
+        let mut cfg = test_config("http://host/v1");
+        cfg.temperature = Some(5.0);
+        let hi = build_body(&cfg, &[], "m", false, None);
+        assert_eq!(hi["temperature"], json!(2.0));
+
+        cfg.temperature = Some(-1.0);
+        let lo = build_body(&cfg, &[], "m", false, None);
+        assert_eq!(lo["temperature"], json!(0.0));
+
+        cfg.temperature = Some(0.7);
+        let ok = build_body(&cfg, &[], "m", false, None);
+        assert_eq!(ok["temperature"], json!(0.7));
+    }
+
+    #[test]
+    fn build_body_adds_max_tokens_and_tools() {
+        let mut cfg = test_config("http://host/v1");
+        cfg.max_tokens = Some(256);
+        let tools = vec![json!({"type": "function", "function": {"name": "read"}})];
+        let body = build_body(&cfg, &[], "m", false, Some(&tools));
+        assert_eq!(body["max_tokens"], json!(256));
+        assert_eq!(body["tools"], json!(tools));
+    }
+
+    // -- probe_backend ------------------------------------------------------
+
+    #[tokio::test]
+    async fn probe_backend_reads_ollama_tags() {
+        async fn tags() -> impl IntoResponse {
+            Json(json!({"models": [{"name": "llama3:8b"}, {"name": "qwen2:7b"}]}))
+        }
+        let url = serve(Router::new().route("/api/tags", get(tags))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let models = probe_backend(&cfg).await.unwrap();
+        assert_eq!(models, vec!["llama3:8b", "qwen2:7b"]);
+    }
+
+    #[tokio::test]
+    async fn probe_backend_falls_back_to_openai_models() {
+        async fn models() -> impl IntoResponse {
+            Json(json!({"data": [{"id": "gpt-local"}]}))
+        }
+        // No /api/tags route → Ollama probe fails, falls back to /v1/models.
+        let url = serve(Router::new().route("/v1/models", get(models))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let found = probe_backend(&cfg).await.unwrap();
+        assert_eq!(found, vec!["gpt-local"]);
+    }
+
+    #[tokio::test]
+    async fn probe_backend_reports_http_error() {
+        async fn err() -> impl IntoResponse {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let url = serve(Router::new().route("/v1/models", get(err))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let res = probe_backend(&cfg).await;
+        assert!(res.is_err(), "expected Err, got {res:?}");
+    }
+
+    // -- query_model_info / query_running_models ----------------------------
+
+    #[tokio::test]
+    async fn query_model_info_none_for_openai_backend() {
+        let cfg = test_config("http://host/v1");
+        assert!(query_model_info(&cfg).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_model_info_reads_context_length() {
+        async fn show() -> impl IntoResponse {
+            Json(json!({"model_info": {"llama.context_length": 8192}}))
+        }
+        let url = serve(Router::new().route("/api/show", post(show))).await;
+        // No /v1 suffix → treated as Ollama native.
+        let cfg = test_config(&url);
+        let info = query_model_info(&cfg).await.expect("model info");
+        assert_eq!(info.context_length, 8192);
+    }
+
+    #[tokio::test]
+    async fn query_running_models_lists_loaded() {
+        async fn ps() -> impl IntoResponse {
+            Json(json!({"models": [{"name": "loaded:latest"}]}))
+        }
+        let url = serve(Router::new().route("/api/ps", get(ps))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let models = query_running_models(&cfg).await.expect("running models");
+        assert_eq!(models, vec!["loaded:latest"]);
+    }
+
+    // -- chat (retry + errors) ---------------------------------------------
+
+    #[tokio::test]
+    async fn chat_returns_response_on_success() {
+        async fn ok() -> impl IntoResponse {
+            Json(json!({"choices": [{"message": {"content": "hi"}}]}))
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(ok))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let val = chat(&cfg, &[], None, None).await.unwrap();
+        assert_eq!(val["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn chat_retries_transient_then_succeeds() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        async fn handler(State(c): State<Arc<AtomicUsize>>) -> Response {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+            } else {
+                Json(json!({"choices": [{"message": {"content": "ok"}}]})).into_response()
+            }
+        }
+        use axum::extract::State;
+        let router = Router::new()
+            .route("/v1/chat/completions", post(handler))
+            .with_state(counter.clone());
+        let url = serve(router).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let val = chat(&cfg, &[], None, None).await.unwrap();
+        assert_eq!(val["choices"][0]["message"]["content"], "ok");
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "should retry once");
+    }
+
+    #[tokio::test]
+    async fn chat_returns_err_on_non_retryable_status() {
+        async fn bad() -> impl IntoResponse {
+            axum::http::StatusCode::BAD_REQUEST
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(bad))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let err = chat(&cfg, &[], None, None).await.unwrap_err();
+        assert!(err.contains("400"), "err was: {err}");
+    }
+
+    // -- streaming ----------------------------------------------------------
+
+    async fn collect_stream(mut rx: mpsc::Receiver<StreamChunk>) -> (String, bool) {
+        let mut text = String::new();
+        let mut done = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Content(c) => text.push_str(&c),
+                StreamChunk::Done => {
+                    done = true;
+                    break;
+                }
+                StreamChunk::Error(e) => panic!("unexpected stream error: {e}"),
+            }
+        }
+        (text, done)
+    }
+
+    #[tokio::test]
+    async fn stream_chat_parses_openai_sse() {
+        async fn sse() -> impl IntoResponse {
+            let chunks = vec![
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"content": "Hello"}}]})
+                ),
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"delta": {"content": " world"}}]})
+                ),
+                "data: [DONE]\n\n".to_string(),
+            ];
+            let stream = futures_lite::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+            );
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(sse))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let rx = stream_chat(&cfg, &[], None).await.unwrap();
+        let (text, done) = collect_stream(rx).await;
+        assert_eq!(text, "Hello world");
+        assert!(done);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_parses_ollama_ndjson() {
+        async fn ndjson() -> impl IntoResponse {
+            let chunks = vec![
+                format!(
+                    "{}\n",
+                    json!({"message": {"content": "foo"}, "done": false})
+                ),
+                format!(
+                    "{}\n",
+                    json!({"message": {"content": "bar"}, "done": false})
+                ),
+                format!("{}\n", json!({"done": true})),
+            ];
+            let stream = futures_lite::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+            );
+            Response::builder().body(Body::from_stream(stream)).unwrap()
+        }
+        // No /v1 suffix → Ollama native NDJSON parser.
+        let url = serve(Router::new().route("/api/chat", post(ndjson))).await;
+        let cfg = test_config(&url);
+        let rx = stream_chat(&cfg, &[], None).await.unwrap();
+        let (text, done) = collect_stream(rx).await;
+        assert_eq!(text, "foobar");
+        assert!(done);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_errors_on_non_retryable_status() {
+        async fn bad() -> impl IntoResponse {
+            axum::http::StatusCode::UNAUTHORIZED
+        }
+        let url = serve(Router::new().route("/v1/chat/completions", post(bad))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let err = stream_chat(&cfg, &[], None).await.unwrap_err();
+        assert!(err.contains("401"), "err was: {err}");
+    }
+}
