@@ -404,6 +404,7 @@ pub async fn session_prompt(
     notify(Notification::ToolStart("llm_chat".into()));
 
     let mut had_error = false;
+    let mut got_final_response = false;
     let mut final_text = String::new();
     let tool_defs = tools::tool_definitions();
 
@@ -413,7 +414,12 @@ pub async fn session_prompt(
             let sessions = state.sessions_read();
             match sessions.get(session_id) {
                 Some(s) => (s.messages.clone(), s.working_dir.clone()),
-                None => break,
+                None => {
+                    warn!(session_id, "Session removed during prompt processing");
+                    had_error = true;
+                    final_text = format!("Session {session_id} was removed during processing");
+                    break;
+                }
             }
         };
 
@@ -424,6 +430,7 @@ pub async fn session_prompt(
                 let tool_calls = extract_tool_calls(&response);
 
                 if tool_calls.is_empty() {
+                    got_final_response = true;
                     let text = extract_response_text(&response);
                     if !text.is_empty() {
                         final_text = text.clone();
@@ -491,6 +498,23 @@ pub async fn session_prompt(
                 break;
             }
         }
+    }
+
+    // The loop can also exit by exhausting MAX_TOOL_ROUNDS while the model
+    // keeps requesting tools. Without this the turn would be reported as a
+    // successful "completed" with empty text, silently swallowing the fact
+    // that the model never produced a final answer.
+    if !had_error && !got_final_response {
+        warn!(
+            max_rounds = MAX_TOOL_ROUNDS,
+            "Tool-call loop hit round limit without a final response"
+        );
+        let msg = format!(
+            "\n\n**Error:** reached the tool-call limit ({MAX_TOOL_ROUNDS} rounds) without a final answer\n"
+        );
+        notify(Notification::TextChunk(msg.clone()));
+        final_text = msg;
+        had_error = true;
     }
 
     let status = if had_error { "failed" } else { "completed" };

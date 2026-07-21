@@ -263,4 +263,109 @@ mod tests {
         assert_eq!(r.completion_tokens, None);
         assert!(r.decode_tps.is_none());
     }
+
+    #[test]
+    fn default_fixtures_cover_expected_set() {
+        let fx = default_fixtures();
+        assert_eq!(fx.len(), 5);
+        let names: Vec<&str> = fx.iter().map(|f| f.name).collect();
+        assert_eq!(
+            names,
+            [
+                "hello",
+                "short_code",
+                "explain_concept",
+                "refactor",
+                "summarize"
+            ]
+        );
+        // Decode-heavy fixtures intentionally omit a system prompt.
+        assert!(fx.iter().any(|f| f.system_prompt.is_none()));
+        assert!(fx.iter().all(|f| !f.user_text.is_empty()));
+    }
+
+    #[test]
+    fn openai_zero_completion_tokens_yields_no_tps() {
+        let val = json!({"usage": {"prompt_tokens": 10, "completion_tokens": 0}});
+        let r = parse_result("t", &val, 1000);
+        assert_eq!(r.prompt_tokens, Some(10));
+        assert_eq!(r.completion_tokens, Some(0));
+        assert!(r.decode_tps.is_none());
+    }
+
+    #[test]
+    fn openai_zero_wall_ms_yields_no_tps() {
+        let val = json!({"usage": {"prompt_tokens": 10, "completion_tokens": 20}});
+        let r = parse_result("t", &val, 0);
+        assert_eq!(r.completion_tokens, Some(20));
+        assert!(r.decode_tps.is_none());
+    }
+
+    #[test]
+    fn ollama_missing_eval_duration_yields_no_tps() {
+        let val = json!({"prompt_eval_count": 10, "eval_count": 40});
+        let r = parse_result("t", &val, 1000);
+        assert_eq!(r.prompt_tokens, Some(10));
+        assert_eq!(r.completion_tokens, Some(40));
+        assert!(r.decode_tps.is_none());
+    }
+
+    #[test]
+    fn ollama_zero_eval_duration_yields_no_tps() {
+        let val = json!({"eval_count": 40, "eval_duration": 0});
+        let r = parse_result("t", &val, 1000);
+        assert!(r.decode_tps.is_none());
+    }
+
+    fn dummy_config(base_url: &str) -> LlmConfig {
+        LlmConfig {
+            base_url: base_url.to_string(),
+            model: "m".into(),
+            api_key: "k".into(),
+            system_prompt: None,
+            temperature: None,
+            max_tokens: None,
+            timeout_secs: 5,
+            max_history_turns: 50,
+            max_sessions: 0,
+            session_idle_timeout_secs: 0,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("client"),
+        }
+    }
+
+    #[test]
+    fn print_report_handles_mixed_results_without_panic() {
+        // OpenAI-compatible backend (base_url ends with /v1).
+        let cfg = dummy_config("http://host/v1");
+        let results = vec![
+            RunResult {
+                name: "ok",
+                wall_ms: 1200,
+                prompt_tokens: Some(10),
+                completion_tokens: Some(50),
+                decode_tps: Some(41.6),
+                error: None,
+            },
+            RunResult {
+                name: "err",
+                wall_ms: 0,
+                prompt_tokens: None,
+                completion_tokens: None,
+                decode_tps: None,
+                error: Some("boom".into()),
+            },
+        ];
+        // Smoke test — the report writes to stdout; we assert it doesn't panic.
+        print_report(&cfg, &results);
+    }
+
+    #[test]
+    fn print_report_handles_empty_results_and_native_backend() {
+        // Ollama-native backend (no /v1 suffix) with no results.
+        let cfg = dummy_config("http://host:11434");
+        print_report(&cfg, &[]);
+    }
 }
