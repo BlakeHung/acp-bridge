@@ -955,6 +955,76 @@ async fn mock_chat_completions_with_tools(
     }
 }
 
+/// Mock that always returns a `list_dir` tool call and never a final answer,
+/// forcing the engine's tool loop to exhaust MAX_TOOL_ROUNDS.
+fn mock_llm_always_tool_router() -> Router {
+    Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(mock_chat_completions_always_tool),
+        )
+        .route("/api/tags", get(mock_ollama_tags))
+}
+
+async fn mock_chat_completions_always_tool() -> impl IntoResponse {
+    axum::Json(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_loop",
+                    "type": "function",
+                    "function": {
+                        "name": "list_dir",
+                        "arguments": "{\"path\": \".\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_round_limit_surfaces_failure() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_always_tool_router(),
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"loop forever"}]}
+    }));
+
+    let (_notifications, response) = h.read_until_response(2);
+
+    // The model never produces a final answer, so instead of a silent
+    // "completed" with empty text the turn must be reported as failed with a
+    // message that explains the tool-call limit was reached.
+    assert_eq!(response["result"]["status"], "failed");
+    assert!(
+        response["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("tool-call limit"),
+        "Expected tool-call limit message, got: {:?}",
+        response["result"]["text"]
+    );
+
+    h.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_call_list_dir() {
     let port = free_port();
