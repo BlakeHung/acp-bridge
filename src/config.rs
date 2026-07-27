@@ -148,7 +148,6 @@ mod tests {
                 system_prompt: Some("from file".into()),
                 ..LlmSection::default()
             },
-            ..ConfigFile::default()
         };
 
         let llm = cfg.into_llm_config();
@@ -164,7 +163,6 @@ mod tests {
                 system_prompt: Some("from file".into()),
                 ..LlmSection::default()
             },
-            ..ConfigFile::default()
         };
 
         let llm = cfg.into_llm_config();
