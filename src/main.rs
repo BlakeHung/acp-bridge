@@ -89,7 +89,6 @@ async fn main() {
         .as_ref()
         .map(|path| ConfigFile::load(std::path::Path::new(path)));
 
-
     let config = match config_file {
         Some(file) => file.into_llm_config(),
         None => llm::LlmConfig::from_env(),

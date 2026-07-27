@@ -3,10 +3,10 @@ name = "acp-bridge"
 version = "0.7.7"
 edition = "2021"
 authors = ["Blake Labs"]
-description = "ACP/A2A adapter for self-hosted AI — bridges local LLM backends to Agent Client Protocol and Agent-to-Agent protocol"
+description = "ACP adapter for local AI — bridges local LLM backends to Agent Client Protocol"
 license = "MIT"
 repository = "https://github.com/BlakeHung/acp-bridge"
-keywords = ["acp", "a2a", "ollama", "local-ai", "agent-protocol"]
+keywords = ["acp", "ollama", "local-ai", "agent-protocol"]
 categories = ["command-line-utilities"]
 
 [lib]
