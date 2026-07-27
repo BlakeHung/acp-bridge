@@ -1,53 +1,26 @@
 # ACP-Bridge
 
-ACP ([Agent Client Protocol](https://agentclientprotocol.com)) adapter for **self-hosted AI** — the zero-cloud, zero-dependency bridge for air-gapped and enterprise environments.
-
-When OpenCode can't reach the internet, acp-bridge can still run.
+ACP ([Agent Client Protocol](https://agentclientprotocol.com)) adapter for **self-hosted AI** — a minimal, air-gap friendly bridge between ACP harnesses and local inference backends.
 
 Written in Rust. Single ~5MB binary. Zero runtime dependencies. Fully offline.
 
-## Project status — active development
+## Project status — minimal maintenance
 
-acp-bridge is actively maintained, focused on a niche neither OpenCode nor Cline currently fills: **fully air-gapped local AI coding agents that speak ACP**. v0.7.x delivers a working subset of the ACP server surface (`initialize`, `session/new`, `session/prompt`, `session/end`) with streaming notifications and tool calling, and advertises `agentCapabilities` so editors like Zed and Neovim can feature-detect correctly.
+acp-bridge is intentionally **narrow in scope**: it implements the ACP server surface (`initialize`, `session/new`, `session/prompt`, `session/end`) over stdin/stdout JSON-RPC, translates requests to Ollama-native or OpenAI-compatible local backends, and streams back `agent_message_chunk` notifications.
 
-Roadmap (2026-Q3):
+It does **not** try to be a general-purpose agent runtime, orchestrator, or A2A server. It is a backend adapter: a small, auditable piece you can drop behind `openab`, `opencode acp`, Zed, or any ACP harness that can spawn a subprocess and read/write JSON-RPC over stdio.
 
-- Full ACP spec compliance — `session/load`, `session/resume`, `session/set_mode`
-- Integration tests against thinking-on chat templates (Qwen3, DeepSeek-R1, GLM, Kimi-K2) that currently break in mainstream alternatives
-- Optional audit log mode for regulated deployments
+## Positioning
 
-## Relationship to OpenCode
+acp-bridge is not a replacement for full-stack agents like OpenCode or Claude Code. It is a **backend adapter** for ACP harnesses that need a clean, offline-only path to local inference servers.
 
-[OpenCode](https://opencode.ai) is a feature-rich coding agent with an ACP surface (`opencode acp`) and a broad provider matrix via the Vercel AI SDK. For online, cloud-leaning workflows it is the right tool.
+Use it when:
 
-For the air-gapped local-AI path, however, OpenCode has several open issues as of mid-2026:
+- The deployment is air-gapped or has strict egress policies.
+- You need a single static binary that only talks to the configured LLM endpoint.
+- You want Ollama-native performance plus OpenAI-compatible backend support in one adapter.
 
-- ACP server `newSession` returns `Method not found` ([opencode#24846])
-- `opencode acp --port` exits immediately on start ([opencode#22795])
-- Ollama / vLLM / llama.cpp / LM Studio adapters have unresolved tool-calling bugs across thinking-on templates ([opencode#22132], [opencode#27920], [opencode#25351])
-- Air-gap mode still leaks network calls to models.dev, LSP manifests, and ripgrep binary fetch ([opencode#18492])
-
-acp-bridge targets the same protocol but a narrower scope: **air-gap clean, local-first, ACP-compliant**.
-
-| Concern | OpenCode | acp-bridge |
-|---------|----------|-----------|
-| Provider breadth | 75+ via AI SDK (cloud-leaning) | OpenAI-compatible + Ollama native |
-| Network footprint | models.dev, LSP, update, ripgrep fetches | Outbound only to configured LLM endpoint |
-| Runtime | Node.js + npm | Single 5MB static Rust binary |
-| Tool surface | Full agent (edit, shell, web) | 3 sandboxed read-only tools |
-| Air-gap audit | Per-release verification | Binary small enough to audit once |
-| ACP server stability | Active issues on `newSession`, `--port` | Spec-compliant `initialize` + session lifecycle |
-
-**Use OpenCode** when you want the full cloud-and-local agent toolkit. **Use acp-bridge** when the deployment requires a fully offline, audit-friendly bridge — air-gapped sites, regulated industries, edge / embedded ACP harnesses, CI runners with strict egress policies.
-
-See [When to use acp-bridge vs OpenCode](#when-to-use-acp-bridge-vs-opencode) below for a per-scenario breakdown.
-
-[opencode#24846]: https://github.com/anomalyco/opencode/issues/24846
-[opencode#22795]: https://github.com/anomalyco/opencode/issues/22795
-[opencode#22132]: https://github.com/anomalyco/opencode/issues/22132
-[opencode#27920]: https://github.com/anomalyco/opencode/issues/27920
-[opencode#25351]: https://github.com/anomalyco/opencode/issues/25351
-[opencode#18492]: https://github.com/anomalyco/opencode/issues/18492
+Use a fuller agent runtime (e.g. `opencode acp`) when you need provider breadth, marketplace integrations, or cloud-leaning workflows.
 
 ## Why acp-bridge
 
@@ -58,26 +31,15 @@ acp-bridge addresses the "can't go online" and "won't go online" cases.
 
 - **Air-gapped / internal deployment** — data never leaves the machine; suitable for strict-compliance enterprise environments
 - **Zero cloud dependency** — all inference runs on your hardware, no API key required
-- **Special backends** — vLLM, llama.cpp, TGI, and other inference engines OpenCode doesn't directly support
-- **Ollama native integration** — auto-detects Ollama and uses native `/api/chat` with NDJSON streaming, model info query, and VRAM status check
+- **Backend flexibility** — Ollama native `/api/chat`, or any OpenAI-compatible server (vLLM, llama.cpp, TGI, LocalAI, LM Studio, Jan)
 - **Embeddable** — 5MB binary; drop into Docker Compose, CI/CD pipelines, or any ACP harness
-- **Enterprise-ready** — structured logging, retry with backoff, graceful shutdown, configurable history limits
+- **Minimal attack surface** — no telemetry, no update checks, no remote model registry calls
 
-## When to use acp-bridge vs OpenCode
+## When to use
 
-```
-┌─────────────────────────────┬──────────────────┬──────────────────────┐
-│ Scenario                    │ OpenCode         │ acp-bridge           │
-├─────────────────────────────┼──────────────────┼──────────────────────┤
-│ Online + Ollama Cloud       │ ✓ preferred      │ works, redundant     │
-│ Online + Claude/GPT API     │ ✓ preferred      │ ✗                    │
-│ Internal + Ollama local     │ works            │ ✓ preferred          │
-│ Air-gapped                  │ ✗                │ ✓ only choice        │
-│ vLLM / TGI / llama.cpp      │ ✗                │ ✓ only choice        │
-│ Docker Compose embed        │ works, heavy     │ ✓ 5MB binary         │
-│ Strict offline compliance   │ verify yourself  │ ✓ guaranteed offline │
-└─────────────────────────────┴──────────────────┴──────────────────────┘
-```
+- Air-gapped or no-internet environments where you run Ollama, vLLM, llama.cpp, or another local backend.
+- CI runners, edge devices, or regulated deployments that need a single auditable binary.
+- As a backend adapter for `opencode acp`, `openab`, Zed, or any ACP harness that spawns its agent via stdio.
 
 ## Architecture
 
