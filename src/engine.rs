@@ -4,7 +4,7 @@
 //! Transport layers (stdin/stdout ACP, HTTP A2A) call these functions and
 //! deliver results in their own format.
 
-use crate::llm::{self, LlmConfig};
+use crate::llm::{self, DEFAULT_IMAGE_MIME, ImageBlock, LlmConfig};
 use crate::protocol::{AcpError, Session};
 use crate::tools;
 use serde_json::{json, Value};
@@ -31,17 +31,6 @@ pub fn extract_text_parts(parts: &[Value]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-
-/// A multi-modal image block — base64 data plus the MIME type the client
-/// declared. Default fallback is `image/jpeg` for clients that omit the
-/// MIME (older or out-of-spec).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageBlock {
-    pub data: String,
-    pub mime_type: String,
-}
-
-const DEFAULT_IMAGE_MIME: &str = "image/jpeg";
 
 /// Extract base64 image content blocks from a slice of ACP/A2A content parts.
 /// Preserves the per-block `mimeType` so multimodal LLM payloads round-trip
@@ -319,41 +308,12 @@ pub async fn session_prompt(
             }
         };
         session.touch();
-        if user_images.is_empty() {
-            session
-                .messages
-                .push(json!({"role": "user", "content": user_text}));
-        } else {
-            // Ollama native API: images are base64 strings in "images" array
-            // OpenAI compat API: images are in content array with type "image_url"
-            if state.config.is_ollama_native() {
-                // Ollama native takes base64 strings in `images`; no MIME field.
-                let images: Vec<&str> = user_images.iter().map(|i| i.data.as_str()).collect();
-                session.messages.push(json!({
-                    "role": "user",
-                    "content": user_text,
-                    "images": images
-                }));
-            } else {
-                // OpenAI-compat multimodal: text + image_url parts in a
-                // content array. user_images is guaranteed non-empty here
-                // by the outer branch. Use each block's declared MIME type
-                // so PNG/WebP/GIF aren't misencoded as JPEG.
-                let mut content_parts: Vec<Value> =
-                    vec![json!({"type": "text", "text": user_text})];
-                for img in user_images {
-                    content_parts.push(json!({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": format!("data:{};base64,{}", img.mime_type, img.data)
-                        }
-                    }));
-                }
-                session
-                    .messages
-                    .push(json!({"role": "user", "content": content_parts}));
-            }
-        }
+        session.messages.push(
+            state
+                .config
+                .backend()
+                .format_user_message(user_text, user_images),
+        );
 
         if state.config.max_history_turns > 0 {
             let before = session.messages.len();
@@ -388,15 +348,16 @@ pub async fn session_prompt(
             }
         };
 
+        let backend = state.config.backend();
         let chat_result = llm::chat(&state.config, &messages, None, Some(&tool_defs)).await;
 
         match chat_result {
             Ok(response) => {
-                let tool_calls = extract_tool_calls(&response);
+                let tool_calls = backend.extract_tool_calls(&response);
 
                 if tool_calls.is_empty() {
                     got_final_response = true;
-                    let text = extract_response_text(&response);
+                    let text = backend.extract_response_text(&response);
                     if !text.is_empty() {
                         final_text = text.clone();
                         {
@@ -418,11 +379,8 @@ pub async fn session_prompt(
                 {
                     let mut sessions = state.sessions_write();
                     if let Some(session) = sessions.get_mut(session_id) {
-                        let assistant_msg = if state.config.is_ollama_native() {
-                            json!({"role": "assistant", "content": "", "tool_calls": tool_calls})
-                        } else {
-                            response["choices"][0]["message"].clone()
-                        };
+                        let assistant_msg =
+                            backend.format_assistant_message("", &tool_calls, &response);
                         session.messages.push(assistant_msg);
                     }
                 }
@@ -445,11 +403,9 @@ pub async fn session_prompt(
                             tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
                         let mut sessions = state.sessions_write();
                         if let Some(session) = sessions.get_mut(session_id) {
-                            session.messages.push(json!({
-                                "role": "tool",
-                                "content": result,
-                                "tool_call_id": tool_call_id
-                            }));
+                            session
+                                .messages
+                                .push(backend.format_tool_result(tool_call_id, &result));
                         }
                     }
                 }
@@ -516,37 +472,8 @@ pub struct PromptResult {
 }
 
 // ---------------------------------------------------------------------------
-// LLM response helpers (moved from main.rs)
-// ---------------------------------------------------------------------------
-
-/// Extract tool calls from an LLM response (supports both Ollama and OpenAI format).
-fn extract_tool_calls(response: &Value) -> Vec<Value> {
-    response_message_field(response, "tool_calls")
-        .and_then(|tc| tc.as_array())
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// Extract text content from an LLM response (supports both formats).
-fn extract_response_text(response: &Value) -> String {
-    response_message_field(response, "content")
-        .and_then(|c| c.as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn response_message_field<'a>(response: &'a Value, field: &str) -> Option<&'a Value> {
-    response
-        .get("message")
-        .and_then(|m| m.get(field))
-        .or_else(|| {
-            response
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get(field))
-        })
-}
+// Backend-specific message formatting, response extraction, and tool-call handling
+// now live in `crate::llm::Backend` so `engine` stays transport-agnostic.
 
 #[cfg(test)]
 mod tests {
