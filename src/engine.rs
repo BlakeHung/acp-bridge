@@ -4,7 +4,7 @@
 //! Transport layers (stdin/stdout ACP, HTTP A2A) call these functions and
 //! deliver results in their own format.
 
-use crate::llm::{self, ImageBlock, LlmConfig};
+use crate::llm::{self, DEFAULT_IMAGE_MIME, ImageBlock, LlmConfig};
 use crate::protocol::{AcpError, Session};
 use crate::tools;
 use serde_json::{json, Value};
