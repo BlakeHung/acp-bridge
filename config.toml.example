@@ -28,14 +28,8 @@ timeout_secs = 300
 # Prevents memory growth in long sessions
 max_history_turns = 50
 
-# ---------------------------------------------------------------------------
-# Client mode — spawn an external ACP agent (used with --client flag)
-# ---------------------------------------------------------------------------
-# [agent]
-# command = "opencode"
-# args = ["acp"]
-# working_dir = "/home/node"
-#
-# # Optional environment variables passed to the agent process
-# [agent.env]
-# OPENAI_API_KEY = "${OPENAI_API_KEY}"
+# Max concurrent sessions (0 = unlimited)
+# max_sessions = 0
+
+# Evict idle sessions after N seconds (0 = disabled)
+# session_idle_timeout_secs = 0
