@@ -33,10 +33,11 @@ toml = "0.8"
 tokio-test = "0.4"
 hyper = "1"
 futures-lite = "2"
+axum = "0.8"
 
 # Release profile tuned for edge / air-gapped deployments — smaller binary,
 # at the cost of longer compile time. Keeps default unwinding so panics
-# don't orphan spawned child agents in --client mode.
+# don't orphan spawned processes.
 [profile.release]
 lto = "thin"
 codegen-units = 1
