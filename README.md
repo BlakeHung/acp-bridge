@@ -8,7 +8,9 @@ Written in Rust. Single ~5MB binary. Zero runtime dependencies. Fully offline.
 
 ## Project status — active development
 
-acp-bridge is actively maintained, focused on a niche neither OpenCode nor Cline currently fills: **fully air-gapped local AI coding agents that speak ACP**. v0.7.x delivers a working subset of the ACP server surface (`initialize`, `session/new`, `session/prompt`, `session/end`) with streaming notifications and tool calling, and advertises `agentCapabilities` so editors like Zed and Neovim can feature-detect correctly.
+acp-bridge is actively maintained, focused on a niche neither OpenCode nor Cline currently fills: **fully air-gapped local AI coding agents that speak ACP**. v0.7.8 delivers a working subset of the ACP server surface (`initialize`, `session/new`, `session/prompt`, `session/end`) with streaming notifications and tool calling, and advertises `agentCapabilities` so editors like Zed and Neovim can feature-detect correctly.
+
+**v0.7.8**: Removed A2A and Client modes; acp-bridge is now an ACP-only adapter focused on stdin/stdout JSON-RPC transport.
 
 Roadmap (2026-Q3):
 
@@ -130,7 +132,6 @@ acp-bridge makes **zero outbound network calls** beyond the user-configured LLM 
 - No remote model registry lookups (no calls to `models.dev` or similar)
 - No automatic MCP server fetching — `mcpServers` in `session/new` is logged but not executed
 - The only HTTP traffic is to `LLM_BASE_URL` (default `http://localhost:11434/v1`)
-- The only socket bind is the optional `--a2a` HTTP server (off by default; you opt in)
 
 This makes acp-bridge safe to run on truly air-gapped networks: the binary will work identically with a local Ollama instance on a disconnected machine, and there is no failure path that depends on internet reachability.
 
@@ -169,6 +170,9 @@ LLM_BASE_URL=http://localhost:8000/v1 LLM_MODEL=meta-llama/Llama-3-8b ./target/r
 
 # Run with config file
 ./target/release/acp-bridge config.toml
+
+# Run benchmark mode
+./target/release/acp-bridge --bench
 ```
 
 ### With Docker

@@ -1,14 +1,11 @@
-//! acp-bridge — ACP/A2A adapter for self-hosted AI services.
+//! acp-bridge — Minimal ACP adapter for local AI.
 //!
-//! Supports two transport modes:
-//! - **ACP mode** (default): stdin/stdout JSON-RPC, spawned by openab/Zed/JetBrains
-//! - **A2A mode** (`--a2a`): HTTP server with Agent Card and A2A protocol
+//! Single transport: stdin/stdout JSON-RPC 2.0 (ACP).
+//! Spawns by openab, Zed, JetBrains, or any ACP harness.
 
-use acp_bridge::a2a::{self, A2aConfig};
 use acp_bridge::acp;
 use acp_bridge::bench;
-use acp_bridge::client;
-use acp_bridge::config::{AgentConfig, ConfigFile};
+use acp_bridge::config::ConfigFile;
 use acp_bridge::engine::{self, AppState, Notification};
 use acp_bridge::hardware;
 use acp_bridge::llm;
@@ -25,12 +22,8 @@ use tracing::{debug, error, info, warn};
 // ---------------------------------------------------------------------------
 
 enum RunMode {
-    /// stdin/stdout ACP (backward compatible, default)
+    /// stdin/stdout ACP (default)
     Acp,
-    /// HTTP A2A server
-    A2a,
-    /// Client mode — spawn and interact with an external ACP agent
-    Client,
     /// Benchmark mode — run fixture prompts against the configured LLM, print stats, exit.
     Bench,
 }
@@ -51,7 +44,7 @@ async fn main() {
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "acp-bridge {} — ACP/A2A adapter for self-hosted AI",
+            "acp-bridge {} — Minimal ACP adapter for local AI",
             env!("CARGO_PKG_VERSION")
         );
         println!();
@@ -60,8 +53,6 @@ async fn main() {
         println!();
         println!("MODES:");
         println!("  (default)    ACP mode — stdin/stdout JSON-RPC (act as agent)");
-        println!("  --a2a        A2A mode — HTTP server with Agent Card");
-        println!("  --client     Client mode — spawn and interact with an external ACP agent");
         println!(
             "  --bench      Benchmark mode — run fixture prompts against LLM, print stats, exit"
         );
@@ -72,18 +63,11 @@ async fn main() {
         println!();
         println!("ENVIRONMENT:");
         println!("  LLM_BASE_URL, LLM_MODEL, LLM_API_KEY, LLM_TIMEOUT, ...");
-        println!("  A2A_HOST (default: 0.0.0.0), A2A_PORT (default: 8080)");
-        println!("  A2A_AGENT_NAME, A2A_AGENT_DESCRIPTION");
-        println!("  AGENT_COMMAND, AGENT_ARGS, AGENT_WORKING_DIR (for --client mode)");
         return;
     }
 
     let mode = if args.iter().any(|a| a == "--bench") {
         RunMode::Bench
-    } else if args.iter().any(|a| a == "--client") {
-        RunMode::Client
-    } else if args.iter().any(|a| a == "--a2a") {
-        RunMode::A2a
     } else {
         RunMode::Acp
     };
@@ -105,35 +89,9 @@ async fn main() {
         .as_ref()
         .map(|path| ConfigFile::load(std::path::Path::new(path)));
 
-    // In client mode, we only need the agent config
-    if let RunMode::Client = mode {
-        let agent_config = config_file
-            .as_ref()
-            .and_then(|f| f.agent_config())
-            .or_else(AgentConfig::from_env);
-
-        match agent_config {
-            Some(ac) => {
-                for line in hardware::detect().report_lines() {
-                    info!("{line}");
-                }
-                client::run_client_mode(&ac).await;
-                return;
-            }
-            None => {
-                eprintln!("Error: --client mode requires agent config.");
-                eprintln!("Set AGENT_COMMAND env var or add [agent] section to config.toml");
-                return;
-            }
-        }
-    }
-
-    let (config, a2a_config) = match config_file {
-        Some(file) => {
-            let a2a_cfg = file.a2a_config();
-            (file.into_llm_config(), a2a_cfg)
-        }
-        None => (llm::LlmConfig::from_env(), A2aConfig::from_env()),
+    let config = match config_file {
+        Some(file) => file.into_llm_config(),
+        None => llm::LlmConfig::from_env(),
     };
 
     if let RunMode::Bench = mode {
@@ -150,18 +108,11 @@ async fn main() {
         return;
     }
 
-    let mode_str = match mode {
-        RunMode::Acp => "acp",
-        RunMode::A2a => "a2a",
-        RunMode::Client => unreachable!(),
-        RunMode::Bench => unreachable!(),
-    };
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        mode = mode_str,
         model = %config.model,
         base_url = %config.base_url,
-        ollama_native = config.is_ollama_native(),
+        backend = ?config.backend(),
         max_history_turns = config.max_history_turns,
         max_sessions = config.max_sessions,
         session_idle_timeout_secs = config.session_idle_timeout_secs,
@@ -191,17 +142,8 @@ async fn main() {
         });
     }
 
-    // Run in selected mode
-    match mode {
-        RunMode::Acp => run_acp_loop(state).await,
-        RunMode::A2a => {
-            if let Err(e) = a2a::serve(state, a2a_config).await {
-                error!(error = %e, "A2A server error");
-            }
-        }
-        RunMode::Client => unreachable!("Client mode handled above"),
-        RunMode::Bench => unreachable!("Bench mode handled above"),
-    }
+    // Run ACP stdin/stdout loop
+    run_acp_loop(state).await;
 }
 
 // ---------------------------------------------------------------------------

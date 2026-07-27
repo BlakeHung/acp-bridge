@@ -1,12 +1,12 @@
 [package]
 name = "acp-bridge"
-version = "0.7.7"
+version = "0.7.8"
 edition = "2021"
 authors = ["Blake Labs"]
-description = "ACP/A2A adapter for self-hosted AI — bridges local LLM backends to Agent Client Protocol and Agent-to-Agent protocol"
+description = "ACP adapter for local AI — bridges local LLM backends to Agent Client Protocol"
 license = "MIT"
 repository = "https://github.com/BlakeHung/acp-bridge"
-keywords = ["acp", "a2a", "ollama", "local-ai", "agent-protocol"]
+keywords = ["acp", "ollama", "local-ai", "agent-protocol"]
 categories = ["command-line-utilities"]
 
 [lib]
@@ -28,17 +28,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 toml = "0.8"
-axum = "0.8"
-libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
 hyper = "1"
 futures-lite = "2"
+axum = "0.8"
 
 # Release profile tuned for edge / air-gapped deployments — smaller binary,
 # at the cost of longer compile time. Keeps default unwinding so panics
-# don't orphan spawned child agents in --client mode.
+# don't orphan spawned processes.
 [profile.release]
 lto = "thin"
 codegen-units = 1
