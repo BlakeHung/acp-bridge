@@ -28,8 +28,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 toml = "0.8"
-axum = "0.8"
-libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
