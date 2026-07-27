@@ -4,7 +4,7 @@
 //! Transport layers (stdin/stdout ACP, HTTP A2A) call these functions and
 //! deliver results in their own format.
 
-use crate::llm::{self, Backend, ImageBlock, LlmConfig, DEFAULT_IMAGE_MIME};
+use crate::llm::{self, ImageBlock, LlmConfig, DEFAULT_IMAGE_MIME};
 use crate::protocol::{AcpError, Session};
 use crate::tools;
 use serde_json::{json, Value};
@@ -478,6 +478,7 @@ pub struct PromptResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::Backend;
 
     #[test]
     fn extract_user_text_handles_acp_array_shape() {
@@ -615,7 +616,10 @@ mod tests {
         });
 
         assert_eq!(Backend::Ollama.extract_response_text(&ollama), "ollama");
-        assert_eq!(Backend::Ollama.extract_tool_calls(&ollama), vec![tool_call.clone()]);
+        assert_eq!(
+            Backend::Ollama.extract_tool_calls(&ollama),
+            vec![tool_call.clone()]
+        );
         assert_eq!(Backend::OpenAi.extract_response_text(&openai), "openai");
         assert_eq!(Backend::OpenAi.extract_tool_calls(&openai), vec![tool_call]);
     }
