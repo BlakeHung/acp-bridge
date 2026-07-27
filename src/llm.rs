@@ -7,6 +7,170 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// A multi-modal image block — base64 data plus the MIME type the client declared.
+/// Default fallback is `image/jpeg` for clients that omit the MIME.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBlock {
+    pub data: String,
+    pub mime_type: String,
+}
+
+pub(crate) const DEFAULT_IMAGE_MIME: &str = "image/jpeg";
+
+/// Pluggable backend discriminator. Each variant encodes the protocol quirks
+/// (message shapes, tool-call formats, response extraction, stream parsing) for
+/// one family of local inference servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Ollama,
+    OpenAi,
+}
+
+impl Backend {
+    /// Infer backend family from the configured base URL.
+    pub fn from_url(base_url: &str) -> Self {
+        if base_url.ends_with("/v1") {
+            Backend::OpenAi
+        } else {
+            Backend::Ollama
+        }
+    }
+
+    pub fn is_ollama_native(&self) -> bool {
+        matches!(self, Backend::Ollama)
+    }
+
+    /// Chat completion endpoint for this backend.
+    pub fn chat_url(&self, base_url: &str) -> String {
+        match self {
+            Backend::Ollama => format!("{}/api/chat", base_url),
+            Backend::OpenAi => format!("{}/chat/completions", base_url),
+        }
+    }
+
+    /// Format a user message with optional images for this backend.
+    pub fn format_user_message(&self, text: &str, images: &[ImageBlock]) -> Value {
+        match self {
+            Backend::Ollama if !images.is_empty() => {
+                let images: Vec<&str> = images.iter().map(|i| i.data.as_str()).collect();
+                json!({"role": "user", "content": text, "images": images})
+            }
+            Backend::OpenAi if !images.is_empty() => {
+                let mut content_parts: Vec<Value> = vec![json!({"type": "text", "text": text})];
+                for img in images {
+                    content_parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", img.mime_type, img.data)
+                        }
+                    }));
+                }
+                json!({"role": "user", "content": content_parts})
+            }
+            _ => json!({"role": "user", "content": text}),
+        }
+    }
+
+    /// Format an assistant message after tool calls. The raw response is needed
+    /// because OpenAI-compatible servers return `tool_calls` inside
+    /// `choices[0].message` with extra fields (`role`, `content`) that must be
+    /// preserved for the next turn.
+    pub fn format_assistant_message(
+        &self,
+        text: &str,
+        tool_calls: &[Value],
+        raw_response: &Value,
+    ) -> Value {
+        match self {
+            Backend::Ollama => {
+                json!({"role": "assistant", "content": text, "tool_calls": tool_calls})
+            }
+            Backend::OpenAi => {
+                // Clone the server's message object so role/content/tool_calls all round-trip.
+                raw_response
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        json!({"role": "assistant", "content": text, "tool_calls": tool_calls})
+                    })
+            }
+        }
+    }
+
+    /// Format a tool result message for this backend.
+    pub fn format_tool_result(&self, tool_call_id: &str, content: &str) -> Value {
+        json!({"role": "tool", "content": content, "tool_call_id": tool_call_id})
+    }
+
+    /// Extract the assistant's text response, accounting for thinking-mode
+    /// models that put reasoning in `message.thinking` and leave `content` empty.
+    pub fn extract_response_text(&self, response: &Value) -> String {
+        // Ollama native: response.message.content
+        if let Some(text) = response
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            if !text.is_empty() {
+                return text.to_string();
+            }
+        }
+
+        // Ollama thinking mode: content may be empty while thinking carries the reasoning.
+        if self.is_ollama_native() {
+            if let Some(thinking) = response
+                .get("message")
+                .and_then(|m| m.get("thinking"))
+                .and_then(|t| t.as_str())
+            {
+                if !thinking.is_empty() {
+                    return thinking.to_string();
+                }
+            }
+        }
+
+        // OpenAI compat: response.choices[0].message.content
+        if let Some(text) = response
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            return text.to_string();
+        }
+
+        String::new()
+    }
+
+    /// Extract tool calls from a backend response.
+    pub fn extract_tool_calls(&self, response: &Value) -> Vec<Value> {
+        // Ollama native: response.message.tool_calls
+        if let Some(calls) = response
+            .get("message")
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|tc| tc.as_array())
+        {
+            return calls.clone();
+        }
+
+        // OpenAI compat: response.choices[0].message.tool_calls
+        if let Some(calls) = response
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|tc| tc.as_array())
+        {
+            return calls.clone();
+        }
+
+        vec![]
+    }
+}
+
 /// Probe the backend on startup: check connectivity and list available models.
 /// Returns Ok(model_list) on success, Err(reason) on failure.
 /// Non-fatal — callers should log the result but not abort.
@@ -145,18 +309,19 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
+    /// Returns the backend family inferred from the configured base URL.
+    pub fn backend(&self) -> Backend {
+        Backend::from_url(&self.base_url)
+    }
+
     /// Returns true if the base_url points to an Ollama native API (no /v1 suffix).
     pub fn is_ollama_native(&self) -> bool {
-        !self.base_url.ends_with("/v1")
+        self.backend().is_ollama_native()
     }
 
     /// Returns the chat completion URL based on backend type.
     fn chat_url(&self) -> String {
-        if self.is_ollama_native() {
-            format!("{}/api/chat", self.base_url)
-        } else {
-            format!("{}/chat/completions", self.base_url)
-        }
+        self.backend().chat_url(&self.base_url)
     }
 
     pub fn from_env() -> Self {
