@@ -13,6 +13,10 @@ const MAX_LIST_DEPTH: usize = 3;
 /// Maximum entries in directory listing.
 const MAX_LIST_ENTRIES: usize = 200;
 
+fn is_ignored_entry(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "node_modules" | "target" | "__pycache__")
+}
+
 /// Tool definitions in OpenAI/Ollama function calling format.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
@@ -238,11 +242,7 @@ fn list_dir_recursive(
 
         let name = entry.file_name().to_string_lossy().to_string();
         // Skip hidden files and common noise
-        if name.starts_with('.')
-            || name == "node_modules"
-            || name == "target"
-            || name == "__pycache__"
-        {
+        if is_ignored_entry(&name) {
             continue;
         }
 
@@ -334,11 +334,7 @@ fn search_dir(
         let name = entry.file_name().to_string_lossy().to_string();
 
         // Skip hidden/noise directories
-        if name.starts_with('.')
-            || name == "node_modules"
-            || name == "target"
-            || name == "__pycache__"
-        {
+        if is_ignored_entry(&name) {
             continue;
         }
 

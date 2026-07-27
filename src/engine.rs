@@ -521,54 +521,31 @@ pub struct PromptResult {
 
 /// Extract tool calls from an LLM response (supports both Ollama and OpenAI format).
 fn extract_tool_calls(response: &Value) -> Vec<Value> {
-    // Ollama native: response.message.tool_calls
-    if let Some(calls) = response
-        .get("message")
-        .and_then(|m| m.get("tool_calls"))
+    response_message_field(response, "tool_calls")
         .and_then(|tc| tc.as_array())
-    {
-        return calls.clone();
-    }
-
-    // OpenAI compat: response.choices[0].message.tool_calls
-    if let Some(calls) = response
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("tool_calls"))
-        .and_then(|tc| tc.as_array())
-    {
-        return calls.clone();
-    }
-
-    vec![]
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Extract text content from an LLM response (supports both formats).
 fn extract_response_text(response: &Value) -> String {
-    // Ollama native: response.message.content
-    if let Some(text) = response
+    response_message_field(response, "content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn response_message_field<'a>(response: &'a Value, field: &str) -> Option<&'a Value> {
+    response
         .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-    {
-        if !text.is_empty() {
-            return text.to_string();
-        }
-    }
-
-    // OpenAI compat: response.choices[0].message.content
-    if let Some(text) = response
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-    {
-        return text.to_string();
-    }
-
-    String::new()
+        .and_then(|m| m.get(field))
+        .or_else(|| {
+            response
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get(field))
+        })
 }
 
 #[cfg(test)]
@@ -698,5 +675,21 @@ mod tests {
         let (cleaned, ctx) = strip_sender_context(input);
         assert_eq!(cleaned, "");
         assert_eq!(ctx.unwrap(), "just metadata");
+    }
+
+    #[test]
+    fn response_helpers_support_ollama_and_openai_formats() {
+        let tool_call = json!({"id": "call-1", "function": {"name": "read_file"}});
+        let ollama = json!({
+            "message": {"content": "ollama", "tool_calls": [tool_call.clone()]}
+        });
+        let openai = json!({
+            "choices": [{"message": {"content": "openai", "tool_calls": [tool_call.clone()]}}]
+        });
+
+        assert_eq!(extract_response_text(&ollama), "ollama");
+        assert_eq!(extract_tool_calls(&ollama), vec![tool_call.clone()]);
+        assert_eq!(extract_response_text(&openai), "openai");
+        assert_eq!(extract_tool_calls(&openai), vec![tool_call]);
     }
 }

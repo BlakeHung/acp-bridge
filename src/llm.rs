@@ -7,6 +7,19 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// Collect the string values at `name_key` from each object in the JSON array
+/// stored under `array_key`. A missing array or missing keys yield an empty vec.
+fn json_names(val: &Value, array_key: &str, name_key: &str) -> Vec<String> {
+    val[array_key]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m[name_key].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Probe the backend on startup: check connectivity and list available models.
 /// Returns Ok(model_list) on success, Err(reason) on failure.
 /// Non-fatal — callers should log the result but not abort.
@@ -14,24 +27,12 @@ pub async fn probe_backend(config: &LlmConfig) -> Result<Vec<String>, String> {
     let client = &config.client;
 
     // Try Ollama-native /api/tags first (works on localhost:11434)
-    let base = config
-        .base_url
-        .trim_end_matches("/v1")
-        .trim_end_matches('/');
-    let tags_url = format!("{base}/api/tags");
+    let tags_url = format!("{}/api/tags", config.ollama_base());
 
     if let Ok(resp) = client.get(&tags_url).send().await {
         if resp.status().is_success() {
             if let Ok(val) = resp.json::<Value>().await {
-                let models: Vec<String> = val["models"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| m["name"].as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                return Ok(models);
+                return Ok(json_names(&val, "models", "name"));
             }
         }
     }
@@ -46,15 +47,7 @@ pub async fn probe_backend(config: &LlmConfig) -> Result<Vec<String>, String> {
     {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(val) = resp.json::<Value>().await {
-                let models: Vec<String> = val["data"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| m["id"].as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                return Ok(models);
+                return Ok(json_names(&val, "data", "id"));
             }
             Ok(vec![])
         }
@@ -96,25 +89,13 @@ pub async fn query_model_info(config: &LlmConfig) -> Option<ModelInfo> {
 
 /// Query Ollama /api/ps to check if a model is loaded in VRAM.
 pub async fn query_running_models(config: &LlmConfig) -> Option<Vec<String>> {
-    let base = config
-        .base_url
-        .trim_end_matches("/v1")
-        .trim_end_matches('/');
-    let url = format!("{base}/api/ps");
+    let url = format!("{}/api/ps", config.ollama_base());
     let resp = config.client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let val: Value = resp.json().await.ok()?;
-    let models: Vec<String> = val["models"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["name"].as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(models)
+    Some(json_names(&val, "models", "name"))
 }
 
 pub struct ModelInfo {
@@ -148,6 +129,17 @@ impl LlmConfig {
     /// Returns true if the base_url points to an Ollama native API (no /v1 suffix).
     pub fn is_ollama_native(&self) -> bool {
         !self.base_url.ends_with("/v1")
+    }
+
+    fn ollama_base(&self) -> &str {
+        self.base_url.trim_end_matches("/v1").trim_end_matches('/')
+    }
+
+    fn authenticated_post(&self, url: &str) -> reqwest::RequestBuilder {
+        self.client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .bearer_auth(&self.api_key)
     }
 
     /// Returns the chat completion URL based on backend type.
@@ -214,9 +206,86 @@ pub enum StreamChunk {
     Done,
 }
 
+const MAX_STREAM_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+
+#[derive(Default)]
+struct LineBuffer {
+    data: String,
+}
+
+impl LineBuffer {
+    fn push(&mut self, chunk: &[u8]) -> bool {
+        let chunk = String::from_utf8_lossy(chunk);
+        if self.data.len() + chunk.len() > MAX_STREAM_BUFFER_SIZE {
+            return false;
+        }
+        self.data.push_str(&chunk);
+        true
+    }
+
+    fn next_line(&mut self) -> Option<String> {
+        let newline_pos = self.data.find('\n').or_else(|| self.data.find('\r'))?;
+        let skip = if self.data[newline_pos..].starts_with("\r\n") {
+            2
+        } else {
+            1
+        };
+        let line = self.data[..newline_pos].trim_end().to_string();
+        self.data.drain(..newline_pos + skip);
+        Some(line)
+    }
+}
+
 /// Returns true if the HTTP status code is transient and worth retrying.
 fn is_retryable(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+async fn send_with_retry(
+    config: &LlmConfig,
+    url: &str,
+    body: &Value,
+    operation: &str,
+) -> Result<reqwest::Response, String> {
+    let mut last_err = String::new();
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let delay = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
+            warn!(attempt, delay_ms = delay, operation, "Retrying LLM request");
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        match config.authenticated_post(url).json(body).send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) if is_retryable(response.status()) => {
+                last_err = format!(
+                    "LLM HTTP {}: {}",
+                    response.status(),
+                    response.status().canonical_reason().unwrap_or("error")
+                );
+                warn!(status = %response.status(), operation, "Transient LLM error");
+            }
+            Ok(response) => {
+                return Err(format!(
+                    "LLM HTTP {}: {}",
+                    response.status(),
+                    response
+                        .status()
+                        .canonical_reason()
+                        .unwrap_or("Unknown error")
+                ));
+            }
+            Err(e) if e.is_timeout() || e.is_connect() => {
+                last_err = format!("HTTP request failed: {e}");
+                warn!(error = %e, operation, "Transient connection error");
+            }
+            Err(e) => return Err(format!("HTTP request failed: {e}")),
+        }
+    }
+
+    error!(error = %last_err, operation, "All retry attempts exhausted");
+    Err(last_err)
 }
 
 /// Build the JSON body for a chat completion request.
@@ -254,62 +323,12 @@ pub async fn chat(
 ) -> Result<Value, String> {
     let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
-    let client = &config.client;
-
     let body = build_body(config, messages, model, false, tools);
-
-    let mut last_err = String::new();
-    for attempt in 0..=MAX_RETRIES {
-        if attempt > 0 {
-            let delay = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
-            warn!(attempt, delay_ms = delay, "Retrying LLM request");
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-
-        let result = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .json(&body)
-            .send()
-            .await;
-
-        match result {
-            Ok(response) if response.status().is_success() => {
-                let val: Value = response
-                    .json()
-                    .await
-                    .map_err(|e| format!("Failed to parse response: {e}"))?;
-                return Ok(val);
-            }
-            Ok(response) if is_retryable(response.status()) => {
-                last_err = format!(
-                    "LLM HTTP {}: {}",
-                    response.status(),
-                    response.status().canonical_reason().unwrap_or("error")
-                );
-                warn!(status = %response.status(), "Transient LLM error");
-            }
-            Ok(response) => {
-                return Err(format!(
-                    "LLM HTTP {}: {}",
-                    response.status(),
-                    response
-                        .status()
-                        .canonical_reason()
-                        .unwrap_or("Unknown error")
-                ));
-            }
-            Err(e) if e.is_timeout() || e.is_connect() => {
-                last_err = format!("HTTP request failed: {e}");
-                warn!(error = %e, "Transient connection error");
-            }
-            Err(e) => return Err(format!("HTTP request failed: {e}")),
-        }
-    }
-
-    error!(error = %last_err, "All retry attempts exhausted");
-    Err(last_err)
+    let response = send_with_retry(config, &url, &body, "chat").await?;
+    response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {e}"))
 }
 
 /// Stream chat completion — auto-detects backend and uses appropriate parser.
@@ -320,65 +339,10 @@ pub async fn stream_chat(
 ) -> Result<mpsc::Receiver<StreamChunk>, String> {
     let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
-    let client = &config.client;
     let is_native = config.is_ollama_native();
 
     let body = build_body(config, messages, model, true, None);
-
-    // Retry loop for the initial connection
-    let mut last_err = String::new();
-    let mut response_ok = None;
-
-    for attempt in 0..=MAX_RETRIES {
-        if attempt > 0 {
-            let delay = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
-            warn!(attempt, delay_ms = delay, "Retrying streaming LLM request");
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-
-        let result = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .json(&body)
-            .send()
-            .await;
-
-        match result {
-            Ok(resp) if resp.status().is_success() => {
-                response_ok = Some(resp);
-                break;
-            }
-            Ok(resp) if is_retryable(resp.status()) => {
-                last_err = format!(
-                    "LLM HTTP {}: {}",
-                    resp.status(),
-                    resp.status().canonical_reason().unwrap_or("error")
-                );
-                warn!(status = %resp.status(), "Transient LLM error");
-            }
-            Ok(resp) => {
-                return Err(format!(
-                    "LLM HTTP {}: {}",
-                    resp.status(),
-                    resp.status().canonical_reason().unwrap_or("Unknown error")
-                ));
-            }
-            Err(e) if e.is_timeout() || e.is_connect() => {
-                last_err = format!("HTTP request failed: {e}");
-                warn!(error = %e, "Transient connection error");
-            }
-            Err(e) => return Err(format!("HTTP request failed: {e}")),
-        }
-    }
-
-    let response = match response_ok {
-        Some(r) => r,
-        None => {
-            error!(error = %last_err, "All retry attempts exhausted (stream)");
-            return Err(last_err);
-        }
-    };
+    let response = send_with_retry(config, &url, &body, "stream_chat").await?;
 
     let (tx, rx) = mpsc::channel(256);
 
@@ -398,32 +362,21 @@ async fn parse_ollama_native_stream(
     mut response: reqwest::Response,
     tx: mpsc::Sender<StreamChunk>,
 ) {
-    let mut buffer = String::new();
-    const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+    let mut buffer = LineBuffer::default();
 
     loop {
         let chunk_result: Result<Option<bytes::Bytes>, reqwest::Error> = response.chunk().await;
         match chunk_result {
             Ok(Some(bytes)) => {
-                let chunk_str = String::from_utf8_lossy(&bytes);
-                if buffer.len() + chunk_str.len() > MAX_BUFFER_SIZE {
+                if !buffer.push(&bytes) {
                     error!("Stream buffer exceeded limit, aborting");
                     let _ = tx
                         .send(StreamChunk::Error("Stream buffer overflow".into()))
                         .await;
                     return;
                 }
-                buffer.push_str(&chunk_str);
 
-                while let Some(newline_pos) = buffer.find('\n').or_else(|| buffer.find('\r')) {
-                    let line = buffer[..newline_pos].trim_end().to_string();
-                    let skip = if buffer[newline_pos..].starts_with("\r\n") {
-                        2
-                    } else {
-                        1
-                    };
-                    buffer = buffer[newline_pos + skip..].to_string();
-
+                while let Some(line) = buffer.next_line() {
                     if line.is_empty() {
                         continue;
                     }
@@ -466,32 +419,21 @@ async fn parse_ollama_native_stream(
 /// Parse OpenAI-compatible SSE streaming response.
 /// Each line: "data: {json}" or "data: [DONE]"
 async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Sender<StreamChunk>) {
-    let mut buffer = String::new();
-    const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+    let mut buffer = LineBuffer::default();
 
     loop {
         let chunk_result: Result<Option<bytes::Bytes>, reqwest::Error> = response.chunk().await;
         match chunk_result {
             Ok(Some(bytes)) => {
-                let chunk_str = String::from_utf8_lossy(&bytes);
-                if buffer.len() + chunk_str.len() > MAX_BUFFER_SIZE {
+                if !buffer.push(&bytes) {
                     error!("Stream buffer exceeded limit, aborting");
                     let _ = tx
                         .send(StreamChunk::Error("Stream buffer overflow".into()))
                         .await;
                     return;
                 }
-                buffer.push_str(&chunk_str);
 
-                while let Some(newline_pos) = buffer.find('\n').or_else(|| buffer.find('\r')) {
-                    let line = buffer[..newline_pos].trim_end().to_string();
-                    let skip = if buffer[newline_pos..].starts_with("\r\n") {
-                        2
-                    } else {
-                        1
-                    };
-                    buffer = buffer[newline_pos + skip..].to_string();
-
+                while let Some(line) = buffer.next_line() {
                     if line.is_empty() || !line.starts_with("data: ") {
                         continue;
                     }
@@ -531,7 +473,6 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
 
     let _ = tx.send(StreamChunk::Done).await;
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +549,34 @@ mod tests {
                 "{code} should not be retryable"
             );
         }
+    }
+
+    #[test]
+    fn json_names_collects_present_string_fields() {
+        let value = json!({
+            "models": [
+                {"name": "qwen"},
+                {"name": 42},
+                {},
+                {"name": "gemma"}
+            ]
+        });
+
+        assert_eq!(json_names(&value, "models", "name"), vec!["qwen", "gemma"]);
+        assert!(json_names(&value, "data", "id").is_empty());
+    }
+
+    #[test]
+    fn line_buffer_handles_chunked_and_crlf_lines() {
+        let mut buffer = LineBuffer::default();
+
+        assert!(buffer.push(b"first\r"));
+        assert_eq!(buffer.next_line().as_deref(), Some("first"));
+        assert!(buffer.push(b"\nsecond"));
+        assert_eq!(buffer.next_line().as_deref(), Some(""));
+        assert!(buffer.push(b"\n"));
+        assert_eq!(buffer.next_line().as_deref(), Some("second"));
+        assert!(buffer.next_line().is_none());
     }
 
     #[test]
