@@ -308,9 +308,12 @@ pub async fn session_prompt(
             }
         };
         session.touch();
-        session
-            .messages
-            .push(state.config.backend().format_user_message(user_text, user_images));
+        session.messages.push(
+            state
+                .config
+                .backend()
+                .format_user_message(user_text, user_images),
+        );
 
         if state.config.max_history_turns > 0 {
             let before = session.messages.len();
@@ -393,9 +396,9 @@ pub async fn session_prompt(
                             tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
                         let mut sessions = state.sessions_write();
                         if let Some(session) = sessions.get_mut(session_id) {
-                            session.messages.push(
-                                backend.format_tool_result(tool_call_id, &result),
-                            );
+                            session
+                                .messages
+                                .push(backend.format_tool_result(tool_call_id, &result));
                         }
                     }
                 }

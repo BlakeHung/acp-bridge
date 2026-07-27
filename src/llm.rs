@@ -92,9 +92,9 @@ impl Backend {
                     .and_then(|c| c.get(0))
                     .and_then(|c| c.get("message"))
                     .cloned()
-                    .unwrap_or_else(|| {
-                        json!({"role": "assistant", "content": text, "tool_calls": tool_calls})
-                    })
+                    .unwrap_or_else(
+                        || json!({"role": "assistant", "content": text, "tool_calls": tool_calls}),
+                    )
             }
         }
     }
