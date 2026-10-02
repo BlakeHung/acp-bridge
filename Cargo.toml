@@ -1,6 +1,6 @@
 [package]
 name = "acp-bridge"
-version = "0.7.8"
+version = "0.8.2"
 edition = "2021"
 authors = ["Blake Labs"]
 description = "ACP adapter for local AI — bridges local LLM backends to Agent Client Protocol"
@@ -17,17 +17,38 @@ path = "src/lib.rs"
 name = "acp-bridge"
 path = "src/main.rs"
 
+# Each file under tests/clients/ is its own integration test target, named
+# after the file. The shared `tests/clients/harness.rs` is `mod`-included
+# from each test file via `#[path = "harness.rs"]`, so it is not a target
+# itself and does not need a `[[test]]` entry here.
+[[test]]
+name = "zed_style"
+path = "tests/clients/zed_style.rs"
+
+[[test]]
+name = "inspector_style"
+path = "tests/clients/inspector_style.rs"
+
+[[test]]
+name = "minimal_style"
+path = "tests/clients/minimal_style.rs"
+
+[[test]]
+name = "notifications"
+path = "tests/clients/notifications.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "blocking"] }
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 toml = "0.8"
+url = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"

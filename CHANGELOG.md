@@ -5,6 +5,198 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-10-02
+
+### Added
+
+- **New tools** — four more built-in tools round out the surface so AI
+  agents can stay inside acp-bridge instead of falling back to
+  their own knowledge:
+  - **`edit`** — surgical string replacement. Replace exactly one
+    occurrence of `old_text` with `new_text` in an existing file.
+    Refuses to act if `old_text` is missing or appears more than once,
+    so the model has to re-read the file rather than guess.
+  - **`write_file`** — create or overwrite a file with new content.
+    Sibling to `edit` for whole-file rewrites; rejects `..` escapes.
+  - **`web_fetch`** — fetch a URL over HTTP/HTTPS and return the body
+    as text. HTML is reduced to readable text (scripts/styles
+    stripped, tags removed, whitespace collapsed). 5 MB body cap,
+    30 s timeout.
+    **Off by default**: requires `LLM_WEB_ALLOWLIST` to be set to a
+    comma-separated list of host suffixes (e.g.
+    `LLM_WEB_ALLOWLIST=docs.rs,crates.io`). Empty allowlist blocks
+    every request. This is an opt-in safety boundary so a
+    misconfigured sandbox cannot exfiltrate to internal
+    infrastructure.
+  - **`git_status`**, **`git_diff`**, **`git_log`**, **`git_commit`** —
+    read-only and write git operations, all run inside the session
+    working directory. `git_diff` accepts an optional `path` and a
+    `staged: true` flag (`--cached`). `git_log` accepts `max_count`
+    (clamped to 1–200, default 20) and an optional `path` filter.
+    `git_commit` stages the listed `paths` (or `git add -u` when
+    `paths` is omitted) and commits with the supplied message.
+- **`acp-bridge` now publishes four `plan` notification helpers** —
+  `acp::PlanEntry`, `acp::notify_plan`, `acp::notify_session_info`,
+  `acp::notify_usage`, `acp::AvailableCommand`,
+  `acp::notify_available_commands`. Engine hooks fire
+  `available_commands_update` and `session_info_update` immediately
+  after `session/new`, and `usage_update` + `session_info_update`
+  after `session/prompt` returns.
+- **`LlmConfig.context_size`** — model context window in tokens,
+  surfaced as `usage_update.size`. Override via `LLM_MODEL_CONTEXT`
+  env var or `[llm].model_context` config field (default 32768).
+- **`PromptResult::usage`** carries an estimated `used` token count
+  (chars / 4 across the session history) so the `usage_update` has
+  a number to ship. Local backends rarely stream stable per-turn
+  token counts; this is intentionally approximate.
+- **`acp::kind_for_tool`** now classifies `edit`, `write_file`,
+  `web_fetch`, and the four `git_*` tools so Clients render the
+  right icon and affordance.
+- **Classified backend errors** — `LlmErrorKind` (`Unreachable`,
+  `RateLimited`, `ServerBusy`, `Auth`, `BadRequest`, `NotFound`,
+  `Timeout`, `ParseError`, `Unknown`) and `LlmError::is_retryable()`.
+  `chat` and `stream_chat` now return `Result<_, LlmError>` instead
+  of plain strings. Failed turns emit a structured
+  `error.data.category` + `error.data.retryable` in the JSON-RPC
+  response so Clients can branch on it (e.g. "auto-retry on
+  `backend_unreachable`, show 'check your model name' on
+  `not_found`").
+
+### Changed
+
+- **Wire order on `session/prompt` and `session/new`** — the
+  post-event notifications (`available_commands_update`,
+  `session_info_update`, `usage_update`) are emitted **before** the
+  JSON-RPC response, not after. Clients that buffer the entire
+  notification stream per turn (most ACP Clients) see the
+  notifications bound to the right sessionId; Clients that read
+  strictly one-line-at-a-time still get the response on the line
+  after the notifications.
+- **`PromptResult` gains `error_class: Option<LlmErrorKind>` and
+  `error_retryable: bool`** so the engine's failure classification
+  reaches the JSON-RPC response without string-matching.
+
+### Tests
+
+- 14 new unit tests (`src/tools.rs`): write / edit (unique match,
+  missing, ambiguous, empty), web_fetch allowlist enforcement, HTML
+  reduction, git status.
+- 3 new unit tests (`src/llm.rs`): `LlmErrorKind::as_str` stability,
+  retryable classification, status-code → kind mapping.
+- All existing test suites still pass; 159 tests total.
+
+## [0.8.1] - 2026-10-01
+
+### Added
+- **`docs/scope.md`** — single source of truth for what acp-bridge supports,
+  supports with caveats, and deliberately does not implement. Clients pick
+  acp-bridge expecting certain capabilities; this doc sets expectations
+  before `initialize` is even called.
+- **Real-Client e2e tests** (`tests/clients/`) — three test suites that
+  spawn acp-bridge as a subprocess and drive it through the protocol
+  sequences actually emitted by named Clients:
+  - `tests/clients/zed_style.rs` — Zed Industries' editor (full client
+    capabilities, image + text prompt, capability probes)
+  - `tests/clients/inspector_style.rs` — ACP Inspector (minimal
+    capabilities, request-id fuzz, ResourceLink prompt handling)
+  - `tests/clients/minimal_style.rs` — Codex CLI adapter and stripped-down
+    Clients (bare capabilities, notification handling)
+- **`ContentBlock::ResourceLink` support** — ACP v1 requires Agents to
+  accept ResourceLink blocks in `session/prompt`. acp-bridge now converts
+  ResourceLinks to `[Attached resource: <name> (<uri>)]` pseudo-lines so
+  the LLM has something to act on. Clients such as ACP Inspector that
+  attach files via the "Attach" button previously saw
+  `MissingParam prompt (expected non-empty text or image content)` errors.
+- **Graceful error responses with `data.reason`** — capability-mismatch
+  errors now carry a stable `error.data.reason` field Clients can switch
+  on for log filtering:
+  - `session/load`, `session/resume` → `-32001` with `reason: "no_persistence"`
+  - `session/set_mode` → `-32602` with `reason: "no_modes"`
+  - `auth/login`, `auth/logout` → `-32601` with `reason: "no_auth_methods"`
+  - `fs/read_text_file`, `fs/write_text_file` → `-32601` with
+    `reason: "agent_does_not_call_client_fs"`
+  - `terminal/*` → `-32601` with `reason: "agent_does_not_call_client_terminal"`
+
+### Changed
+- **`session/load` / `session/resume`** — error code changed from `-32601`
+  to `-32001` to better reflect the "this is a server-side capability
+  gap, not a malformed request" nature of the failure. The message and
+  the new `data.reason` field give Clients everything they need.
+- **`session/set_mode`** — error code changed from `-32601` to `-32602`
+  (invalid params) for the same reason.
+
+### Internal
+- New `acp::send_error_with_data()` helper for attaching machine-readable
+  context to JSON-RPC error responses.
+
+## [0.8.0] - 2026-09-30
+
+### Breaking Changes
+- **`session/update` replaces `session/notify`** — outgoing notifications now use the
+  method name mandated by ACP v1. Clients written against the older `session/notify`
+  shape (legacy openab pipelines, some custom harnesses) will stop receiving
+  updates and must be updated. Reviewer-flagged via [issue #13](https://github.com/BlakeHung/acp-bridge/issues/13).
+- **`initialize` no longer advertises `promptCapabilities.image: true` by
+  default** — image support is now opt-in via `LLM_SUPPORTS_IMAGE=true` or
+  `[llm].supports_image = true`. Previously the agent unconditionally claimed
+  image support, which caused spec-compliant Clients (Meuxe, ACP UI, Codeg,
+  Gold Band, Casper, DeepChat, …) to forward image attachments to local
+  backends without a vision model and surface upstream as empty replies.
+- **`tool_call` / `tool_call_update` now require `toolCallId`** — the id is
+  required by ACP v1; clients use it to pair start/update notifications into a
+  single tool-call timeline. Emitting notifications without the id caused
+  Clients to render the call without a coherent start/end pair or drop the
+  update entirely. The id is sourced from the LLM's `tool_call.id` field
+  (the synthetic outer `llm_chat` envelope uses `llm_chat:<session_id>`).
+- **`tool_call` now carries `kind` and `status: "in_progress"`** — required
+  by ACP v1. `kind` is derived from the tool name (`read_file`/`list_dir` →
+  `read`, `write_file` → `edit`, `shell`/`bash` → `execute`, `search`/`grep`
+  → `search`, `fetch` → `fetch`, unknown → `other`).
+- **`agent_thought_chunk` now carries a typed `content` block** — empty
+  `content: { type: "text", text: "" }` is emitted so spec-compliant Clients
+  render the thought bubble correctly. Earlier versions emitted the
+  sessionUpdate with no content, which Clients rejected.
+
+### Added
+- **`LLM_SUPPORTS_IMAGE` env var / `[llm].supports_image` config option** —
+  opt back in to advertising the `image` prompt capability for backends that
+  can actually accept image content blocks.
+- **`acp::kind_for_tool(name) -> &'static str`** — maps tool names to the
+  ACP `ToolKind` enum; reusable from external integrations that build their
+  own session-update payloads.
+- **Regression tests for ACP v1 wire-format conformance** — three new
+  integration tests (`test_initialize_does_not_advertise_image_by_default`,
+  `test_tool_call_notification_carries_tool_call_id_and_kind`,
+  `test_thought_chunk_carries_content_block`) lock the new shape down so
+  future refactors cannot silently regress Meuxe / ACP UI compatibility.
+- **Unit tests for `acp::kind_for_tool`** and the new `Notification::ToolStart`
+  / `Notification::ToolDone` struct variants in `engine.rs`.
+
+### Changed
+- **`Notification::ToolStart` / `Notification::ToolDone`** are now struct
+  variants with an explicit `id` field so the engine propagates the LLM-
+  supplied `tool_call.id` end-to-end into the ACP notification.
+- **`agent_thought_chunk` payload** — see Breaking Changes above; the
+  sessionUpdate kind stays the same, the payload gains `content`.
+- **`Cargo.toml`** `version` bumped to `0.8.0` to reflect the wire-format
+  break.
+
+### Migration Notes
+- **Clients that consumed `session/notify`** must switch to reading
+  `session/update`. If you maintain a custom harness, see
+  <https://agentclientprotocol.com/protocol/session-setup>.
+- **Operators who actually run a vision-capable model** (e.g. LLaVA,
+  Qwen-VL, Pixtral) should set `LLM_SUPPORTS_IMAGE=true` so Clients know
+  to forward image attachments. Leave it unset otherwise — the new default
+  matches the ACP v1 spec and avoids surprise image traffic to local
+  backends.
+
+### Cross-references
+- Issue #13 (Meuxe string/UUID request id) was the trigger for the
+  wire-format audit that produced this release. 0.7.8 already shipped the
+  request-id fix; 0.8.0 closes out the remaining conformance gaps surfaced
+  by surveying Meuxe, ACP UI, Codeg, Gold Band, Casper, and DeepChat.
+
 ## [0.7.8] - 2026-07-27
 
 ### Breaking Changes

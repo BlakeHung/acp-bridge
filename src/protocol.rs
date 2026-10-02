@@ -1,12 +1,34 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// JSON-RPC 2.0 request/response ID. Per the spec an `id` may be a
+/// string or a number; a `null`/absent `id` marks a notification.
+///
+/// acp-bridge must preserve the original type and value so clients that use
+/// UUID/string IDs (e.g. Meuxe) get their exact ID echoed back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestId {
+    Number(u64),
+    String(String),
+}
+
+impl RequestId {
+    /// Render the ID back into its JSON representation.
+    pub fn as_value(&self) -> Value {
+        match self {
+            RequestId::Number(n) => Value::Number((*n).into()),
+            RequestId::String(s) => Value::String(s.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     /// Present for requests, absent for notifications (e.g. `session/cancel`).
-    pub id: Option<u64>,
+    pub id: Option<RequestId>,
     pub method: String,
     pub params: Option<Value>,
 }

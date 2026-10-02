@@ -285,6 +285,18 @@ pub struct LlmConfig {
     pub max_sessions: usize,
     /// Session idle timeout in seconds (0 = no timeout).
     pub session_idle_timeout_secs: u64,
+    /// Whether the configured backend can accept image content blocks in
+    /// `session/prompt`. Controls whether the agent advertises
+    /// `promptCapabilities.image` to Clients at `initialize` time. Defaults
+    /// to `false`; set `LLM_SUPPORTS_IMAGE=true` to opt in.
+    pub prompt_supports_image: bool,
+    /// Model context window in tokens. Used to report `size` in
+    /// `usage_update` notifications. acp-bridge does its own
+    /// char-based estimate for `used` because most local backends do
+    /// not stream per-turn token counts in a stable shape; clients can
+    /// still display the percentage used.
+    /// Override via `LLM_MODEL_CONTEXT` env var; defaults to 32768.
+    pub context_size: u64,
     /// Shared HTTP client for connection pooling.
     pub client: Client,
 }
@@ -359,6 +371,14 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            prompt_supports_image: matches!(
+                std::env::var("LLM_SUPPORTS_IMAGE").as_deref(),
+                Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+            ),
+            context_size: std::env::var("LLM_MODEL_CONTEXT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32768),
             client,
         }
     }
@@ -369,6 +389,137 @@ pub enum StreamChunk {
     Content(String),
     Error(String),
     Done,
+}
+
+/// Classified LLM/backend failure.
+///
+/// acp-bridge surfaces these in the JSON-RPC error responses so Clients
+/// can distinguish "the model is just slow, retry" from "the model name
+/// is wrong, do not retry". See `LlmError::classify` for the mapping
+/// from raw reqwest / HTTP errors into a category.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmErrorKind {
+    /// Backend unreachable: connection refused, DNS failure, socket
+    /// error. Retryable.
+    Unreachable,
+    /// HTTP 429 too many requests. Retryable after backoff.
+    RateLimited,
+    /// HTTP 5xx (500, 502, 503, 504). Retryable.
+    ServerBusy,
+    /// HTTP 401 / 403. Configuration issue. Do not retry.
+    Auth,
+    /// HTTP 400. Bad request — likely a malformed prompt or invalid
+    /// tool definition. Do not retry.
+    BadRequest,
+    /// HTTP 404. Model not found / wrong base URL. Do not retry.
+    NotFound,
+    /// Client-side request timeout. Retryable.
+    Timeout,
+    /// Response was not parseable as JSON. Do not retry — repeating
+    /// the same request won't fix a malformed server response.
+    ParseError,
+    /// Catch-all for anything we cannot classify.
+    Unknown,
+}
+
+impl LlmErrorKind {
+    /// Stable string identifier used as the JSON-RPC `error.data.category`
+    /// field. Clients can switch on this without parsing prose.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unreachable => "backend_unreachable",
+            Self::RateLimited => "rate_limited",
+            Self::ServerBusy => "server_busy",
+            Self::Auth => "auth_error",
+            Self::BadRequest => "bad_request",
+            Self::NotFound => "not_found",
+            Self::Timeout => "timeout",
+            Self::ParseError => "parse_error",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the Client should retry the request automatically.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Unreachable | Self::RateLimited | Self::ServerBusy | Self::Timeout
+        )
+    }
+}
+
+/// Classified error returned by `chat` and `stream_chat`. The original
+/// transport error is preserved in `message` for log diagnostics; the
+/// `kind` + `retryable` fields let the engine / Client react without
+/// string-matching.
+#[derive(Debug, Clone)]
+pub struct LlmError {
+    pub kind: LlmErrorKind,
+    pub message: String,
+    pub status: Option<u16>,
+}
+
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.kind.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for LlmError {}
+
+impl LlmError {
+    /// Build a classified error from a `reqwest::Error` (transport
+    /// failure). Falls back to `Unknown` if the error cannot be tied to
+    /// a specific category.
+    pub fn from_reqwest(e: &reqwest::Error, url: &str) -> Self {
+        let kind = if e.is_timeout() {
+            LlmErrorKind::Timeout
+        } else if e.is_connect() || e.is_request() {
+            LlmErrorKind::Unreachable
+        } else {
+            LlmErrorKind::Unknown
+        };
+        let message = if matches!(kind, LlmErrorKind::Unreachable) {
+            format!("Cannot reach backend at {url}: {e}")
+        } else {
+            format!("{e}")
+        };
+        Self {
+            kind,
+            message,
+            status: None,
+        }
+    }
+
+    /// Build a classified error from an HTTP response status. Used
+    /// inside `send_with_retry` once a non-retryable response is seen.
+    pub fn from_status(status: reqwest::StatusCode, body_snippet: &str) -> Self {
+        let code = status.as_u16();
+        let kind = match code {
+            401 | 403 => LlmErrorKind::Auth,
+            404 => LlmErrorKind::NotFound,
+            400 | 422 => LlmErrorKind::BadRequest,
+            408 | 429 => LlmErrorKind::RateLimited,
+            500..=599 => LlmErrorKind::ServerBusy,
+            _ => LlmErrorKind::Unknown,
+        };
+        let snippet = if body_snippet.len() > 200 {
+            format!("{}…", &body_snippet[..200])
+        } else {
+            body_snippet.to_string()
+        };
+        let message = format!(
+            "HTTP {} {}: {}",
+            code,
+            status.canonical_reason().unwrap_or(""),
+            snippet
+        );
+        Self {
+            kind,
+            message,
+            status: Some(code),
+        }
+    }
 }
 
 const MAX_STREAM_BUFFER_SIZE: usize = 10 * 1024 * 1024;
@@ -402,6 +553,9 @@ impl LineBuffer {
 }
 
 /// Returns true if the HTTP status code is transient and worth retrying.
+/// Test-only — production code uses `LlmErrorKind::is_retryable()` after
+/// the response has been classified.
+#[allow(dead_code)]
 fn is_retryable(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
 }
@@ -411,8 +565,8 @@ async fn send_with_retry(
     url: &str,
     body: &Value,
     operation: &str,
-) -> Result<reqwest::Response, String> {
-    let mut last_err = String::new();
+) -> Result<reqwest::Response, LlmError> {
+    let mut last_err: Option<LlmError> = None;
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -422,35 +576,54 @@ async fn send_with_retry(
         }
 
         match config.authenticated_post(url).json(body).send().await {
-            Ok(response) if response.status().is_success() => return Ok(response),
-            Ok(response) if is_retryable(response.status()) => {
-                last_err = format!(
-                    "LLM HTTP {}: {}",
-                    response.status(),
-                    response.status().canonical_reason().unwrap_or("error")
-                );
-                warn!(status = %response.status(), operation, "Transient LLM error");
-            }
             Ok(response) => {
-                return Err(format!(
-                    "LLM HTTP {}: {}",
-                    response.status(),
-                    response
-                        .status()
-                        .canonical_reason()
-                        .unwrap_or("Unknown error")
-                ));
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(response);
+                }
+                let snippet = response.text().await.unwrap_or_default();
+                let err = LlmError::from_status(status, &snippet);
+                if err.kind.is_retryable() {
+                    warn!(
+                        kind = err.kind.as_str(),
+                        status = %status,
+                        operation,
+                        "Transient LLM error"
+                    );
+                    last_err = Some(err);
+                } else {
+                    return Err(err);
+                }
             }
-            Err(e) if e.is_timeout() || e.is_connect() => {
-                last_err = format!("HTTP request failed: {e}");
-                warn!(error = %e, operation, "Transient connection error");
+            Err(e) => {
+                let err = LlmError::from_reqwest(&e, url);
+                if err.kind.is_retryable() {
+                    warn!(
+                        kind = err.kind.as_str(),
+                        error = %e,
+                        operation,
+                        "Transient transport error"
+                    );
+                    last_err = Some(err);
+                } else {
+                    return Err(err);
+                }
             }
-            Err(e) => return Err(format!("HTTP request failed: {e}")),
         }
     }
 
-    error!(error = %last_err, operation, "All retry attempts exhausted");
-    Err(last_err)
+    let err = last_err.unwrap_or_else(|| LlmError {
+        kind: LlmErrorKind::Unknown,
+        message: format!("{operation} failed with no captured error"),
+        status: None,
+    });
+    error!(
+        kind = err.kind.as_str(),
+        error = %err.message,
+        operation,
+        "All retry attempts exhausted"
+    );
+    Err(err)
 }
 
 /// Build the JSON body for a chat completion request.
@@ -485,15 +658,16 @@ pub async fn chat(
     messages: &[Value],
     model_override: Option<&str>,
     tools: Option<&[Value]>,
-) -> Result<Value, String> {
+) -> Result<Value, LlmError> {
     let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
     let body = build_body(config, messages, model, false, tools);
     let response = send_with_retry(config, &url, &body, "chat").await?;
-    response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {e}"))
+    response.json().await.map_err(|e| LlmError {
+        kind: LlmErrorKind::ParseError,
+        message: format!("Failed to parse response as JSON: {e}"),
+        status: None,
+    })
 }
 
 /// Stream chat completion — auto-detects backend and uses appropriate parser.
@@ -501,7 +675,7 @@ pub async fn stream_chat(
     config: &LlmConfig,
     messages: &[Value],
     model_override: Option<&str>,
-) -> Result<mpsc::Receiver<StreamChunk>, String> {
+) -> Result<mpsc::Receiver<StreamChunk>, LlmError> {
     let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
     let is_native = config.is_ollama_native();
@@ -644,6 +818,64 @@ mod tests {
     use axum::body::Body;
     use axum::response::{IntoResponse, Response};
     use axum::routing::{get, post};
+
+    #[test]
+    fn llm_error_kind_as_str_is_stable() {
+        // These strings are part of acp-bridge's wire contract: Clients
+        // (Zed, ACP UI, etc.) switch on `error.data.category` to decide
+        // whether to retry. Do not change them.
+        assert_eq!(LlmErrorKind::Unreachable.as_str(), "backend_unreachable");
+        assert_eq!(LlmErrorKind::RateLimited.as_str(), "rate_limited");
+        assert_eq!(LlmErrorKind::ServerBusy.as_str(), "server_busy");
+        assert_eq!(LlmErrorKind::Auth.as_str(), "auth_error");
+        assert_eq!(LlmErrorKind::BadRequest.as_str(), "bad_request");
+        assert_eq!(LlmErrorKind::NotFound.as_str(), "not_found");
+        assert_eq!(LlmErrorKind::Timeout.as_str(), "timeout");
+        assert_eq!(LlmErrorKind::ParseError.as_str(), "parse_error");
+        assert_eq!(LlmErrorKind::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn llm_error_kind_retryable_classification() {
+        // Transient — Client may auto-retry.
+        assert!(LlmErrorKind::Unreachable.is_retryable());
+        assert!(LlmErrorKind::RateLimited.is_retryable());
+        assert!(LlmErrorKind::ServerBusy.is_retryable());
+        assert!(LlmErrorKind::Timeout.is_retryable());
+        // Configuration / malformed — retrying is pointless.
+        assert!(!LlmErrorKind::Auth.is_retryable());
+        assert!(!LlmErrorKind::BadRequest.is_retryable());
+        assert!(!LlmErrorKind::NotFound.is_retryable());
+        assert!(!LlmErrorKind::ParseError.is_retryable());
+        assert!(!LlmErrorKind::Unknown.is_retryable());
+    }
+
+    #[test]
+    fn llm_error_from_status_classifies_known_codes() {
+        let cases: &[(u16, LlmErrorKind)] = &[
+            (400, LlmErrorKind::BadRequest),
+            (401, LlmErrorKind::Auth),
+            (403, LlmErrorKind::Auth),
+            (404, LlmErrorKind::NotFound),
+            (408, LlmErrorKind::RateLimited),
+            (422, LlmErrorKind::BadRequest),
+            (429, LlmErrorKind::RateLimited),
+            (500, LlmErrorKind::ServerBusy),
+            (502, LlmErrorKind::ServerBusy),
+            (503, LlmErrorKind::ServerBusy),
+            (504, LlmErrorKind::ServerBusy),
+        ];
+        for (code, expected_kind) in cases {
+            let status = reqwest::StatusCode::from_u16(*code).unwrap();
+            let err = LlmError::from_status(status, "test body");
+            assert_eq!(
+                err.kind, *expected_kind,
+                "HTTP {code} should classify as {expected_kind:?}"
+            );
+            assert_eq!(err.status, Some(*code));
+        }
+    }
+
     use axum::{Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -662,6 +894,8 @@ mod tests {
             max_history_turns: 50,
             max_sessions: 0,
             session_idle_timeout_secs: 0,
+            prompt_supports_image: false,
+            context_size: 32768,
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -893,7 +1127,12 @@ mod tests {
         let url = serve(Router::new().route("/v1/chat/completions", post(bad))).await;
         let cfg = test_config(&format!("{url}/v1"));
         let err = chat(&cfg, &[], None, None).await.unwrap_err();
-        assert!(err.contains("400"), "err was: {err}");
+        assert_eq!(
+            err.kind,
+            crate::llm::LlmErrorKind::BadRequest,
+            "err was: {err}"
+        );
+        assert!(err.message.contains("400"), "err was: {err}");
     }
 
     // -- streaming ----------------------------------------------------------
@@ -980,6 +1219,7 @@ mod tests {
         let url = serve(Router::new().route("/v1/chat/completions", post(bad))).await;
         let cfg = test_config(&format!("{url}/v1"));
         let err = stream_chat(&cfg, &[], None).await.unwrap_err();
-        assert!(err.contains("401"), "err was: {err}");
+        assert_eq!(err.kind, crate::llm::LlmErrorKind::Auth, "err was: {err}");
+        assert!(err.message.contains("401"), "err was: {err}");
     }
 }

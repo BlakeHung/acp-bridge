@@ -210,21 +210,48 @@ impl TestHarness {
         stdin.flush().expect("Failed to flush stdin");
     }
 
+    /// Read the next JSON object from stdout (notification or response).
+    /// Skips empty lines but does NOT skip notifications.
+    fn read_message(&mut self) -> Value {
+        loop {
+            let mut line = String::new();
+            self.reader
+                .read_line(&mut line)
+                .expect("Failed to read stdout");
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return serde_json::from_str(trimmed)
+                .unwrap_or_else(|_| panic!("Invalid JSON from stdout: {}", line));
+        }
+    }
+
+    /// Read the next JSON-RPC response from stdout, transparently
+    /// skipping any session/update notifications emitted between the
+    /// previous read and this one. acp-bridge may emit notifications
+    /// (e.g. `usage_update`, `session_info_update`) after the response
+    /// for the previous request, so a strict line-by-line reader that
+    /// wants the next response must skip past them.
     fn read_line(&mut self) -> Value {
-        let mut line = String::new();
-        self.reader
-            .read_line(&mut line)
-            .expect("Failed to read stdout");
-        serde_json::from_str(line.trim())
-            .unwrap_or_else(|_| panic!("Invalid JSON from stdout: {}", line))
+        loop {
+            let msg = self.read_message();
+            // Notifications have no `id`; skip them so callers see the
+            // next response.
+            if msg.get("id").is_some() {
+                return msg;
+            }
+        }
     }
 
     /// Read messages until we get a response with the given id.
-    /// Returns (notifications, response).
+    /// Returns (notifications, response). Uses `read_message` so that
+    /// session/update notifications interleaved between the request and
+    /// the response are surfaced to the caller for inspection.
     fn read_until_response(&mut self, expected_id: u64) -> (Vec<Value>, Value) {
         let mut notifications = Vec::new();
         loop {
-            let msg = self.read_line();
+            let msg = self.read_message();
             if msg.get("id").is_some() && msg["id"] == expected_id {
                 return (notifications, msg);
             }
@@ -270,6 +297,109 @@ async fn test_initialize() {
     assert!(resp["result"]["agentInfo"]["version"].is_string());
 
     h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #13 regression: Meuxe interop
+// ---------------------------------------------------------------------------
+
+/// Issue #13: Meuxe sends string/UUID JSON-RPC request IDs. These must be
+/// echoed back verbatim (not dropped), and a response must still be produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_initialize_with_uuid_string_id() {
+    let port = free_port();
+    let mut h = TestHarness::start(port).await;
+
+    // Exact shape from the issue: UUID string ID.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":"e2a9b464-6960-4557-a750-6773429f8be5",
+        "method":"initialize",
+        "params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}
+    }));
+
+    let resp = h.read_line();
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], "e2a9b464-6960-4557-a750-6773429f8be5");
+    assert!(resp["result"]["agentInfo"]["name"]
+        .as_str()
+        .unwrap()
+        .contains("acp-bridge"));
+
+    h.shutdown();
+}
+
+/// Issue #13: the full initialize → new → prompt flow must work with a
+/// string request ID, emit ACP `session/update` notifications that carry a
+/// `sessionId` and typed text content, and end the turn with
+/// `stopReason: "end_turn"` — all without any compatibility shim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_full_flow_string_id_session_update_and_stop_reason() {
+    let port = free_port();
+    let mut h = TestHarness::start(port).await;
+
+    // initialize with a UUID string id
+    h.send(&json!({
+        "jsonrpc":"2.0","id":"init-1",
+        "method":"initialize","params":{"protocolVersion":1}
+    }));
+    let resp = h.read_line();
+    assert_eq!(resp["id"], "init-1");
+
+    // session/new with a string id
+    h.send(&json!({"jsonrpc":"2.0","id":"new-1","method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    assert_eq!(resp["id"], "new-1");
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // session/prompt with a string id
+    h.send(&json!({
+        "jsonrpc":"2.0","id":"prompt-1","method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"say hello"}]}
+    }));
+
+    let (notifications, response) = read_until_response_id(&mut h, "prompt-1");
+
+    // 1. Notifications use ACP `session/update` (not `session/notify`),
+    //    carry the sessionId, and text chunks are typed.
+    for n in &notifications {
+        if n.get("method").is_some() {
+            assert_eq!(n["method"], "session/update");
+            assert_eq!(n["params"]["sessionId"], sid);
+        }
+    }
+    let text_chunks: Vec<String> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .map(|m| {
+            assert_eq!(m["params"]["update"]["content"]["type"], "text");
+            m["params"]["update"]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(text_chunks.join(""), "Hello world");
+
+    // 2. Final response echoes the string id, includes the legacy fields for
+    //    OpenAB, and reports a standard end-of-turn stop reason.
+    assert_eq!(response["id"], "prompt-1");
+    assert_eq!(response["result"]["status"], "completed");
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    h.shutdown();
+}
+
+/// Read stdout until a message whose `id` equals `expected` (string or number).
+/// Returns (notifications, response).
+fn read_until_response_id(h: &mut TestHarness, expected: &str) -> (Vec<Value>, Value) {
+    let mut notifications = Vec::new();
+    loop {
+        let msg = h.read_message();
+        if msg.get("id").is_some() && msg["id"] == expected {
+            return (notifications, msg);
+        }
+        notifications.push(msg);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1011,8 +1141,11 @@ async fn test_tool_round_limit_surfaces_failure() {
 
     // The model never produces a final answer, so instead of a silent
     // "completed" with empty text the turn must be reported as failed with a
-    // message that explains the tool-call limit was reached.
+    // message that explains the tool-call limit was reached. Per ACP the stop
+    // reason for exhausting the per-turn model-request budget is
+    // `max_turn_requests`.
     assert_eq!(response["result"]["status"], "failed");
+    assert_eq!(response["result"]["stopReason"], "max_turn_requests");
     assert!(
         response["result"]["text"]
             .as_str()
@@ -1145,4 +1278,172 @@ async fn test_tool_unknown() {
 
     let result = tools::execute_tool(Path::new("/tmp"), "hack_the_planet", &json!({}));
     assert!(result.contains("Unknown tool"));
+}
+
+// ----------------------------------------------------------------------------
+// ACP v1 wire-format conformance regression tests (issue #13 follow-up + survey
+// of Meuxe / ACP UI / Casper / Gold Band / Codeg / DeepChat).
+// ----------------------------------------------------------------------------
+
+/// `initialize` must NOT advertise `image: true` by default. Clients such as
+/// Meuxe forward image attachments only when the agent opts in via this
+/// capability; turning it on unconditionally causes image payloads to be
+/// sent to local backends with no vision model and surface upstream as
+/// confusing empty replies. Operators who actually want image support opt
+/// in via `LLM_SUPPORTS_IMAGE=true` or `[llm].supports_image = true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_initialize_does_not_advertise_image_by_default() {
+    // Ensure the opt-in env var is unset for this test
+    std::env::remove_var("LLM_SUPPORTS_IMAGE");
+
+    let port = free_port();
+    let mut h = TestHarness::start(port).await;
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}
+    }));
+    let resp = h.read_line();
+
+    assert_eq!(
+        resp["result"]["agentCapabilities"]["promptCapabilities"]["image"], false,
+        "initialize must default image capability to false; got {resp}"
+    );
+
+    h.shutdown();
+}
+
+/// Every `tool_call` notification must carry a `toolCallId` (required by
+/// ACP v1). Clients use the id to pair the start with subsequent updates;
+/// without it the per-tool timeline collapses and rendering degrades.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_call_notification_carries_tool_call_id_and_kind() {
+    std::env::set_var("LLM_SCENARIO", "tool_round_trip");
+
+    let port = free_port();
+    let mut h = TestHarness::start(port).await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"show me the project structure"}]}
+    }));
+
+    let (notifications, _response) = h.read_until_response(2);
+
+    // Find every tool_call / tool_call_update, collect their toolCallId + kind.
+    let tool_starts: Vec<&Value> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "tool_call")
+        .collect();
+    assert!(
+        !tool_starts.is_empty(),
+        "Expected at least one tool_call notification"
+    );
+
+    for n in &tool_starts {
+        let update = &n["params"]["update"];
+        let id = update["toolCallId"].as_str();
+        let kind = update["kind"].as_str();
+        let status = update["status"].as_str();
+        let title = update["title"].as_str();
+        assert!(id.is_some(), "tool_call must include toolCallId, got {n}");
+        assert!(
+            !id.unwrap().is_empty(),
+            "tool_call.toolCallId must be non-empty, got {n}"
+        );
+        assert!(kind.is_some(), "tool_call must include kind, got {n}");
+        assert!(
+            matches!(
+                kind.unwrap(),
+                "read"
+                    | "edit"
+                    | "delete"
+                    | "move"
+                    | "search"
+                    | "execute"
+                    | "fetch"
+                    | "think"
+                    | "other"
+            ),
+            "tool_call.kind must be a valid ACP ToolKind, got {kind:?}"
+        );
+        assert!(status.is_some(), "tool_call must include status, got {n}");
+        assert_eq!(status.unwrap(), "in_progress");
+        assert!(title.is_some(), "tool_call must include title, got {n}");
+    }
+
+    // Every tool_call_update must also carry toolCallId and a valid status.
+    let tool_updates: Vec<&Value> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update")
+        .collect();
+    assert!(
+        !tool_updates.is_empty(),
+        "Expected at least one tool_call_update notification"
+    );
+    for n in &tool_updates {
+        let update = &n["params"]["update"];
+        assert!(
+            update["toolCallId"].is_string(),
+            "tool_call_update must include toolCallId, got {n}"
+        );
+        let status = update["status"].as_str().unwrap_or("");
+        assert!(
+            matches!(status, "pending" | "in_progress" | "completed" | "failed"),
+            "tool_call_update.status must be one of pending/in_progress/completed/failed, got {status:?}"
+        );
+    }
+
+    h.shutdown();
+}
+
+/// `agent_thought_chunk` notifications must carry a typed `content` block.
+/// Earlier versions of acp-bridge emitted the sessionUpdate with no content,
+/// which spec-compliant clients (Meuxe, ACP UI, …) either reject or render
+/// as an empty bubble.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_thought_chunk_carries_content_block() {
+    let port = free_port();
+    let mut h = TestHarness::start(port).await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"say hello"}]}
+    }));
+
+    let (notifications, _response) = h.read_until_response(2);
+
+    let thoughts: Vec<&Value> = notifications
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_thought_chunk")
+        .collect();
+    assert!(
+        !thoughts.is_empty(),
+        "Expected at least one agent_thought_chunk notification"
+    );
+    for n in &thoughts {
+        let content = &n["params"]["update"]["content"];
+        assert!(
+            content.is_object(),
+            "agent_thought_chunk must include content object, got {n}"
+        );
+        assert_eq!(
+            content["type"].as_str(),
+            Some("text"),
+            "agent_thought_chunk.content.type must be 'text'"
+        );
+        assert!(
+            content["text"].is_string(),
+            "agent_thought_chunk.content.text must be a string"
+        );
+    }
+
+    h.shutdown();
 }

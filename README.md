@@ -216,6 +216,9 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_MAX_HISTORY_TURNS` | `50` | Max conversation turns to keep (0 = unlimited) |
 | `LLM_MAX_SESSIONS` | `0` | Max concurrent sessions (0 = unlimited) |
 | `LLM_SESSION_IDLE_TIMEOUT` | `0` | Evict idle sessions after N seconds (0 = disabled) |
+| `LLM_SUPPORTS_IMAGE` | `false` | Opt-in: advertise `promptCapabilities.image: true` at `initialize`. Set to `true` only if the configured backend can actually accept image content blocks (e.g. a vision-capable model). |
+| `LLM_MODEL_CONTEXT` | `32768` | Model context window in tokens. Reported as `size` in `usage_update` notifications. |
+| `LLM_WEB_ALLOWLIST` | (empty) | Comma-separated host suffixes the `web_fetch` tool is allowed to reach. Empty = block all web access. |
 | `RUST_LOG` | `acp_bridge=info` | Log level (`debug`, `info`, `warn`, `error`) |
 
 Also supports `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_API_KEY` as aliases.
@@ -332,6 +335,14 @@ When the LLM supports function calling (Ollama with compatible models, OpenAI-co
 | `read_file` | Read file contents | Max 1MB, sandboxed to working dir |
 | `list_dir` | List directory tree | Max depth 3, max 200 entries |
 | `search_code` | Grep for patterns | Max 50 matches |
+| `write_file` | Create or overwrite a file | Max 5MB, sandboxed to working dir |
+| `edit` | Replace a unique substring in a file | Refuses ambiguous / missing matches |
+| `web_fetch` | Fetch a URL over HTTP/HTTPS | 5MB body, 30s timeout. Requires `LLM_WEB_ALLOWLIST` |
+| `bash` | Run a bash command in the working dir | Output truncated at 50 KB |
+| `git_status` | Compact `git status` | — |
+| `git_diff` | Show unstaged (or staged) changes | Optional `path` filter |
+| `git_log` | One-line-per-commit log | `max_count` (default 20, max 200) |
+| `git_commit` | Stage listed paths and commit | — |
 
 All tools are **sandboxed** to the session's working directory — the LLM cannot access files outside it.
 
@@ -339,9 +350,9 @@ All tools are **sandboxed** to the session's working directory — the LLM canno
 
 | Method | Status |
 |--------|--------|
-| `initialize` | Supported — advertises `agentCapabilities.promptCapabilities.image: true`, `protocolVersion: 1`, `authMethods: []` |
+| `initialize` | Supported — advertises `agentCapabilities.promptCapabilities` (image support opt-in via `LLM_SUPPORTS_IMAGE`), `protocolVersion: 1`, `authMethods: []` |
 | `session/new` | Multi-session with conversation history; `mcpServers` param accepted but ignored in v0.7 |
-| `session/prompt` | Streaming via SSE; supports image content blocks |
+| `session/prompt` | Streaming via SSE; image content blocks supported only when `LLM_SUPPORTS_IMAGE=true`. Final response carries `stopReason` per ACP v1. |
 | `session/end` | Session cleanup |
 | `session/load` | Not yet — roadmap |
 | `session/resume` | Not yet — roadmap |

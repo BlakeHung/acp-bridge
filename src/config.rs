@@ -31,6 +31,15 @@ pub struct LlmSection {
     pub max_history_turns: Option<usize>,
     pub max_sessions: Option<usize>,
     pub session_idle_timeout_secs: Option<u64>,
+    /// Whether the backend accepts image content blocks. Mirrors the
+    /// `LLM_SUPPORTS_IMAGE` env var; the env var takes precedence.
+    #[serde(default)]
+    pub supports_image: Option<bool>,
+    /// Model context window in tokens. Mirrors the `LLM_MODEL_CONTEXT` env
+    /// var; the env var takes precedence. Reported as `size` in
+    /// `usage_update` notifications.
+    #[serde(default)]
+    pub model_context: Option<u64>,
 }
 
 impl ConfigFile {
@@ -113,6 +122,18 @@ impl ConfigFile {
             .or(file.session_idle_timeout_secs)
             .unwrap_or(0);
 
+        let prompt_supports_image = match std::env::var("LLM_SUPPORTS_IMAGE").as_deref() {
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on") => true,
+            Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
+            _ => file.supports_image.unwrap_or(false),
+        };
+
+        let context_size = std::env::var("LLM_MODEL_CONTEXT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.model_context)
+            .unwrap_or(32768);
+
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(4)
@@ -130,6 +151,8 @@ impl ConfigFile {
             max_history_turns,
             max_sessions,
             session_idle_timeout_secs,
+            prompt_supports_image,
+            context_size,
             client,
         }
     }

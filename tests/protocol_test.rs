@@ -1,4 +1,4 @@
-use acp_bridge::protocol::{AcpError, JsonRpcRequest, Session};
+use acp_bridge::protocol::{AcpError, JsonRpcRequest, RequestId, Session};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -9,7 +9,7 @@ use serde_json::json;
 fn parse_initialize_request() {
     let input = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let req: JsonRpcRequest = serde_json::from_str(input).unwrap();
-    assert_eq!(req.id, Some(1));
+    assert_eq!(req.id, Some(RequestId::Number(1)));
     assert_eq!(req.method, "initialize");
     assert!(req.params.is_some());
 }
@@ -18,9 +18,36 @@ fn parse_initialize_request() {
 fn parse_request_without_params() {
     let input = r#"{"jsonrpc":"2.0","id":42,"method":"session/end"}"#;
     let req: JsonRpcRequest = serde_json::from_str(input).unwrap();
-    assert_eq!(req.id, Some(42));
+    assert_eq!(req.id, Some(RequestId::Number(42)));
     assert_eq!(req.method, "session/end");
     assert!(req.params.is_none());
+}
+
+#[test]
+fn parse_string_uuid_request_id() {
+    // Issue #13: Meuxe uses string/UUID request IDs. These must be preserved,
+    // not silently dropped.
+    let input = r#"{"jsonrpc":"2.0","id":"e2a9b464-6960-4557-a750-6773429f8be5","method":"initialize","params":{"protocolVersion":1}}"#;
+    let req: JsonRpcRequest = serde_json::from_str(input).unwrap();
+    assert_eq!(
+        req.id,
+        Some(RequestId::String(
+            "e2a9b464-6960-4557-a750-6773429f8be5".into()
+        ))
+    );
+    assert_eq!(req.method, "initialize");
+}
+
+#[test]
+fn request_id_as_value_round_trips_string() {
+    let id = RequestId::String("e2a9b464-6960-4557-a750-6773429f8be5".into());
+    assert_eq!(id.as_value(), json!("e2a9b464-6960-4557-a750-6773429f8be5"));
+}
+
+#[test]
+fn request_id_as_value_round_trips_number() {
+    let id = RequestId::Number(42);
+    assert_eq!(id.as_value(), json!(42));
 }
 
 #[test]

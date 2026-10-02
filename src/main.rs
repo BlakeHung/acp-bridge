@@ -9,7 +9,7 @@ use acp_bridge::config::ConfigFile;
 use acp_bridge::engine::{self, AppState, Notification};
 use acp_bridge::hardware;
 use acp_bridge::llm;
-use acp_bridge::protocol::{AcpError, JsonRpcRequest};
+use acp_bridge::protocol::{AcpError, JsonRpcRequest, RequestId};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -260,7 +260,7 @@ async fn run_acp_loop(state: Arc<AppState>) {
                         match method {
                             "initialize" => {
                                 let result = engine::initialize(&state.config);
-                                acp::send_response(id, result);
+                                acp::send_response(&id, result);
                             }
                             "session/new" => {
                                 let raw_cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or("/tmp");
@@ -271,10 +271,21 @@ async fn run_acp_loop(state: Arc<AppState>) {
                                 }
                                 match engine::session_new(&state, raw_cwd) {
                                     Ok(session_id) => {
-                                        acp::send_response(id, json!({"sessionId": session_id}));
+                                        // Post-creation notifications first so
+                                        // Clients that want to render the
+                                        // slash-command menu / session title
+                                        // as soon as the sessionId arrives
+                                        // see them attached to the same
+                                        // session. Notifications carry the
+                                        // sessionId they apply to, so sending
+                                        // them before the response is safe
+                                        // (Client binds them on receipt of
+                                        // the response anyway).
+                                        engine::session_new_post_create_notifications(&session_id, raw_cwd);
+                                        acp::send_response(&id, json!({"sessionId": session_id}));
                                     }
                                     Err(e) => {
-                                        acp::send_error(id, e.code(), &e.to_string());
+                                        acp::send_error(&id, e.code(), &e.to_string());
                                     }
                                 }
                             }
@@ -285,42 +296,79 @@ async fn run_acp_loop(state: Arc<AppState>) {
                                 let session_id = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
                                 if session_id.is_empty() {
                                     let err = AcpError::MissingParam { field: "sessionId".into() };
-                                    acp::send_error(id, err.code(), &err.to_string());
+                                    acp::send_error(&id, err.code(), &err.to_string());
                                 } else {
                                     match engine::session_end(&state, session_id) {
-                                        Ok(()) => acp::send_response(id, json!({"status": "ended"})),
-                                        Err(e) => acp::send_error(id, e.code(), &e.to_string()),
+                                        Ok(()) => acp::send_response(&id, json!({"status": "ended"})),
+                                        Err(e) => acp::send_error(&id, e.code(), &e.to_string()),
                                     }
                                 }
                             }
                             "session/load" | "session/resume" => {
-                                // ACP uses capability-based negotiation: a client should
-                                // only call `session/load` when the agent advertises
-                                // `loadSession` in `agentCapabilities`. acp-bridge does
-                                // not advertise it, so the correct response is -32601
-                                // (method not found) — the keep-the-message-helpful
-                                // string is preserved for operators debugging stray
-                                // calls.
-                                acp::send_error(
-                                    id,
-                                    -32601,
-                                    "session/load and session/resume are not supported by acp-bridge (no persistence layer; loadSession capability is not advertised)",
+                                // acp-bridge has no persistence layer; it does not
+                                // advertise `loadSession` in `agentCapabilities`, so a
+                                // spec-compliant Client should not call this. We
+                                // return `-32001` (application error) with a stable
+                                // `data.reason` so Clients can branch on it.
+                                acp::send_error_with_data(
+                                    &id,
+                                    -32001,
+                                    "acp-bridge has no persistence layer; session/load and session/resume are unavailable",
+                                    json!({ "reason": "no_persistence" }),
                                 );
                             }
                             "session/set_mode" => {
-                                // session/new responses do not include a `modes` array,
-                                // so per ACP spec this method is not applicable to
-                                // sessions created by acp-bridge. Capability-based
-                                // negotiation: respond with -32601 method-not-found.
-                                acp::send_error(
-                                    id,
+                                // session/new does not include a `modes` array, so
+                                // per ACP spec this method is not applicable to
+                                // sessions created by acp-bridge. Spec-compliant
+                                // Clients detect this via the missing `modes` array
+                                // and skip the call entirely; this branch is the
+                                // safety net for non-compliant Clients.
+                                acp::send_error_with_data(
+                                    &id,
+                                    -32602,
+                                    "session/set_mode is not applicable; sessions created by acp-bridge have no modes",
+                                    json!({ "reason": "no_modes" }),
+                                );
+                            }
+                            "auth/login" | "auth/logout" => {
+                                // acp-bridge advertises `authMethods: []` at
+                                // initialize, so a spec-compliant Client should not
+                                // call auth methods. Return a clear reason so the
+                                // Client can log it.
+                                acp::send_error_with_data(
+                                    &id,
                                     -32601,
-                                    "session/set_mode is not supported by acp-bridge (sessions are created without a `modes` array)",
+                                    "acp-bridge does not implement authentication; authMethods is empty at initialize",
+                                    json!({ "reason": "no_auth_methods" }),
+                                );
+                            }
+                            method if method.starts_with("fs/") => {
+                                // The Client-side fs surface is for agents that
+                                // want to read/write files via the editor.
+                                // acp-bridge uses its own built-in tool set
+                                // (`read_file` / `write_file` / `list_dir` / …)
+                                // and never calls these. Spec-compliant Clients
+                                // detect the agent's lack of need via
+                                // `agentCapabilities`; this is the safety net.
+                                acp::send_error_with_data(
+                                    &id,
+                                    -32601,
+                                    "acp-bridge does not call client-side filesystem methods",
+                                    json!({ "reason": "agent_does_not_call_client_fs" }),
+                                );
+                            }
+                            method if method.starts_with("terminal/") => {
+                                acp::send_error_with_data(
+                                    &id,
+                                    -32601,
+                                    "acp-bridge does not call client-side terminal methods",
+                                    json!({ "reason": "agent_does_not_call_client_terminal" }),
                                 );
                             }
                             _ => {
                                 let err = AcpError::MethodNotFound { method: method.to_string() };
-                                acp::send_error(id, err.code(), &err.to_string());
+                                acp::send_error(&id, err.code(), &err.to_string());
                             }
                         }
                     }
@@ -349,14 +397,14 @@ async fn run_acp_loop(state: Arc<AppState>) {
 }
 
 /// Handle ACP session/prompt — runs engine and streams notifications to stdout.
-async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
+async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>) {
     let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
             let err = AcpError::MissingParam {
                 field: "sessionId".into(),
             };
-            acp::send_error(id, err.code(), &err.to_string());
+            acp::send_error(&id, err.code(), &err.to_string());
             return;
         }
     };
@@ -385,9 +433,19 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
         let err = AcpError::MissingParam {
             field: "prompt (expected non-empty text or image content)".into(),
         };
-        acp::send_error(id, err.code(), &err.to_string());
+        acp::send_error(&id, err.code(), &err.to_string());
         return;
     }
+
+    // Compute a session title from the user's first non-empty line so
+    // Clients can surface a meaningful name in their session list. Done
+    // before spawning the engine task because `user_text` is moved into
+    // the task below.
+    let derived_title = user_text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().chars().take(80).collect::<String>())
+        .filter(|s: &String| !s.is_empty());
 
     // Set up notification channel for ACP streaming
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Notification>();
@@ -409,10 +467,12 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
     // Drain notifications to ACP stdout
     while let Some(notif) = notify_rx.recv().await {
         match notif {
-            Notification::Thinking => acp::notify_thinking(),
-            Notification::ToolStart(name) => acp::notify_tool_start(&name),
-            Notification::ToolDone(name, status) => acp::notify_tool_done(&name, &status),
-            Notification::TextChunk(text) => acp::notify_text(&text),
+            Notification::Thinking => acp::notify_thinking(&session_id),
+            Notification::ToolStart { id, name } => acp::notify_tool_start(&session_id, &id, &name),
+            Notification::ToolDone { id, name, status } => {
+                acp::notify_tool_done(&session_id, &id, &name, &status)
+            }
+            Notification::TextChunk(text) => acp::notify_text(&session_id, &text),
         }
     }
 
@@ -420,24 +480,78 @@ async fn handle_acp_prompt(id: u64, params: &Value, state: &Arc<AppState>) {
         status: "failed".into(),
         text: "Internal error".into(),
         error: None,
+        usage: engine::UsageReport {
+            used: 0,
+            size: state.config.context_size,
+        },
+        error_class: Some(acp_bridge::llm::LlmErrorKind::Unknown),
+        error_retryable: false,
     });
 
     // If the engine returned a protocol error (e.g. unknown session), send JSON-RPC error
     if let Some(err) = &result.error {
-        acp::send_error(id, err.code(), &err.to_string());
-    } else {
-        // Include the accumulated text in the final response as well as the
-        // streamed `TextChunk` notifications. Some upstream clients (e.g.
-        // OpenAB pipelines that treat `ToolDone("llm_chat","completed")`
-        // as the turn boundary) rely on the final response for the message
-        // body — without `text` here those clients show an empty reply
-        // even though the chunks were sent.
-        acp::send_response(
-            id,
-            json!({
-                "status": result.status,
-                "text": result.text,
-            }),
-        );
+        acp::send_error(&id, err.code(), &err.to_string());
+        return;
     }
+
+    // A successful prompt ends a turn, which ACP signals via `stopReason:
+    // "end_turn"`. The generated text is delivered through the streamed
+    // `agent_message_chunk` notifications.
+    //
+    // The legacy `status`/`text` fields are kept alongside `stopReason` so
+    // existing OpenAB pipelines that rely on the final response body keep
+    // working; standard ACP clients read `stopReason` and ignore the extra
+    // fields. Once OpenAB migrates off the legacy format this can be trimmed.
+    // ACP v1 StopReason values: end_turn / max_tokens / max_turn_requests /
+    // refusal / cancelled. There is no generic "error" reason, so a turn that
+    // hits the tool-call round limit maps to `max_turn_requests` (the model
+    // made the maximum number of requests in a single turn). The actual error
+    // text is already delivered via the streamed `agent_message_chunk` and the
+    // legacy `status`/`text` fields below.
+    // The legacy `status`/`text` fields are kept alongside `stopReason` so
+    // existing OpenAB pipelines that rely on the final response body keep
+    // working; standard ACP clients read `stopReason` and ignore the extra
+    // fields. Once OpenAB migrates off the legacy format this can be trimmed.
+    // ACP v1 StopReason values: end_turn / max_tokens / max_turn_requests /
+    // refusal / cancelled. There is no generic "error" reason, so a turn that
+    // hits the tool-call round limit maps to `max_turn_requests` (the model
+    // made the maximum number of requests in a single turn). The actual error
+    // text is already delivered via the streamed `agent_message_chunk` and the
+    // legacy `status`/`text` fields below.
+    let stop_reason = if result.status == "completed" {
+        "end_turn"
+    } else {
+        "max_turn_requests"
+    };
+
+    // If the turn failed due to a classified LLM error, attach the
+    // classification to the response so Clients can branch on
+    // `error.category` and `error.retryable` without parsing the prose
+    // `text` field. We only emit this when `error_class` is set; pure
+    // `max_turn_requests` (tool-loop exhaustion) does not classify.
+    let error_meta = result.error_class.as_ref().map(|k| {
+        json!({
+            "category": k.as_str(),
+            "retryable": k.is_retryable(),
+        })
+    });
+
+    // Post-turn notifications come BEFORE the response so Clients that
+    // collect both (e.g. via `read_until_response`) see them bound to
+    // this turn. The notification `sessionId` field already tells the
+    // Client which session they apply to.
+    acp::notify_usage(&session_id, result.usage.used, result.usage.size, None);
+    if let Some(title) = derived_title.as_deref() {
+        acp::notify_session_info(&session_id, title, None);
+    }
+
+    let mut response_body = json!({
+        "stopReason": stop_reason,
+        "status": result.status,
+        "text": result.text,
+    });
+    if let Some(meta) = error_meta {
+        response_body["error"] = meta;
+    }
+    acp::send_response(&id, response_body);
 }

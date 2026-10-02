@@ -99,7 +99,7 @@ pub async fn run(config: &LlmConfig, fixtures: &[Fixture]) -> Vec<RunResult> {
                 prompt_tokens: None,
                 completion_tokens: None,
                 decode_tps: None,
-                error: Some(e),
+                error: Some(e.to_string()),
             }),
         }
     }
@@ -329,6 +329,8 @@ mod tests {
             max_history_turns: 50,
             max_sessions: 0,
             session_idle_timeout_secs: 0,
+            prompt_supports_image: false,
+            context_size: 32768,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()

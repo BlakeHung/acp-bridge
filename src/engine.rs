@@ -22,14 +22,38 @@ const MAX_TOOL_ROUNDS: usize = 5;
 /// Extract concatenated text from a slice of ACP/A2A content parts.
 ///
 /// Each part is expected to be an object with `"type": "text"` and `"text": "..."`.
-/// Non-text parts and malformed entries are skipped.
+/// `ContentBlock::ResourceLink` parts (type == "resource_link") are converted
+/// to a `[Attached resource: <uri>]` pseudo-line so the LLM has at least a
+/// textual hint that a resource was attached. This satisfies ACP v1's
+/// "MUST support ContentBlock::ResourceLink in session/prompt" requirement
+/// without acp-bridge having to dereference the URI itself — that is the
+/// responsibility of the Client per spec.
 pub fn extract_text_parts(parts: &[Value]) -> String {
-    parts
-        .iter()
-        .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut lines: Vec<String> = Vec::new();
+    for p in parts {
+        let Some(t) = p.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        match t {
+            "text" => {
+                if let Some(text) = p.get("text").and_then(|v| v.as_str()) {
+                    lines.push(text.to_string());
+                }
+            }
+            "resource_link" => {
+                if let Some(uri) = p.get("uri").and_then(|v| v.as_str()) {
+                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if name.is_empty() {
+                        lines.push(format!("[Attached resource: {uri}]"));
+                    } else {
+                        lines.push(format!("[Attached resource: {name} ({uri})]"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    lines.join("\n")
 }
 
 /// Extract base64 image content blocks from a slice of ACP/A2A content parts.
@@ -56,7 +80,8 @@ pub fn extract_image_parts(parts: &[Value]) -> Vec<ImageBlock> {
 ///
 /// 1. ACP spec: `Array<ContentBlock>` — handled by `extract_text_parts`.
 /// 2. A single ContentBlock object (some clients send the block directly,
-///    not wrapped in a one-element array).
+///    not wrapped in a one-element array). ResourceLink is converted to a
+///    pseudo-line in the same way as in the array case.
 /// 3. A plain string (legacy or simplified clients that put the whole
 ///    prompt directly in the `prompt` field).
 ///
@@ -67,11 +92,26 @@ pub fn extract_user_text_from_prompt(prompt: &Value) -> String {
     match prompt {
         Value::String(s) => s.clone(),
         Value::Array(arr) => extract_text_parts(arr),
-        Value::Object(_) => prompt
-            .get("text")
-            .and_then(|t| t.as_str())
-            .map(str::to_owned)
-            .unwrap_or_default(),
+        Value::Object(_) => {
+            // ResourceLink-as-the-whole-prompt: turn into a single pseudo-line.
+            if prompt.get("type").and_then(|v| v.as_str()) == Some("resource_link") {
+                let uri = prompt.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                let name = prompt.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if uri.is_empty() {
+                    String::new()
+                } else if name.is_empty() {
+                    format!("[Attached resource: {uri}]")
+                } else {
+                    format!("[Attached resource: {name} ({uri})]")
+                }
+            } else {
+                prompt
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_default()
+            }
+        }
         _ => String::new(),
     }
 }
@@ -151,8 +191,19 @@ pub fn extract_user_images_from_prompt(prompt: &Value) -> Vec<ImageBlock> {
 #[derive(Debug, Clone)]
 pub enum Notification {
     Thinking,
-    ToolStart(String),
-    ToolDone(String, String),
+    ToolStart {
+        /// ACP v1 `toolCallId` — required for clients to pair tool_call /
+        /// tool_call_update updates. The LLM assigns this id per call; for
+        /// the synthetic outer `llm_chat` event we mint a stable id derived
+        /// from the session/round so clients can render it.
+        id: String,
+        name: String,
+    },
+    ToolDone {
+        id: String,
+        name: String,
+        status: String,
+    },
     TextChunk(String),
 }
 
@@ -222,8 +273,33 @@ impl AppState {
 // ---------------------------------------------------------------------------
 
 /// Handle `initialize` — returns agent info.
+///
+/// ACP v1 spec treats capability flags as the only signal a Client has for
+/// whether to send images / audio / embedded resources. Per-spec the default
+/// for all three is `false`, and acp-bridge historically advertised
+/// `image: true` unconditionally — which caused Clients (Meuxe, ACP UI, …)
+/// to forward image attachments to local backends that had no vision model
+/// loaded, surfacing upstream as confusing "agent didn't respond" errors.
+///
+/// We now advertise `image` only when the operator opts in via the
+/// `LLM_SUPPORTS_IMAGE` env var or the equivalent field in the config file.
+/// `audio` and `embeddedContext` remain `false` — acp-bridge does not yet
+/// process them.
 pub fn initialize(config: &LlmConfig) -> Value {
     info!(model = %config.model, base_url = %config.base_url, "Initialize");
+    let prompt_capabilities = if config.prompt_supports_image {
+        json!({
+            "image": true,
+            "audio": false,
+            "embeddedContext": false
+        })
+    } else {
+        json!({
+            "image": false,
+            "audio": false,
+            "embeddedContext": false
+        })
+    };
     json!({
         "protocolVersion": 1,
         "agentInfo": {
@@ -231,9 +307,7 @@ pub fn initialize(config: &LlmConfig) -> Value {
             "version": env!("CARGO_PKG_VERSION")
         },
         "agentCapabilities": {
-            "promptCapabilities": {
-                "image": true
-            }
+            "promptCapabilities": prompt_capabilities
         },
         "authMethods": []
     })
@@ -272,7 +346,64 @@ pub fn session_new(state: &AppState, cwd: &str) -> Result<String, AcpError> {
     state.sessions_write().insert(session_id.clone(), session);
 
     info!(session_id = %session_id, max_history = state.config.max_history_turns, "New session");
+
+    // NOTE: We return `Ok(session_id)` from here BEFORE emitting the
+    // post-session-creation notifications below. Callers (e.g.
+    // `main::run_acp_loop`) send the JSON-RPC response immediately on
+    // receiving the session id, then emit the notifications. This ordering
+    // matches what other ACP agents do (OpenClaw, OpenCode) — the Client
+    // learns the new sessionId first, then receives the post-session
+    // notifications (commands, info update) bound to that id.
     Ok(session_id)
+}
+
+/// Post-creation notifications to send after `session/new` returns.
+/// Exposed so `main::run_acp_loop` can emit them with the right wire
+/// framing after the response is on the wire.
+pub fn session_new_post_create_notifications(session_id: &str, cwd: &str) {
+    // Advertise the slash commands this agent recognises. Clients use this
+    // to populate the "/…" shortcut menu. The list is intentionally small:
+    // commands are shortcuts, not advertised features. See `tools.rs` for
+    // the tool surface that backs the longer-tail capabilities.
+    crate::acp::notify_available_commands(
+        session_id,
+        &[
+            crate::acp::AvailableCommand::new(
+                "read",
+                "Read a file (alias for read_file tool)",
+                Some::<&str>("path"),
+            ),
+            crate::acp::AvailableCommand::new(
+                "ls",
+                "List directory contents (alias for list_dir tool)",
+                Some::<&str>("path"),
+            ),
+            crate::acp::AvailableCommand::new(
+                "search",
+                "Search code (alias for search tool)",
+                Some::<&str>("pattern"),
+            ),
+            crate::acp::AvailableCommand::new(
+                "edit",
+                "Patch a file via write_file tool",
+                Some::<&str>("path"),
+            ),
+            crate::acp::AvailableCommand::new(
+                "shell",
+                "Run a shell command via the shell tool",
+                Some::<&str>("command"),
+            ),
+        ],
+    );
+
+    // Initial session_info_update — title defaults to the cwd basename so
+    // the Client has something to show in its session list before any
+    // prompt runs.
+    let title = std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(cwd);
+    crate::acp::notify_session_info(session_id, title, None);
 }
 
 /// Handle `session/prompt` — runs the LLM with tool loop.
@@ -304,6 +435,12 @@ pub async fn session_prompt(
                     error: Some(AcpError::UnknownSession {
                         session_id: session_id.into(),
                     }),
+                    usage: UsageReport {
+                        used: 0,
+                        size: state.config.context_size,
+                    },
+                    error_class: None,
+                    error_retryable: false,
                 };
             }
         };
@@ -326,11 +463,15 @@ pub async fn session_prompt(
     }
 
     notify(Notification::Thinking);
-    notify(Notification::ToolStart("llm_chat".into()));
+    notify(Notification::ToolStart {
+        id: format!("llm_chat:{session_id}"),
+        name: "llm_chat".into(),
+    });
 
     let mut had_error = false;
     let mut got_final_response = false;
     let mut final_text = String::new();
+    let mut last_error_class: Option<crate::llm::LlmErrorKind> = None;
     let tool_defs = tools::tool_definitions();
 
     // Tool call loop
@@ -391,16 +532,22 @@ pub async fn session_prompt(
                     let args_str = func["arguments"].as_str().unwrap_or("{}");
                     let args: Value = serde_json::from_str(args_str)
                         .unwrap_or_else(|_| func["arguments"].clone());
+                    let tool_call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
 
-                    notify(Notification::ToolStart(name.into()));
+                    notify(Notification::ToolStart {
+                        id: tool_call_id.to_string(),
+                        name: name.into(),
+                    });
                     let result = tools::execute_tool(&working_dir, name, &args);
-                    notify(Notification::ToolDone(name.into(), "completed".into()));
+                    notify(Notification::ToolDone {
+                        id: tool_call_id.to_string(),
+                        name: name.into(),
+                        status: "completed".into(),
+                    });
 
                     debug!(tool = name, result_len = result.len(), "Tool executed");
 
                     {
-                        let tool_call_id =
-                            tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
                         let mut sessions = state.sessions_write();
                         if let Some(session) = sessions.get_mut(session_id) {
                             session
@@ -411,11 +558,32 @@ pub async fn session_prompt(
                 }
             }
             Err(e) => {
-                let err_msg = format!("\n\n**Error:** {e}\n");
+                // Classify the LLM error so the response can carry a
+                // structured `data.category` field that Clients can
+                // switch on without parsing prose. See
+                // `LlmErrorKind::as_str()` for the stable category names.
+                let kind = e.kind.clone();
+                let retryable = e.kind.is_retryable();
+                let err_msg = format!(
+                    "\n\n**Error ({}):** {}\n{}",
+                    e.kind.as_str(),
+                    e.message,
+                    if retryable {
+                        "_Hint: this is a transient error; the same prompt may succeed on retry._"
+                    } else {
+                        "_Hint: this error is not retryable; check the model name, base URL, or prompt shape._"
+                    }
+                );
                 notify(Notification::TextChunk(err_msg.clone()));
                 final_text = err_msg;
                 had_error = true;
-                error!(error = %e, "LLM communication failed");
+                last_error_class = Some(kind);
+                error!(
+                    kind = e.kind.as_str(),
+                    status = ?e.status,
+                    retryable,
+                    "LLM communication failed"
+                );
                 break;
             }
         }
@@ -439,13 +607,61 @@ pub async fn session_prompt(
     }
 
     let status = if had_error { "failed" } else { "completed" };
-    notify(Notification::ToolDone("llm_chat".into(), status.into()));
+    notify(Notification::ToolDone {
+        id: format!("llm_chat:{session_id}"),
+        name: "llm_chat".into(),
+        status: status.into(),
+    });
+
+    // Estimate the current context utilization for `usage_update`. Local
+    // backends rarely stream per-turn token counts in a stable shape, so
+    // we estimate by summing the textual length of every message in the
+    // session history and dividing by 4 chars per token (the canonical
+    // LLM rule of thumb). This is intentionally approximate; clients use
+    // it for progress bars and not for cost attribution.
+    let used_tokens = {
+        let sessions = state.sessions_read();
+        sessions
+            .get(session_id)
+            .map(|s| estimate_tokens(&s.messages))
+            .unwrap_or(0)
+    };
 
     PromptResult {
         status: status.into(),
         text: final_text,
         error: None,
+        usage: UsageReport {
+            used: used_tokens,
+            size: state.config.context_size,
+        },
+        error_class: last_error_class.clone(),
+        error_retryable: last_error_class.as_ref().is_some_and(|k| k.is_retryable()),
     }
+}
+
+/// Rough token estimate from a list of chat messages. Sums the textual
+/// content of every message and divides by 4 chars/token. We do NOT try
+/// to be precise — local backends do not stream stable per-turn token
+/// counts, and clients use this only for progress visualisation.
+pub fn estimate_tokens(messages: &[Value]) -> u64 {
+    let total_chars: usize = messages
+        .iter()
+        .map(|m| {
+            // `content` may be a string, an array of ContentBlocks, or
+            // null; extract any text we can find.
+            match m.get("content") {
+                Some(Value::String(s)) => s.len(),
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                    .map(|s| s.len())
+                    .sum(),
+                _ => 0,
+            }
+        })
+        .sum();
+    ((total_chars / 4) as u64).max(1)
 }
 
 /// Handle `session/end` — removes a session.
@@ -469,6 +685,25 @@ pub struct PromptResult {
     pub status: String,
     pub text: String,
     pub error: Option<AcpError>,
+    pub usage: UsageReport,
+    /// Classification of the most recent LLM error (if any). `None` means
+    /// the turn completed without a backend failure. Carries a stable
+    /// `LlmErrorKind` so the JSON-RPC response can attach a structured
+    /// `error.data.category` field Clients can switch on.
+    pub error_class: Option<crate::llm::LlmErrorKind>,
+    /// True if the last LLM failure was a transient error the Client
+    /// could retry by re-issuing the same prompt.
+    pub error_retryable: bool,
+}
+
+/// Estimated token usage for a completed prompt turn. The wire shape
+/// consumed by `acp::notify_usage` (`used`, `size`) — no cost is
+/// reported because acp-bridge runs against local backends where cost
+/// is unknown.
+#[derive(Debug, Clone, Copy)]
+pub struct UsageReport {
+    pub used: u64,
+    pub size: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +729,43 @@ mod tests {
     fn extract_user_text_handles_single_block_object() {
         let prompt = serde_json::json!({"type": "text", "text": "hello"});
         assert_eq!(extract_user_text_from_prompt(&prompt), "hello");
+    }
+
+    #[test]
+    fn extract_user_text_handles_resource_link_in_array() {
+        let prompt = serde_json::json!([
+            {"type": "text", "text": "describe this"},
+            {"type": "resource_link", "uri": "file:///etc/hostname", "name": "hostname"}
+        ]);
+        let text = extract_user_text_from_prompt(&prompt);
+        assert!(text.contains("describe this"));
+        assert!(text.contains("[Attached resource: hostname (file:///etc/hostname)]"));
+    }
+
+    #[test]
+    fn extract_user_text_handles_pure_resource_link_object() {
+        // Some Clients send a ResourceLink as the entire prompt.
+        let prompt = serde_json::json!({
+            "type": "resource_link",
+            "uri": "file:///etc/hostname",
+            "name": "hostname"
+        });
+        assert_eq!(
+            extract_user_text_from_prompt(&prompt),
+            "[Attached resource: hostname (file:///etc/hostname)]"
+        );
+    }
+
+    #[test]
+    fn extract_user_text_handles_resource_link_without_name() {
+        let prompt = serde_json::json!({
+            "type": "resource_link",
+            "uri": "file:///x"
+        });
+        assert_eq!(
+            extract_user_text_from_prompt(&prompt),
+            "[Attached resource: file:///x]"
+        );
     }
 
     #[test]
@@ -622,5 +894,86 @@ mod tests {
         );
         assert_eq!(Backend::OpenAi.extract_response_text(&openai), "openai");
         assert_eq!(Backend::OpenAi.extract_tool_calls(&openai), vec![tool_call]);
+    }
+
+    fn cfg_with_image(supports_image: bool) -> LlmConfig {
+        LlmConfig {
+            base_url: "http://localhost:11434/v1".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            system_prompt: None,
+            temperature: None,
+            max_tokens: None,
+            timeout_secs: 5,
+            max_history_turns: 50,
+            max_sessions: 0,
+            session_idle_timeout_secs: 0,
+            prompt_supports_image: supports_image,
+            context_size: 32768,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("client"),
+        }
+    }
+
+    #[test]
+    fn initialize_does_not_advertise_image_by_default() {
+        let caps = initialize(&cfg_with_image(false));
+        assert_eq!(caps["protocolVersion"], 1);
+        assert_eq!(
+            caps["agentCapabilities"]["promptCapabilities"]["image"], false,
+            "image must default to false to avoid clients forwarding image \
+             attachments to local backends without vision"
+        );
+        assert_eq!(
+            caps["agentCapabilities"]["promptCapabilities"]["audio"],
+            false
+        );
+        assert_eq!(
+            caps["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            false
+        );
+    }
+
+    #[test]
+    fn initialize_advertises_image_when_opted_in() {
+        let caps = initialize(&cfg_with_image(true));
+        assert_eq!(
+            caps["agentCapabilities"]["promptCapabilities"]["image"], true,
+            "image must be true when prompt_supports_image is set"
+        );
+    }
+
+    #[test]
+    fn notification_tool_start_carries_id() {
+        let n = Notification::ToolStart {
+            id: "tc_42".into(),
+            name: "read_file".into(),
+        };
+        match n {
+            Notification::ToolStart { id, name } => {
+                assert_eq!(id, "tc_42");
+                assert_eq!(name, "read_file");
+            }
+            _ => panic!("expected ToolStart"),
+        }
+    }
+
+    #[test]
+    fn notification_tool_done_carries_id_and_status() {
+        let n = Notification::ToolDone {
+            id: "tc_42".into(),
+            name: "read_file".into(),
+            status: "completed".into(),
+        };
+        match n {
+            Notification::ToolDone { id, name, status } => {
+                assert_eq!(id, "tc_42");
+                assert_eq!(name, "read_file");
+                assert_eq!(status, "completed");
+            }
+            _ => panic!("expected ToolDone"),
+        }
     }
 }
