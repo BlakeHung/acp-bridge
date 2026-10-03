@@ -274,3 +274,123 @@ fn v1_client_gets_legacy_shapes_unchanged() {
     assert!(result.get("info").is_none());
     assert!(result.get("capabilities").is_none());
 }
+
+#[test]
+fn v2_session_prompt_response_carries_message_id() {
+    // Review §"v2 session/prompt response 缺 required messageId":
+    // ACP v2 PromptResponse is `{required: ["messageId"]}`. acp-bridge
+    // emits a UUID-derived id on every prompt and v2 Clients must see it
+    // on the response. The legacy v1 fields (stopReason / status /
+    // text) live on `state_update` for v2 Clients.
+    let mut a = Agent::spawn(&[]);
+    a.request(1, "initialize", v2_init());
+    let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
+
+    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    a.request(
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": sid,
+            "prompt": [{"type": "text", "text": "say hi"}]
+        }),
+    );
+    let (_, resp) = a.recv_response(&Value::from(3), Duration::from_secs(15));
+    let result = &resp["result"];
+
+    assert!(
+        result.get("messageId").is_some(),
+        "v2 PromptResponse must carry required messageId, got {result}"
+    );
+    let mid = result["messageId"].as_str().unwrap();
+    assert!(
+        !mid.is_empty() && mid.len() >= 8,
+        "messageId should be a non-trivial opaque string, got {mid:?}"
+    );
+
+    // v2 response must NOT carry the legacy v1 fields — those moved to
+    // `state_update` per the v2 schema. Carrying both is wire-spec
+    // ambiguous.
+    assert!(
+        result.get("stopReason").is_none(),
+        "v2 PromptResponse must not carry legacy stopReason (it lives on state_update)"
+    );
+    assert!(
+        result.get("status").is_none(),
+        "v2 PromptResponse must not carry legacy status"
+    );
+}
+
+#[test]
+fn v2_session_close_succeeds_and_v2_session_delete_gracefully_rejects() {
+    // Review §"v2 session 生命週期方法名未實作": acp-bridge now
+    // implements `session/close` (v2 baseline) and `session/list`, and
+    // gracefully rejects `session/delete` (v2 optional, not implemented).
+    let mut a = Agent::spawn(&[]);
+    a.request(1, "initialize", v2_init());
+    let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
+
+    // session/close on a known session must succeed.
+    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    a.request(3, "session/close", json!({"sessionId": sid}));
+    let (_, resp) = a.recv_response(&Value::from(3), Duration::from_secs(5));
+    assert!(
+        resp.get("result").is_some(),
+        "session/close on a valid session must succeed: {resp}"
+    );
+
+    // session/delete must return -32601 with a stable data.reason.
+    a.request(4, "session/delete", json!({"sessionId": sid}));
+    let (_, resp) = a.recv_response(&Value::from(4), Duration::from_secs(5));
+    assert_eq!(
+        resp["error"]["code"], -32601,
+        "session/delete must return MethodNotFound"
+    );
+    assert_eq!(
+        resp["error"]["data"]["reason"], "not_implemented",
+        "session/delete must carry data.reason: not_implemented"
+    );
+
+    a.shutdown();
+}
+
+#[test]
+fn v2_session_list_returns_session_info_with_cwd() {
+    // Review §"v2 session 生命週期方法名未實作": session/list is
+    // required for the v2 baseline; acp-bridge returns active sessions
+    // as `{sessions: [{sessionId, cwd}], nextCursor: null}`.
+    let mut a = Agent::spawn(&[]);
+    a.request(1, "initialize", v2_init());
+    let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
+
+    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    let (_, _) = a.recv_response(&Value::from(2), Duration::from_secs(5));
+
+    a.request(3, "session/list", json!({}));
+    let (_, resp) = a.recv_response(&Value::from(3), Duration::from_secs(5));
+    let sessions = resp["result"]["sessions"]
+        .as_array()
+        .expect("sessions must be an array");
+    assert!(
+        !sessions.is_empty(),
+        "session/list must include the just-created session: {resp}"
+    );
+    let first = &sessions[0];
+    assert!(first["sessionId"].is_string());
+    assert_eq!(
+        first["cwd"], "/tmp",
+        "session_info.cwd must echo the working_dir passed to session/new: {first}"
+    );
+    assert!(
+        resp["result"]["nextCursor"].is_null(),
+        "nextCursor must be null (no pagination implemented)"
+    );
+
+    a.shutdown();
+}

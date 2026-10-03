@@ -1,6 +1,6 @@
 [package]
 name = "acp-bridge"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 authors = ["Blake Labs"]
 description = "ACP adapter for local AI — bridges local LLM backends to Agent Client Protocol"

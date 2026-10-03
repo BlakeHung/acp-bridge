@@ -537,6 +537,7 @@ fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str
         &mut results,
         &mut match_count,
         MAX_MATCHES,
+        0,
     );
 
     if match_count == 0 {
@@ -551,6 +552,7 @@ fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str
     results
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_dir(
     dir: &Path,
     working_dir: &Path,
@@ -559,8 +561,9 @@ fn search_dir(
     results: &mut String,
     match_count: &mut usize,
     max_matches: usize,
+    depth: usize,
 ) {
-    if *match_count >= max_matches {
+    if *match_count >= max_matches || depth > MAX_LIST_DEPTH * 4 {
         return;
     }
 
@@ -582,6 +585,40 @@ fn search_dir(
             continue;
         }
 
+        // Skip symlinks — both directories and files. `path.is_dir()`
+        // follows symlinks which means a hostile symlink under the
+        // sandbox can read the workspace file outside it (review §3.1).
+        // We use `symlink_metadata` which does NOT follow symlinks; if
+        // the entry itself is a symlink we skip it. The canonical
+        // prefix check below then catches any remaining path-traversal
+        // via regular paths or hardlinks.
+        if entry
+            .path()
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            warn!(path = %path.display(), "Skipping symlink in search_code");
+            continue;
+        }
+
+        // Sanity-check the path is actually inside the working dir. This
+        // is defense in depth — `resolve_sandboxed_path` already does
+        // this for read / write_file, but search_dir recurses through
+        // directory entries and could theoretically walk into a path
+        // created by a TOCTOU between the canonicalize above and the
+        // read below.
+        let canonical_wd = match working_dir.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if let Ok(canonical_path) = path.canonicalize() {
+            if !canonical_path.starts_with(&canonical_wd) {
+                warn!(path = %path.display(), "search_code walked outside sandbox, skipping");
+                continue;
+            }
+        }
+
         if path.is_dir() {
             search_dir(
                 &path,
@@ -591,6 +628,7 @@ fn search_dir(
                 results,
                 match_count,
                 max_matches,
+                depth + 1,
             );
         } else if path.is_file() {
             // Check glob filter
@@ -845,9 +883,36 @@ fn execute_web_fetch(url: &str) -> String {
         );
     }
 
+    let allow_for_redirect_check = allow.clone();
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
         .user_agent(concat!("acp-bridge/", env!("CARGO_PKG_VERSION")))
+        // Limit redirects to a small number and re-validate the host
+        // on every hop. Without this, a server on an allowlisted
+        // domain can 302 to an internal host and the body fetch would
+        // succeed — review §3.4.
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.stop();
+            }
+            // Re-check the next hop's host against the allowlist. The
+            // cloned allowlist is shared (Arc-like via the closure
+            // environment) so this captures the original set at
+            // request time.
+            let next = attempt.url();
+            if let Some(next_host) = next.host_str() {
+                let next_host = next_host.to_ascii_lowercase();
+                let allowed = allow_for_redirect_check.iter().any(|suffix| {
+                    next_host == *suffix || next_host.ends_with(&format!(".{suffix}"))
+                });
+                if !allowed {
+                    return attempt.stop();
+                }
+            } else {
+                return attempt.stop();
+            }
+            attempt.follow()
+        }))
         .build()
     {
         Ok(c) => c,

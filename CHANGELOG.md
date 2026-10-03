@@ -5,6 +5,190 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-10-03
+
+### Fixed — ACP v2 wire-shape blockers
+The 0.9.0 release shipped with three wire-shape violations against the
+v2 protocol that a spec-compliant v2 Client (e.g. an early OpenCode v2
+preview) would have rejected. All three are addressed in this release:
+
+- **`state_update` discriminator** — the v2 schema requires every
+  `state_update` payload to have a `state` field set to one of
+  `"running" | "idle" | "requires_action"`. The previous code emitted
+  `"available": false` (a non-spec field) and was missing `state`. Now
+  emits `{sessionUpdate: "state_update", state: "idle", stopReason?}`
+  per the `IdleStateUpdate` schema.
+- **`session/prompt` v2 response carries `messageId`** — the v2
+  `PromptResponse` is `{required: ["messageId"]}`. The previous v1-style
+  response (`{stopReason, status, text}`) would have failed schema
+  validation. acp-bridge now mints a UUID-derived messageId per prompt
+  and emits the v2 wire shape for v2 Clients. The v1 wire is unchanged.
+  Legacy `status` / `text` / `stopReason` now live on `state_update`
+  for v2 Clients, exactly as the v2 spec requires.
+- **v2 session lifecycle methods** — the v2 baseline includes
+  `session/new | session/list | session/resume | session/close |
+  session/prompt | session/cancel | session/update`. acp-bridge
+  previously only implemented the v1 surface (`session/new`,
+  `session/end`, `session/prompt`, `session/cancel`). New:
+  - `session/close` (v2 baseline; shares the implementation with
+    `session/end`)
+  - `session/list` (v2 baseline; returns active sessions as
+    `{sessions: [{sessionId, cwd}], nextCursor: null}`)
+  `session/delete` (v2 optional) and `session/resume` /
+  `session/load` return graceful `-32601 not_implemented` /
+  `-32001 no_persistence` rejections with the stable `data.reason`
+  field.
+
+### Fixed — Ollama native protocol bugs
+Three pre-existing bugs in the Ollama native code path that had been
+documented as fix-plan priorities P0-C. None were wired through the
+test suite (tests pointed the harness at `127.0.0.1:1`, so Ollama
+native was never exercised in CI):
+
+- **`tool.arguments` object vs string** — Ollama native `/api/chat`
+  returns `function.arguments` as a JSON object; OpenAI-compatible
+  backends return it as a JSON-encoded string. The previous code called
+  `as_str()` on the value and silently fell back to `"{}"` when it
+  wasn't a string, which meant **every** Ollama native tool call ran
+  with empty arguments. Now handles object / array / string uniformly.
+- **`options.*` sampling fields** — Ollama native wants
+  `temperature` and `max_tokens` (renamed `num_predict`) inside an
+  `options` object; OpenAI-compatible expects them at the top level.
+  The previous code only sent top-level fields, so every Ollama
+  native request silently used the model's defaults for sampling.
+- **`format_tool_result` Ollama field** — Ollama native tool messages
+  use `{"role": "tool", "content": …}` and ignore (some versions
+  reject) the `tool_call_id` field that acp-bridge included. The new
+  helper emits `tool_call_id` only when the backend is not Ollama
+  native.
+
+### Fixed — sandbox escapes
+- **`search_code` walks symlinks** — previous code used `path.is_dir()`
+  / `path.is_file()`, which follow symlinks. A symlink inside the
+  sandbox pointing at `/etc/passwd` (or anywhere outside `working_dir`)
+  would be read and its contents returned. Now:
+  - Skip entries whose `symlink_metadata` reports `file_type().is_symlink()`
+  - Canonicalize the entry and skip it if it does not start with the
+    canonicalized working dir
+  - Bound recursion depth to `MAX_LIST_DEPTH * 4` to prevent
+    adversarial directory structures
+- **`web_fetch` redirects bypass `LLM_WEB_ALLOWLIST`** — reqwest's
+  default redirect policy follows up to 10 hops to *any* host. A
+  server on an allowlisted domain could 302 to an internal host and
+  acp-bridge would happily return the body. Now uses
+  `redirect::Policy::custom` that re-validates the next hop's host
+  against `LLM_WEB_ALLOWLIST` on every redirect, with a 5-hop cap.
+
+### Changed
+- **`docs/scope.md` synced with current state** — the previous version
+  still said "Not a v2 protocol agent yet" (incorrect as of 0.9.0),
+  listed the wrong tool set (5 tools instead of the 11 actually
+  shipped in 0.8.2), and referenced a `codex_style.rs` test file
+  that was renamed to `minimal_style.rs` long ago. Now reflects the
+  real v1 / v2 dual implementation, the full tool surface, and the
+  current `tests/clients/` layout.
+- **`CHANGELOG.md` corrections** — 0.9.0 entry over-claimed
+  `Session::protocol_version` is read at emit sites; the field is
+  stored on each Session but the emit helpers currently use
+  `AppState.protocol_version` (one Client per process in practice).
+  0.8.2 entry under-reported the test count.
+
+### Tests
+171 tests total (from 168 in 0.9.0). Added in `tests/clients/protocol_version.rs`:
+- `v2_session_prompt_response_carries_message_id` — asserts the v2
+  `PromptResponse` carries the required `messageId` and does **not**
+  carry the legacy v1 `stopReason` / `status` fields.
+- `v2_session_close_succeeds_and_v2_session_delete_gracefully_rejects`
+  — confirms the new `session/close` routing and the stable
+  `data.reason: "not_implemented"` error on `session/delete`.
+- `v2_session_list_returns_session_info_with_cwd` — asserts
+  `session/list` returns the active sessions in the v2 wire shape.
+
+Hardened existing tests:
+- `v2_emits_state_update_at_end_of_turn` now asserts the
+  `state: "idle"` discriminator (the previous version only checked
+  the discriminator string, which let the bug through).
+- `tests/clients/inspector_style.rs::inspector_style_session_*_returns_method_not_found_gracefully`
+  were updated to positive tests — the methods are now implemented
+  and the previous negative assertions no longer held.
+
+## [0.9.0] - 2026-10-02
+This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.9.0] - 2026-10-02
+
+### Added
+- **ACP v2 protocol support** — acp-bridge now negotiates the wire-format
+  version at `initialize` time and emits either v1 or v2
+  `session/update` payloads depending on what the Client requested.
+  The intent is to keep acp-bridge working as the ACP spec evolves,
+  not to special-case any particular AI — Zed / JetBrains / ACP UI /
+  Meuxe / ACP Inspector that ship v1 today still get the v1 wire they
+  were written against; future v2-only Clients (or Clients that
+  advertise v2 in their `initialize`) get the v2 wire.
+
+  Concrete v2 differences acp-bridge now implements:
+  - `InitializeResponse` uses unified `info` + `capabilities` fields
+    (v1's `agentInfo` / `agentCapabilities` aliases are not emitted
+    on the v2 wire)
+  - `promptCapabilities.image` is advertised as `{}` (capability
+    marker object) on v2, not `true`
+  - `tool_call` sessionUpdate is **not emitted** for v2 Clients;
+    the loop envelope and per-tool start both use
+    `tool_call_update` with `status: "in_progress"` (keyed by
+    `toolCallId`, same schema as v1)
+  - `plan` becomes `plan_update` with `plan: { type: "items", planId,
+    entries[] }` (the `planId` lets Clients track multiple plans
+    independently)
+  - `available_commands_update` and `session_info_update` use the
+    v2 shape (schema-compatible with v1 but routed through the
+    unified v2 emit path)
+  - `usage_update` enforces the v2 ISO 4217 currency pattern
+    (`^[A-Z]{3}$`) on the optional `cost` field when supplied
+  - A new `state_update` (Idle) notification with `stopReason` is
+    emitted at the end of every prompt turn for v2 Clients. v1
+    Clients do not receive this notification (they have no equivalent)
+
+  Helpers added in `src/acp.rs`:
+  - `ProtocolVersion` enum with `V1`, `V2`, `LATEST` constants
+  - `notify_*_for(version, session_id, ...)` dispatchers that route
+    to the v1 or v2 emit functions
+  - `notify_state_idle_for()` for the v2-only `state_update`
+  - The plain (no-suffix) `notify_*` functions stay as the v1
+    shortcut for code paths that have not migrated
+
+- **`AppState` is now `Clone`** — the negotiation step in
+  `run_acp_loop` writes the agreed version into the state via
+  `Arc::make_mut`. Sessions are stored in an `Arc<RwLock<...>>` so
+  the clone shares the same map; cloning happens only when the
+  `Arc` is shared (in `run_acp_loop` it has refcount 1).
+- **`Session` carries its negotiated `ProtocolVersion`** for
+  defense-in-depth and future per-session overrides. In the current
+  single-Client-per-process model the global `AppState.protocol_version`
+  is what emit helpers actually use (the same value is written into
+  every Session opened by that Client); `Session::protocol_version`
+  exists so a future multi-Client / per-session routing layer can
+  switch on it without changing the call sites.
+- **`negotiate_protocol_version(params)`** — new helper in
+  `main.rs` that implements the ACP spec's "pick the highest version
+  we both support" rule. Clients that omit `protocolVersion` fall
+  back to v1 (the conservative default).
+- **6 new e2e tests in `tests/clients/protocol_version.rs`** that
+  construct minimal v1 and v2 Clients and assert the wire shapes
+  match the published schema.
+
+### Migration notes
+- **v1 Clients are unchanged.** The plain `acp::notify_*` helpers
+  still emit v1, the `initialize` response is identical to 0.8.2 when
+  the Client is v1. Existing Clients that omit `protocolVersion`
+  continue to work without changes.
+- **v2 Clients get a new `state_update` notification** that v1
+  Clients never see. Spec-compliant Clients ignore unknown
+  discriminators so this is safe.
+- **Tool calls on v2 use `tool_call_update` only** — Clients
+  written against the v1 `tool_call` discriminator must use the
+  `status: "in_progress"` `tool_call_update` instead.
+
 ## [0.8.2] - 2026-10-02
 
 ### Added
@@ -83,7 +267,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reduction, git status.
 - 3 new unit tests (`src/llm.rs`): `LlmErrorKind::as_str` stability,
   retryable classification, status-code → kind mapping.
-- All existing test suites still pass; 159 tests total.
+- All existing test suites still pass; 168 tests total (after 0.9.0 added 6 v1 / v2 e2e cases in `tests/clients/protocol_version.rs`).
 
 ## [0.8.1] - 2026-10-01
 
