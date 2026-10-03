@@ -8,15 +8,24 @@ Written in Rust. Single ~5MB binary. Zero runtime dependencies. Fully offline.
 
 ## Project status — active development
 
-acp-bridge is actively maintained, focused on a niche neither OpenCode nor Cline currently fills: **fully air-gapped local AI coding agents that speak ACP**. v0.7.8 delivers a working subset of the ACP server surface (`initialize`, `session/new`, `session/prompt`, `session/end`) with streaming notifications and tool calling, and advertises `agentCapabilities` so editors like Zed and Neovim can feature-detect correctly.
+acp-bridge is actively maintained, focused on a niche neither OpenCode nor Cline currently fills: **fully air-gapped local AI coding agents that speak ACP**.
 
-**v0.7.8**: Removed A2A and Client modes; acp-bridge is now an ACP-only adapter focused on stdin/stdout JSON-RPC transport.
+**v0.9.1** (latest, 2026-10-03) — full ACP spec compliance for both **v1 and v2** on the same code base. acp-bridge negotiates `protocolVersion` at `initialize` and emits the appropriate wire shape:
 
-Roadmap (2026-Q3):
+- **v1** (the version every existing Client speaks today — Zed, JetBrains, ACP UI, Meuxe, ACP Inspector, Codex CLI adapter) — full feature set: `initialize`, `session/new`, `session/list`, `session/close` (the v2 baseline), `session/end` (the v1 alias), `session/prompt`, `session/cancel`. 8 built-in tools: `read_file`, `list_dir`, `search_code`, `write_file`, `edit` (surgical string replacement), `web_fetch` (HTTP/HTTPS with HTML reduction, opt-in via `LLM_WEB_ALLOWLIST`), `bash`, `git_status` / `git_diff` / `git_log` / `git_commit`. Four spec session/update notifications: `plan`, `session_info_update`, `usage_update`, `available_commands_update`. Structured backend errors via `LlmErrorKind` (9 categories with stable wire strings — Clients can switch on `error.data.category` to decide whether to retry). 171 tests passing across 8 suites including 16 end-to-end tests against the real init payloads of Zed / ACP Inspector / Codex CLI.
 
-- Full ACP spec compliance — `session/load`, `session/resume`, `session/set_mode`
-- Integration tests against thinking-on chat templates (Qwen3, DeepSeek-R1, GLM, Kimi-K2) that currently break in mainstream alternatives
-- Optional audit log mode for regulated deployments
+- **v2** (released by ACP working group in 2026) — unified `info` + `capabilities` shape, `tool_call_update` replaces `tool_call`, `state_update` with `state: "idle"` + `stopReason`, `plan_update` with `planId`, `session/prompt` response carries required `messageId`. Same code base, dispatch by version. Review of the v2 wire shape against `schema/v2/schema.json` is in [`REVIEW_REPORT.md`](./REVIEW_REPORT.md).
+
+For Clients on the v1 wire (the common case today) the v0.9.x release is a strict additive change — same wire as v0.8.x plus more tools.
+
+For air-gapped, self-hosted, and audit-sensitive deployments the design constraints are unchanged: single ~5 MB static Rust binary, zero runtime dependencies beyond the configured LLM endpoint, sandboxed tool calls within the session working directory, opt-in network access via `LLM_WEB_ALLOWLIST`. See `docs/scope.md` for the capability matrix.
+
+Roadmap:
+
+- ACP v2 `agent_message` upsert (currently chunk-only; v2 RFD allows either).
+- ACP v2 `terminal_update` / `terminal_output_chunk` (agent-owned terminal output).
+- `session/cancel` cancellation propagation into in-flight LLM requests (currently acknowledged with a log line; the in-flight prompt is allowed to run to completion).
+- ACP Registry `agent.json` so Zed / ACP UI can one-click install acp-bridge.
 
 ## Relationship to OpenCode
 
@@ -36,9 +45,9 @@ acp-bridge targets the same protocol but a narrower scope: **air-gap clean, loca
 | Provider breadth | 75+ via AI SDK (cloud-leaning) | OpenAI-compatible + Ollama native |
 | Network footprint | models.dev, LSP, update, ripgrep fetches | Outbound only to configured LLM endpoint |
 | Runtime | Node.js + npm | Single 5MB static Rust binary |
-| Tool surface | Full agent (edit, shell, web) | 3 sandboxed read-only tools |
+| Tool surface | Full agent (edit, shell, web) | 11 tools: `read_file`, `list_dir`, `search_code`, `write_file`, `edit`, `web_fetch`, `bash`, `git_status` / `git_diff` / `git_log` / `git_commit`. `web_fetch` is opt-in (`LLM_WEB_ALLOWLIST`); `bash` runs unconstrained in the session working dir |
 | Air-gap audit | Per-release verification | Binary small enough to audit once |
-| ACP server stability | Active issues on `newSession`, `--port` | Spec-compliant `initialize` + session lifecycle |
+| ACP server stability | Active issues on `newSession`, `--port` | Full ACP v1 + v2 spec compliance: `initialize` + `session/{new, list, close, end, prompt, cancel, load, resume, delete}` + 4 spec session/update notifications + structured `LlmErrorKind` errors |
 
 **Use OpenCode** when you want the full cloud-and-local agent toolkit. **Use acp-bridge** when the deployment requires a fully offline, audit-friendly bridge — air-gapped sites, regulated industries, edge / embedded ACP harnesses, CI runners with strict egress policies.
 
@@ -348,22 +357,53 @@ All tools are **sandboxed** to the session's working directory — the LLM canno
 
 ## ACP protocol support
 
+`acp-bridge` negotiates the wire-format version with each Client at
+`init` time. v1 Clients (the common case today) and v2 Clients get
+the matching wire shape from the same code base.
+
+### Methods (v1 + v2 baseline)
+
 | Method | Status |
 |--------|--------|
-| `initialize` | Supported — advertises `agentCapabilities.promptCapabilities` (image support opt-in via `LLM_SUPPORTS_IMAGE`), `protocolVersion: 1`, `authMethods: []` |
-| `session/new` | Multi-session with conversation history; `mcpServers` param accepted but ignored in v0.7 |
-| `session/prompt` | Streaming via SSE; image content blocks supported only when `LLM_SUPPORTS_IMAGE=true`. Final response carries `stopReason` per ACP v1. |
-| `session/end` | Session cleanup |
-| `session/load` | Not yet — roadmap |
-| `session/resume` | Not yet — roadmap |
-| `session/set_mode` | Not yet — roadmap |
+| `initialize` | Supported. v1: emits `agentCapabilities` + `agentInfo`. v2: emits unified `capabilities` + `info`. Image capability opt-in via `LLM_SUPPORTS_IMAGE`. |
+| `session/new` | Multi-session with per-session conversation history. `mcpServers` param accepted but ignored (acp-bridge has no MCP relay). |
+| `session/prompt` | Streaming via SSE → `session/update` notifications. Text and `ContentBlock::ResourceLink` always supported; `ContentBlock::Image` only when `LLM_SUPPORTS_IMAGE=true`. Final response shape is version-aware (v1: `{stopReason, status, text}`; v2: `{messageId}` with `stopReason` on `state_update`). |
+| `session/cancel` notification | Acknowledged with a log line. In-flight cancellation is on the roadmap. |
+| `session/end` (v1) / `session/close` (v2 baseline) | Session cleanup. Both methods share the same implementation. |
+| `session/list` (v2 baseline) | Returns active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}`. |
+| `session/load` | Graceful `-32001 no_persistence` rejection. acp-bridge has no persistence layer. |
+| `session/resume` | Same. |
+| `session/delete` (v2 optional) | Graceful `-32601 not_implemented` rejection. Use `session/close` instead. |
+| `session/set_mode` | Graceful `-32602 no_modes` rejection. `session/new` does not return a `modes` array. |
 
-| Notification | Status |
-|--------------|--------|
-| `agent_message_chunk` | Streaming text chunks |
-| `agent_thought_chunk` | Emitted on prompt start |
-| `tool_call` | LLM call tracking |
-| `tool_call_update` | Completion status |
+### Session/update notifications (v1 + v2)
+
+| Notification | Discriminator | Status |
+|--------------|---------------|--------|
+| Streaming text chunk | `agent_message_chunk` (v1 + v2) | Always emitted while the model is generating |
+| Streaming thought chunk | `agent_thought_chunk` (v1 + v2) | Emitted at prompt start so Clients can render the thought bubble |
+| Tool call start (v1) | `tool_call` | Carries `toolCallId`, `title`, `kind`, `status: "in_progress"` |
+| Tool call start (v2) | `tool_call_update` (upsert) | Same fields. v2 removed the legacy `tool_call` discriminator. |
+| Tool call update | `tool_call_update` (v1 + v2) | Carries the new `status` (`pending` / `in_progress` / `completed` / `failed`) |
+| Plan (v1) | `plan` | `entries: PlanEntry[]`. Helper is in place; the LLM does not currently auto-emit plans. |
+| Plan (v2) | `plan_update` | Wrapped in `plan: { type: "items", planId, entries[] }` so Clients can track multiple plans independently. |
+| Session info | `session_info_update` | v1 + v2. Carries the session `title`. acp-bridge emits it after `session/new` (defaults to cwd basename) and after each `session/prompt` (first line of user prompt). |
+| Token usage | `usage_update` | v1 + v2. `used` is chars/4 across the session history; `size` from `LLM_MODEL_CONTEXT` (default 32768). |
+| Slash commands | `available_commands_update` | v1 + v2. Advertises `/read`, `/ls`, `/search`, `/edit`, `/shell`. |
+| Turn end (v2 only) | `state_update` | Emitted at end of each prompt with `state: "idle"` and `stopReason`. v1 Clients ignore this unknown discriminator per the JSON-RPC spec. |
+
+### Structured backend errors
+
+`acp-bridge` returns an `error.data.category` + `error.data.retryable`
+field on failed prompt responses so Clients can branch on the failure
+class without parsing prose. See `LlmErrorKind::as_str()` in
+`src/llm.rs` for the full list of stable category strings.
+
+### Where to look
+
+- `docs/scope.md` — capability matrix and graceful-reject reference.
+- `tests/clients/` — end-to-end e2e tests against real init payloads
+  pulled from Zed / ACP Inspector / Codex CLI source code.
 
 ## Observability
 
