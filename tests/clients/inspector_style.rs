@@ -69,29 +69,51 @@ fn inspector_style_request_id_fuzz_numeric_string_uuid() {
 }
 
 #[test]
-fn inspector_style_session_list_returns_method_not_found_gracefully() {
+fn inspector_style_session_list_returns_empty_array_with_no_sessions() {
     // ACP Inspector probes `session/list` capability before calling it.
-    // It should detect acp-bridge doesn't advertise it, but if a Client
-    // calls anyway we should give a clear error.
+    // As of v0.9.0, acp-bridge implements `session/list` (v2 baseline).
+    // With no sessions open, the call succeeds and returns an empty
+    // list. Clients must tolerate this — `sessions: []` is the
+    // documented wire shape.
     let mut a = Agent::spawn(&[]);
     a.request(1, "initialize", inspector_initialize_params());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
     a.request(2, "session/list", json!({}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
-    assert_eq!(resp["error"]["code"], -32601);
+    assert!(
+        resp.get("result").is_some(),
+        "session/list must succeed: {resp}"
+    );
+    assert!(
+        resp["result"]["sessions"].is_array(),
+        "sessions must be an array: {resp}"
+    );
+    assert_eq!(resp["result"]["sessions"].as_array().unwrap().len(), 0);
+    assert!(resp["result"]["nextCursor"].is_null());
     a.shutdown();
 }
 
 #[test]
-fn inspector_style_session_close_returns_method_not_found_gracefully() {
+fn inspector_style_session_close_succeeds_and_variants() {
+    // As of v0.9.0, `session/close` is implemented (and `session/end` is
+    // a v1 alias). When called against a non-existent session, the
+    // error is `-32001` (application error, UnknownSession), not the
+    // generic `-32601` MethodNotFound.
     let mut a = Agent::spawn(&[]);
     a.request(1, "initialize", inspector_initialize_params());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/close", json!({"sessionId": "x"}));
+    a.request(2, "session/close", json!({"sessionId": "no-such-session"}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
-    assert_eq!(resp["error"]["code"], -32601);
+    assert!(
+        resp.get("error").is_some(),
+        "session/close on unknown session must return an error, got: {resp}"
+    );
+    assert_ne!(
+        resp["error"]["code"], -32601,
+        "session/close is implemented; should not return MethodNotFound"
+    );
     a.shutdown();
 }
 

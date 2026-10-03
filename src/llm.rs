@@ -100,8 +100,20 @@ impl Backend {
     }
 
     /// Format a tool result message for this backend.
+    ///
+    /// OpenAI-compatible uses `{"role": "tool", "tool_call_id": ...}`.
+    /// Ollama native uses `{"role": "tool", "content": ...}` — the
+    /// association back to the call is by index in the messages array, not
+    /// by id; the `tool_call_id` field is rejected by Ollama native
+    /// (review §"既有 bug 未修"). When the upstream call had no id (Ollama
+    /// native does not generate one), acp-bridge mints a synthetic id; that
+    /// id is harmless on OpenAI-compatible wheels and dropped on Ollama.
     pub fn format_tool_result(&self, tool_call_id: &str, content: &str) -> Value {
-        json!({"role": "tool", "content": content, "tool_call_id": tool_call_id})
+        if self.is_ollama_native() {
+            json!({"role": "tool", "content": content})
+        } else {
+            json!({"role": "tool", "content": content, "tool_call_id": tool_call_id})
+        }
     }
 
     /// Extract the assistant's text response, accounting for thinking-mode
@@ -271,6 +283,7 @@ const MAX_RETRIES: u32 = 3;
 /// Initial backoff delay in milliseconds (doubles each retry).
 const INITIAL_BACKOFF_MS: u64 = 500;
 
+#[derive(Clone)]
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
@@ -627,6 +640,19 @@ async fn send_with_retry(
 }
 
 /// Build the JSON body for a chat completion request.
+///
+/// The shape is **not** uniform across backends:
+///
+/// - OpenAI-compatible (Ollama's `/v1/chat/completions`, llama.cpp
+///   server, vLLM, LM Studio, etc.) — `temperature` and
+///   `max_tokens` go at the top level.
+///
+/// - Ollama native (`/api/chat`) — those fields go inside an
+///   `options` object. The field names also differ slightly:
+///   `max_tokens` becomes `num_predict`. The previous
+///   top-level-only shape meant every Ollama-native request silently
+///   used the model's defaults for sampling; see review §"既有 bug
+///   未修".
 fn build_body(
     config: &LlmConfig,
     messages: &[Value],
@@ -639,15 +665,33 @@ fn build_body(
         "messages": messages,
         "stream": stream,
     });
-    if let Some(temp) = config.temperature {
-        // Clamp to valid range 0.0–2.0
-        body["temperature"] = json!(temp.clamp(0.0, 2.0));
-    }
-    if let Some(max) = config.max_tokens {
-        body["max_tokens"] = json!(max);
-    }
     if let Some(tools) = tools {
         body["tools"] = json!(tools);
+    }
+
+    let backend = config.backend();
+    if backend.is_ollama_native() {
+        // Ollama native wants sampling fields inside `options`, with
+        // `num_predict` for max tokens.
+        let mut options = serde_json::Map::new();
+        if let Some(temp) = config.temperature {
+            options.insert("temperature".into(), json!(temp.clamp(0.0, 2.0)));
+        }
+        if let Some(max) = config.max_tokens {
+            options.insert("num_predict".into(), json!(max));
+        }
+        if !options.is_empty() {
+            body["options"] = Value::Object(options);
+        }
+    } else {
+        // OpenAI-compatible — top-level fields.
+        if let Some(temp) = config.temperature {
+            // Clamp to valid range 0.0–2.0
+            body["temperature"] = json!(temp.clamp(0.0, 2.0));
+        }
+        if let Some(max) = config.max_tokens {
+            body["max_tokens"] = json!(max);
+        }
     }
     body
 }

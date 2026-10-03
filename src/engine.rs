@@ -212,15 +212,40 @@ pub enum Notification {
 // ---------------------------------------------------------------------------
 
 pub struct AppState {
-    pub sessions: RwLock<HashMap<String, Session>>,
+    /// Sessions are wrapped in `Arc` so that `AppState: Clone` works
+    /// cheaply — the clone shares the same inner map. This is what
+    /// lets `main::run_acp_loop` call `Arc::make_mut` to swap in the
+    /// negotiated `protocol_version` after `initialize` without
+    /// disturbing the live-spawned session map.
+    pub sessions: Arc<RwLock<HashMap<String, Session>>>,
     pub config: LlmConfig,
+    /// ACP wire-format protocol version negotiated at `initialize`.
+    /// All session(s) opened by this Client inherit this version; the
+    /// emit helpers (`acp::notify_*`) branch on it so v1 Clients see
+    /// v1 notifications and v2 Clients see v2.
+    pub protocol_version: crate::protocol::ProtocolVersion,
+}
+
+impl Clone for AppState {
+    fn clone(&self) -> Self {
+        Self {
+            sessions: Arc::clone(&self.sessions),
+            config: self.config.clone(),
+            protocol_version: self.protocol_version,
+        }
+    }
 }
 
 impl AppState {
     pub fn new(config: LlmConfig) -> Arc<Self> {
         Arc::new(Self {
-            sessions: RwLock::new(HashMap::new()),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
+            // Default to V1 for safety. `main::run_acp_loop` overwrites
+            // this with whatever the Client negotiated during
+            // `initialize`. We pick V1 here so unit tests that build an
+            // AppState directly get v1 wire format without ceremony.
+            protocol_version: crate::protocol::ProtocolVersion::V1,
         })
     }
 
@@ -285,36 +310,89 @@ impl AppState {
 /// `LLM_SUPPORTS_IMAGE` env var or the equivalent field in the config file.
 /// `audio` and `embeddedContext` remain `false` — acp-bridge does not yet
 /// process them.
-pub fn initialize(config: &LlmConfig) -> Value {
-    info!(model = %config.model, base_url = %config.base_url, "Initialize");
-    let prompt_capabilities = if config.prompt_supports_image {
-        json!({
-            "image": true,
-            "audio": false,
-            "embeddedContext": false
-        })
+///
+/// The `protocol_version` parameter controls which wire-shape the
+/// response uses:
+/// - `ProtocolVersion::V1` → `agentCapabilities` + `agentInfo` shape
+///   (every existing Client speaks this today)
+/// - `ProtocolVersion::V2` → unified `capabilities` + `info` shape, with
+///   `promptCapabilities.image` expressed as `{}` (capability marker)
+///   rather than `true`
+pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::ProtocolVersion) -> Value {
+    info!(
+        model = %config.model,
+        base_url = %config.base_url,
+        protocol_version = %protocol_version,
+        "Initialize"
+    );
+
+    // v2 marks capability support with the present-of-an-object marker
+    // (`{}` = "supported") rather than `true`. We still want to
+    // distinguish image support from audio / embeddedContext, so:
+    //   - image enabled   → `{"image": {}}` (present, supported)
+    //   - image disabled  → omit `image` entirely (not advertised)
+    // audio / embeddedContext stay omitted regardless.
+    let prompt_capabilities_v2 = if config.prompt_supports_image {
+        json!({ "image": {} })
     } else {
-        json!({
-            "image": false,
-            "audio": false,
-            "embeddedContext": false
-        })
+        json!({})
     };
-    json!({
-        "protocolVersion": 1,
-        "agentInfo": {
-            "name": format!("acp-bridge ({})", config.model),
-            "version": env!("CARGO_PKG_VERSION")
-        },
-        "agentCapabilities": {
-            "promptCapabilities": prompt_capabilities
-        },
-        "authMethods": []
-    })
+
+    match protocol_version {
+        crate::protocol::ProtocolVersion::V2 => json!({
+            "protocolVersion": 2,
+            "info": {
+                "name": format!("acp-bridge ({})", config.model),
+                "title": "acp-bridge",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "session": {
+                    "prompt": prompt_capabilities_v2
+                }
+            },
+            "authMethods": []
+        }),
+        _ => {
+            // v1 (default)
+            let prompt_capabilities_v1 = if config.prompt_supports_image {
+                json!({
+                    "image": true,
+                    "audio": false,
+                    "embeddedContext": false
+                })
+            } else {
+                json!({
+                    "image": false,
+                    "audio": false,
+                    "embeddedContext": false
+                })
+            };
+            json!({
+                "protocolVersion": 1,
+                "agentInfo": {
+                    "name": format!("acp-bridge ({})", config.model),
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "agentCapabilities": {
+                    "promptCapabilities": prompt_capabilities_v1
+                },
+                "authMethods": []
+            })
+        }
+    }
 }
 
 /// Handle `session/new` — creates a new session, returns session ID.
-pub fn session_new(state: &AppState, cwd: &str) -> Result<String, AcpError> {
+///
+/// `protocol_version` is the version negotiated at `initialize` for the
+/// Client calling us. All subsequent notifications in this session use
+/// the v1 or v2 wire shape accordingly.
+pub fn session_new(
+    state: &AppState,
+    cwd: &str,
+    protocol_version: crate::protocol::ProtocolVersion,
+) -> Result<String, AcpError> {
     // Enforce max_sessions limit
     if state.config.max_sessions > 0 {
         let count = state.sessions_read().len();
@@ -342,6 +420,7 @@ pub fn session_new(state: &AppState, cwd: &str) -> Result<String, AcpError> {
     let session = Session::new(
         json!({"role": "system", "content": system_prompt}),
         PathBuf::from(&cwd),
+        protocol_version,
     );
     state.sessions_write().insert(session_id.clone(), session);
 
@@ -359,13 +438,19 @@ pub fn session_new(state: &AppState, cwd: &str) -> Result<String, AcpError> {
 
 /// Post-creation notifications to send after `session/new` returns.
 /// Exposed so `main::run_acp_loop` can emit them with the right wire
-/// framing after the response is on the wire.
-pub fn session_new_post_create_notifications(session_id: &str, cwd: &str) {
+/// framing after the response is on the wire. The `protocol_version`
+/// argument controls which wire shape (v1 vs v2) the dispatchers emit.
+pub fn session_new_post_create_notifications(
+    session_id: &str,
+    cwd: &str,
+    protocol_version: crate::protocol::ProtocolVersion,
+) {
     // Advertise the slash commands this agent recognises. Clients use this
     // to populate the "/…" shortcut menu. The list is intentionally small:
     // commands are shortcuts, not advertised features. See `tools.rs` for
     // the tool surface that backs the longer-tail capabilities.
-    crate::acp::notify_available_commands(
+    crate::acp::notify_available_commands_for(
+        protocol_version,
         session_id,
         &[
             crate::acp::AvailableCommand::new(
@@ -403,19 +488,25 @@ pub fn session_new_post_create_notifications(session_id: &str, cwd: &str) {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(cwd);
-    crate::acp::notify_session_info(session_id, title, None);
+    crate::acp::notify_session_info_for(protocol_version, session_id, title, None);
 }
 
 /// Handle `session/prompt` — runs the LLM with tool loop.
 ///
 /// Sends `Notification` events through `notify_tx` as they happen (for ACP streaming).
 /// Returns the final status ("completed" or "failed") and accumulated text.
+///
+/// `message_id` is the opaque identifier acp-bridge mints for this
+/// prompt. It is required on the v2 `PromptResponse` and used by v2
+/// Clients to correlate the response with `user_message` and
+/// `agent_message` session updates. v1 Clients ignore it.
 pub async fn session_prompt(
     state: &Arc<AppState>,
     session_id: &str,
     user_text: &str,
     user_images: &[ImageBlock],
     notify_tx: Option<mpsc::UnboundedSender<Notification>>,
+    message_id: &str,
 ) -> PromptResult {
     let notify = |n: Notification| {
         if let Some(tx) = &notify_tx {
@@ -441,6 +532,11 @@ pub async fn session_prompt(
                     },
                     error_class: None,
                     error_retryable: false,
+                    // Caller never wired a prompt through this branch —
+                    // the session id doesn't exist — so we emit an
+                    // empty messageId. The Client will see a JSON-RPC
+                    // error from the outer send_error path anyway.
+                    message_id: String::new(),
                 };
             }
         };
@@ -529,9 +625,18 @@ pub async fn session_prompt(
                 for tc in &tool_calls {
                     let func = &tc["function"];
                     let name = func["name"].as_str().unwrap_or("unknown");
-                    let args_str = func["arguments"].as_str().unwrap_or("{}");
-                    let args: Value = serde_json::from_str(args_str)
-                        .unwrap_or_else(|_| func["arguments"].clone());
+                    // `function.arguments` can be either a JSON-encoded
+                    // string (OpenAI-compatible backends) or a JSON
+                    // object (Ollama native /api/chat). Handle both —
+                    // the previous `as_str().unwrap_or("{}")` silently
+                    // dropped every Ollama native tool call's actual
+                    // arguments (see review §"既有 bug 未修").
+                    let args: Value = match func.get("arguments") {
+                        Some(Value::String(s)) => serde_json::from_str(s)
+                            .unwrap_or_else(|_| Value::Object(Default::default())),
+                        Some(Value::Object(_)) | Some(Value::Array(_)) => func["arguments"].clone(),
+                        Some(_) | None => Value::Object(Default::default()),
+                    };
                     let tool_call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
 
                     notify(Notification::ToolStart {
@@ -637,6 +742,7 @@ pub async fn session_prompt(
         },
         error_class: last_error_class.clone(),
         error_retryable: last_error_class.as_ref().is_some_and(|k| k.is_retryable()),
+        message_id: message_id.to_string(),
     }
 }
 
@@ -677,6 +783,27 @@ pub fn session_end(state: &AppState, session_id: &str) -> Result<(), AcpError> {
     }
 }
 
+/// Handle `session/list` (v2 baseline) — returns a list of currently
+/// active sessions. The wire shape follows the v2 schema's
+/// `SessionListResponse`: `{sessions: SessionInfo[], nextCursor: null}`.
+///
+/// We do not currently include `cwd` or `title` in `SessionInfo` (we
+/// only track `messages`, `working_dir`, `protocol_version`, and
+/// `last_active`); `cwd` is reachable via the working_dir field so
+/// emitting it costs nothing.
+pub fn session_list(state: &AppState) -> Vec<Value> {
+    state
+        .sessions_read()
+        .iter()
+        .map(|(session_id, session)| {
+            json!({
+                "sessionId": session_id,
+                "cwd": session.working_dir.display().to_string(),
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Result type
 // ---------------------------------------------------------------------------
@@ -694,6 +821,12 @@ pub struct PromptResult {
     /// True if the last LLM failure was a transient error the Client
     /// could retry by re-issuing the same prompt.
     pub error_retryable: bool,
+    /// ACP v2 `PromptResponse.messageId` — opaque, unique within the
+    /// session. Required by the v2 schema. acp-bridge mints this when it
+    /// accepts the prompt (before invoking the LLM) and echoes it on
+    /// the response; v2 Clients use it to correlate the response with
+    /// `user_message` / `agent_message` session updates.
+    pub message_id: String,
 }
 
 /// Estimated token usage for a completed prompt turn. The wire shape
@@ -714,6 +847,7 @@ pub struct UsageReport {
 mod tests {
     use super::*;
     use crate::llm::Backend;
+    use crate::protocol::ProtocolVersion;
 
     #[test]
     fn extract_user_text_handles_acp_array_shape() {
@@ -919,7 +1053,7 @@ mod tests {
 
     #[test]
     fn initialize_does_not_advertise_image_by_default() {
-        let caps = initialize(&cfg_with_image(false));
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V1);
         assert_eq!(caps["protocolVersion"], 1);
         assert_eq!(
             caps["agentCapabilities"]["promptCapabilities"]["image"], false,
@@ -938,11 +1072,62 @@ mod tests {
 
     #[test]
     fn initialize_advertises_image_when_opted_in() {
-        let caps = initialize(&cfg_with_image(true));
+        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V1);
         assert_eq!(
             caps["agentCapabilities"]["promptCapabilities"]["image"], true,
             "image must be true when prompt_supports_image is set"
         );
+    }
+
+    #[test]
+    fn initialize_v2_uses_unified_capabilities_and_info_shape() {
+        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V2);
+        assert_eq!(caps["protocolVersion"], 2);
+        // v2 collapses agentCapabilities / clientCapabilities into a single
+        // `capabilities`, and `agentInfo` / `clientInfo` into `info`.
+        // Spec deliberately forbids the v1-style aliases — only one of
+        // each pair is permitted on the wire.
+        assert!(caps.get("info").is_some(), "v2 must emit info");
+        assert!(
+            caps.get("capabilities").is_some(),
+            "v2 must emit capabilities"
+        );
+        assert!(
+            caps.get("agentInfo").is_none(),
+            "v1 agentInfo must not appear on v2 wire"
+        );
+        assert!(
+            caps.get("agentCapabilities").is_none(),
+            "v1 agentCapabilities must not appear on v2 wire"
+        );
+        // Image is advertised as `{}` (capability marker) on v2, not `true`.
+        let image = &caps["capabilities"]["session"]["prompt"]["image"];
+        assert!(
+            image.is_object(),
+            "v2 image capability should be an object marker, got: {image}"
+        );
+    }
+
+    #[test]
+    fn initialize_v2_omits_image_when_disabled() {
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V2);
+        let prompt_caps = &caps["capabilities"]["session"]["prompt"];
+        assert!(
+            prompt_caps.get("image").is_none(),
+            "v2 image must be omitted (not `false`) when not supported; \
+             clients interpret present-as-object as 'supported' and absent \
+             as 'not advertised'"
+        );
+    }
+
+    #[test]
+    fn initialize_falls_back_to_v1_for_unknown_versions() {
+        // Default Default for ProtocolVersion is V1, so omitting the arg
+        // should produce the v1 wire shape — Clients that omit
+        // protocolVersion still get a working session on the most widely
+        // deployed wire shape.
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::default());
+        assert_eq!(caps["protocolVersion"], 1);
     }
 
     #[test]

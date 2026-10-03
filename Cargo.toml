@@ -1,6 +1,6 @@
 [package]
 name = "acp-bridge"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 authors = ["Blake Labs"]
 description = "ACP adapter for local AI — bridges local LLM backends to Agent Client Protocol"
@@ -36,6 +36,10 @@ path = "tests/clients/minimal_style.rs"
 [[test]]
 name = "notifications"
 path = "tests/clients/notifications.rs"
+
+[[test]]
+name = "protocol_version"
+path = "tests/clients/protocol_version.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

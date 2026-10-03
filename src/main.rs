@@ -9,7 +9,7 @@ use acp_bridge::config::ConfigFile;
 use acp_bridge::engine::{self, AppState, Notification};
 use acp_bridge::hardware;
 use acp_bridge::llm;
-use acp_bridge::protocol::{AcpError, JsonRpcRequest, RequestId};
+use acp_bridge::protocol::{AcpError, JsonRpcRequest, ProtocolVersion, RequestId};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -205,7 +205,48 @@ async fn probe_backend(config: &llm::LlmConfig) {
 // ACP mode — stdin/stdout JSON-RPC loop
 // ---------------------------------------------------------------------------
 
-async fn run_acp_loop(state: Arc<AppState>) {
+/// Negotiate the ACP wire-format version from a Client's
+/// `initialize` request parameters.
+///
+/// The Client's `protocolVersion` is an integer (1 or 2 today).
+/// Negotiation rule: pick the highest version that both sides
+/// support. We support v1 and v2; anything newer than v2 falls back to
+/// v2 with a warning. Missing field → v1 (conservative default that
+/// works with every existing Client).
+///
+/// This is the *exact* protocol rule described in
+/// <https://agentclientprotocol.com/protocol/initialization> and
+/// mirrored by the official Rust / TypeScript / Elixir SDKs.
+fn negotiate_protocol_version(params: Option<Value>) -> ProtocolVersion {
+    let requested = params
+        .as_ref()
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(|v| v.as_u64())
+        .map(|n| ProtocolVersion(n as u16));
+    match requested {
+        None => {
+            debug!("Client omitted protocolVersion, defaulting to v1");
+            ProtocolVersion::V1
+        }
+        Some(v) if v.as_u16() <= ProtocolVersion::V1.as_u16() => {
+            debug!(requested = %v, "Negotiating v1");
+            ProtocolVersion::V1
+        }
+        Some(v) if v.as_u16() == ProtocolVersion::V2.as_u16() => {
+            debug!("Negotiating v2");
+            ProtocolVersion::V2
+        }
+        Some(v) => {
+            warn!(
+                requested = %v,
+                "Client requested a version newer than we support; falling back to v2"
+            );
+            ProtocolVersion::V2
+        }
+    }
+}
+
+async fn run_acp_loop(mut state: Arc<AppState>) {
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
@@ -259,7 +300,19 @@ async fn run_acp_loop(state: Arc<AppState>) {
 
                         match method {
                             "initialize" => {
-                                let result = engine::initialize(&state.config);
+                                // Negotiate the wire-format version. The Client
+                                // sends its preferred version; we choose the
+                                // highest version we both support. If the
+                                // Client omits the field we fall back to v1
+                                // (the conservative default).
+                                let negotiated = negotiate_protocol_version(Some(params.clone()));
+                                // Arc::make_mut gives us &mut AppState when
+                                // there's only one strong reference; if the
+                                // Arc is shared, it clones. Inside
+                                // run_acp_loop the Arc has refcount 1, so
+                                // make_mut never actually clones.
+                                Arc::make_mut(&mut state).protocol_version = negotiated;
+                                let result = engine::initialize(&state.config, negotiated);
                                 acp::send_response(&id, result);
                             }
                             "session/new" => {
@@ -269,7 +322,7 @@ async fn run_acp_loop(state: Arc<AppState>) {
                                         debug!(count = servers.len(), "Ignoring mcpServers param (not supported in v0.7)");
                                     }
                                 }
-                                match engine::session_new(&state, raw_cwd) {
+                                match engine::session_new(&state, raw_cwd, state.protocol_version) {
                                     Ok(session_id) => {
                                         // Post-creation notifications first so
                                         // Clients that want to render the
@@ -280,8 +333,15 @@ async fn run_acp_loop(state: Arc<AppState>) {
                                         // sessionId they apply to, so sending
                                         // them before the response is safe
                                         // (Client binds them on receipt of
-                                        // the response anyway).
-                                        engine::session_new_post_create_notifications(&session_id, raw_cwd);
+                                        // the response anyway). Routed via
+                                        // the v1/v2 dispatcher so v2 Clients
+                                        // get the v2 wire shape (e.g.
+                                        // plan_update with planId).
+                                        engine::session_new_post_create_notifications(
+                                            &session_id,
+                                            raw_cwd,
+                                            state.protocol_version,
+                                        );
                                         acp::send_response(&id, json!({"sessionId": session_id}));
                                     }
                                     Err(e) => {
@@ -292,17 +352,36 @@ async fn run_acp_loop(state: Arc<AppState>) {
                             "session/prompt" => {
                                 handle_acp_prompt(id, &params, &state).await;
                             }
-                            "session/end" => {
+                            "session/end" | "session/close" => {
                                 let session_id = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
                                 if session_id.is_empty() {
                                     let err = AcpError::MissingParam { field: "sessionId".into() };
                                     acp::send_error(&id, err.code(), &err.to_string());
                                 } else {
+                                    // `session/end` is the v1 method;
+                                    // `session/close` is the v2 baseline
+                                    // alias (see schema/v2 SessionCapabilities).
+                                    // Both share the same implementation:
+                                    // remove the in-memory session. No
+                                    // persistence, so re-opening is a no-op.
                                     match engine::session_end(&state, session_id) {
                                         Ok(()) => acp::send_response(&id, json!({"status": "ended"})),
                                         Err(e) => acp::send_error(&id, e.code(), &e.to_string()),
                                     }
                                 }
+                            }
+                            "session/list" => {
+                                // v2 baseline session method. Lists currently
+                                // active sessions. Returns an empty `sessions`
+                                // array (and cursor: null) when there are none.
+                                let sessions = engine::session_list(&state);
+                                acp::send_response(
+                                    &id,
+                                    json!({
+                                        "sessions": sessions,
+                                        "nextCursor": null,
+                                    }),
+                                );
                             }
                             "session/load" | "session/resume" => {
                                 // acp-bridge has no persistence layer; it does not
@@ -315,6 +394,18 @@ async fn run_acp_loop(state: Arc<AppState>) {
                                     -32001,
                                     "acp-bridge has no persistence layer; session/load and session/resume are unavailable",
                                     json!({ "reason": "no_persistence" }),
+                                );
+                            }
+                            "session/delete" => {
+                                // v2 optional session method (advertised via
+                                // `capabilities.session.delete: {}`). acp-bridge
+                                // does not implement deletion from `session/list`
+                                // — `session/close` is the equivalent.
+                                acp::send_error_with_data(
+                                    &id,
+                                    -32601,
+                                    "session/delete is not supported by acp-bridge; use session/close instead",
+                                    json!({ "reason": "not_implemented" }),
                                 );
                             }
                             "session/set_mode" => {
@@ -437,6 +528,14 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
         return;
     }
 
+    // Mint a messageId for this prompt. v2's PromptResponse schema requires
+    // it (`required: ["messageId"]`); v1 Clients ignore the field but we
+    // send it on every wire version to keep the response shape
+    // identical between versions. The id is opaque to the Client — we use
+    // a UUID so two concurrent turns in the same session can never
+    // collide.
+    let message_id = uuid::Uuid::new_v4().to_string();
+
     // Compute a session title from the user's first non-empty line so
     // Clients can surface a meaningful name in their session list. Done
     // before spawning the engine task because `user_text` is moved into
@@ -453,6 +552,7 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
     // Spawn the engine prompt in a task so we can drain notifications
     let state_clone = Arc::clone(state);
     let sid = session_id.clone();
+    let mid = message_id.clone();
     let handle = tokio::spawn(async move {
         engine::session_prompt(
             &state_clone,
@@ -460,19 +560,27 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
             &user_text,
             &user_images,
             Some(notify_tx),
+            &mid,
         )
         .await
     });
 
-    // Drain notifications to ACP stdout
+    // Drain notifications to ACP stdout. Each notification is routed
+    // through the `_for` dispatcher so v2 Clients receive v2-shaped
+    // payloads (e.g. `tool_call_update` instead of `tool_call`) and v1
+    // Clients receive the legacy shapes they were written against.
     while let Some(notif) = notify_rx.recv().await {
         match notif {
-            Notification::Thinking => acp::notify_thinking(&session_id),
-            Notification::ToolStart { id, name } => acp::notify_tool_start(&session_id, &id, &name),
-            Notification::ToolDone { id, name, status } => {
-                acp::notify_tool_done(&session_id, &id, &name, &status)
+            Notification::Thinking => acp::notify_thinking_for(state.protocol_version, &session_id),
+            Notification::ToolStart { id, name } => {
+                acp::notify_tool_start_for(state.protocol_version, &session_id, &id, &name)
             }
-            Notification::TextChunk(text) => acp::notify_text(&session_id, &text),
+            Notification::ToolDone { id, name, status } => {
+                acp::notify_tool_done_for(state.protocol_version, &session_id, &id, &name, &status)
+            }
+            Notification::TextChunk(text) => {
+                acp::notify_text_for(state.protocol_version, &session_id, &text)
+            }
         }
     }
 
@@ -486,6 +594,7 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
         },
         error_class: Some(acp_bridge::llm::LlmErrorKind::Unknown),
         error_retryable: false,
+        message_id: message_id.clone(),
     });
 
     // If the engine returned a protocol error (e.g. unknown session), send JSON-RPC error
@@ -517,12 +626,9 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
     // hits the tool-call round limit maps to `max_turn_requests` (the model
     // made the maximum number of requests in a single turn). The actual error
     // text is already delivered via the streamed `agent_message_chunk` and the
-    // legacy `status`/`text` fields below.
-    let stop_reason = if result.status == "completed" {
-        "end_turn"
-    } else {
-        "max_turn_requests"
-    };
+    // legacy `status`/`text` fields below. The stop_reason value lives
+    // inside the response-body dispatch below; v1 puts it on the
+    // response directly, v2 puts it on `state_update`.
 
     // If the turn failed due to a classified LLM error, attach the
     // classification to the response so Clients can branch on
@@ -539,19 +645,57 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
     // Post-turn notifications come BEFORE the response so Clients that
     // collect both (e.g. via `read_until_response`) see them bound to
     // this turn. The notification `sessionId` field already tells the
-    // Client which session they apply to.
-    acp::notify_usage(&session_id, result.usage.used, result.usage.size, None);
+    // Client which session they apply to. Routed through the v1/v2
+    // dispatcher so v2 Clients get the v2 wire shape.
+    acp::notify_usage_for(
+        state.protocol_version,
+        &session_id,
+        result.usage.used,
+        result.usage.size,
+        None,
+    );
     if let Some(title) = derived_title.as_deref() {
-        acp::notify_session_info(&session_id, title, None);
+        acp::notify_session_info_for(state.protocol_version, &session_id, title, None);
     }
 
-    let mut response_body = json!({
-        "stopReason": stop_reason,
-        "status": result.status,
-        "text": result.text,
-    });
-    if let Some(meta) = error_meta {
-        response_body["error"] = meta;
+    // v2 Clients expect a `state_update` with `stopReason` so they can
+    // render the prompt input affordably. v1 Clients ignore unknown
+    // sessionUpdate discriminators per the JSON-RPC spec, so it's safe
+    // to always call the dispatcher (it no-ops on v1).
+    if state.protocol_version == ProtocolVersion::V2 {
+        let stop_reason = if result.status == "completed" {
+            "end_turn"
+        } else {
+            "max_turn_requests"
+        };
+        acp::notify_state_idle_for(state.protocol_version, &session_id, Some(stop_reason));
     }
+
+    // Wire-shape dispatch on the response itself. v1 Clients keep the
+    // legacy `{stopReason, status, text, error?}` shape (ACP v1 has no
+    // concept of messageId; the OpenAB pipeline reads `text`). v2
+    // Clients receive the spec-compliant `{messageId}` shape —
+    // `stopReason` lives on `state_update` per the v2 schema, and
+    // messageId is the only required field on PromptResponse.
+    let response_body = if state.protocol_version == ProtocolVersion::V2 {
+        json!({
+            "messageId": result.message_id,
+        })
+    } else {
+        let stop_reason = if result.status == "completed" {
+            "end_turn"
+        } else {
+            "max_turn_requests"
+        };
+        let mut body = json!({
+            "stopReason": stop_reason,
+            "status": result.status,
+            "text": result.text,
+        });
+        if let Some(meta) = error_meta {
+            body["error"] = meta;
+        }
+        body
+    };
     acp::send_response(&id, response_body);
 }

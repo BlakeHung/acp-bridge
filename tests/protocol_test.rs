@@ -1,4 +1,4 @@
-use acp_bridge::protocol::{AcpError, JsonRpcRequest, RequestId, Session};
+use acp_bridge::protocol::{AcpError, JsonRpcRequest, ProtocolVersion, RequestId, Session};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -72,7 +72,11 @@ fn parse_notification_has_no_id() {
 // ---------------------------------------------------------------------------
 
 fn make_session(messages: Vec<serde_json::Value>) -> Session {
-    let mut session = Session::new(messages[0].clone(), std::path::PathBuf::from("/tmp"));
+    let mut session = Session::new(
+        messages[0].clone(),
+        std::path::PathBuf::from("/tmp"),
+        ProtocolVersion::V1,
+    );
     for msg in &messages[1..] {
         session.messages.push(msg.clone());
     }
@@ -152,6 +156,7 @@ fn session_touch_updates_last_active() {
     let session = Session::new(
         json!({"role": "system", "content": "sys"}),
         std::path::PathBuf::from("/tmp"),
+        ProtocolVersion::V1,
     );
     let first = session.last_active;
     std::thread::sleep(std::time::Duration::from_millis(10));

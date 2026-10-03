@@ -3,6 +3,54 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// ACP wire-format protocol version negotiated at `initialize` time.
+///
+/// The ACP working group uses a single integer that is bumped only for
+/// breaking changes. acp-bridge supports v1 (stable, the version most
+/// Clients speak today) and v2 (released 2026, see
+/// <https://agentclientprotocol.com/protocol/v2/initialization>).
+///
+/// On `initialize` the Client's requested version is compared against the
+/// set we support. We echo the negotiated value back so it knows whether
+/// to stay on its preferred version or follow our fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProtocolVersion(pub u16);
+
+impl ProtocolVersion {
+    /// v1: the version Zed, JetBrains, ACP UI, ACP Inspector, Meuxe,
+    /// and Codex CLI adapter all speak today. Stable since 2025.
+    pub const V1: ProtocolVersion = ProtocolVersion(1);
+    /// v2: released 2026. Unifies `agentCapabilities`/`clientCapabilities`
+    /// into a single `capabilities`, adds `messageId`-keyed message
+    /// upserts, and removes the `tool_call` notification in favour of
+    /// `tool_call_update` as an upsert keyed by `toolCallId`.
+    pub const V2: ProtocolVersion = ProtocolVersion(2);
+
+    /// Highest version we support. Negotiated as the fallback when the
+    /// Client requests something newer.
+    pub const LATEST: ProtocolVersion = Self::V2;
+
+    pub fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+impl Default for ProtocolVersion {
+    fn default() -> Self {
+        // Defaulting to V1 is the conservative choice — Clients that
+        // don't bother sending a protocolVersion still get a working
+        // session on the wire shape every existing Client speaks.
+        Self::V1
+    }
+}
+
+impl std::fmt::Display for ProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "v{}", self.0)
+    }
+}
+
 /// JSON-RPC 2.0 request/response ID. Per the spec an `id` may be a
 /// string or a number; a `null`/absent `id` marks a notification.
 ///
@@ -33,20 +81,31 @@ pub struct JsonRpcRequest {
     pub params: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Session {
     pub messages: Vec<Value>,
     /// Last activity timestamp for idle timeout.
     pub last_active: Instant,
     /// Working directory for this session (used for tool sandboxing).
     pub working_dir: PathBuf,
+    /// ACP wire-format protocol version this session uses. Inherited
+    /// from the AppState at session creation; the emit helpers branch
+    /// on it so a v2 Client gets v2-shaped notifications even if a v1
+    /// Client later connects to the same process.
+    pub protocol_version: ProtocolVersion,
 }
 
 impl Session {
-    pub fn new(system_message: Value, working_dir: PathBuf) -> Self {
+    pub fn new(
+        system_message: Value,
+        working_dir: PathBuf,
+        protocol_version: ProtocolVersion,
+    ) -> Self {
         Self {
             messages: vec![system_message],
             last_active: Instant::now(),
             working_dir,
+            protocol_version,
         }
     }
 

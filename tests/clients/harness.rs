@@ -35,6 +35,11 @@ fn acp_bridge_bin() -> PathBuf {
 
 /// A live acp-bridge subprocess with stdin/stdout handles.
 pub struct Agent {
+    /// Kept alive for the lifetime of the Agent so the OS reaps the
+    /// child process if the test panics before calling `shutdown`.
+    /// Some test binaries (notably `protocol_version`) do not exercise
+    /// either path, so `child` is `allow(dead_code)`.
+    #[allow(dead_code)]
     pub child: Child,
     pub stdin: ChildStdin,
     pub stdout_rx: mpsc::Receiver<Value>,
@@ -153,7 +158,9 @@ impl Agent {
         }
     }
 
-    /// Gracefully shut down the agent.
+    /// Gracefully shut down the agent. `allow(dead_code)` because some
+    /// test binaries (notably `protocol_version`) do not exercise it.
+    #[allow(dead_code)]
     pub fn shutdown(mut self) {
         // Closing stdin is the documented shutdown signal.
         let _ = self.stdin.flush();
