@@ -1488,19 +1488,22 @@ mod thinking_recovery_tests {
 
     #[test]
     fn strip_removes_closed_blocks() {
-        let input = "CTXcheck the file first.CTXUse edit tool.";
+        let input = "<think>check the file first.</think>Use edit tool.";
         assert_eq!(strip_thinking_blocks(input), "Use edit tool.");
     }
 
     #[test]
     fn strip_handles_interleaved_and_nested_tags() {
-        let input = "CTXaCTXCTXbCTXremainder";
+        let input = "<thinking>a</thinking><thought>b</thought>remainder";
         assert_eq!(strip_thinking_blocks(input), "remainder");
     }
 
     #[test]
     fn strip_drops_unterminated_to_eof() {
-        assert_eq!(strip_thinking_blocks("CTXreasoning with no closer"), "");
+        assert_eq!(
+            strip_thinking_blocks("<thinking>reasoning with no closer"),
+            ""
+        );
     }
 
     #[test]
@@ -1511,7 +1514,7 @@ mod thinking_recovery_tests {
 
     #[test]
     fn recover_parses_fenced_tool_call_json() {
-        let input = "CTXread it first.CTX\n```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/main.rs\"}}\n```";
+        let input = "<think>read it first.</think>\n```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/main.rs\"}}\n```";
         let (clean, calls) = recover_tool_calls_from_content(input);
         assert_eq!(calls.len(), 1, "calls were: {calls:?}");
         assert_eq!(calls[0]["function"]["name"], "read_file");
@@ -1524,7 +1527,7 @@ mod thinking_recovery_tests {
 
     #[test]
     fn recover_parses_bare_object_with_name_and_arguments() {
-        let input = "CTXreasoningCTX\n{\"name\": \"list_dir\", \"args\": {\"path\": \"src\"}}\n";
+        let input = "<thought>reasoning</thought>\n{\"name\": \"list_dir\", \"args\": {\"path\": \"src\"}}\n";
         let (clean, calls) = recover_tool_calls_from_content(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "list_dir");
@@ -1560,7 +1563,7 @@ mod thinking_recovery_tests {
 
     #[test]
     fn recover_returns_clean_text_when_nothing_matches() {
-        let input = "CTXhiddenCTXplain answer";
+        let input = "<thinking>hidden</thinking>plain answer";
         let (clean, calls) = recover_tool_calls_from_content(input);
         assert!(calls.is_empty());
         assert_eq!(clean, "plain answer");
@@ -1570,7 +1573,7 @@ mod thinking_recovery_tests {
     fn recover_handles_unterminated_think_followed_by_tool_json() {
         // reasoning tag never closed, tool JSON after it — reasoning is
         // dropped wholesale and the tool call is still recovered
-        let input = "CTXlong reasoning never closed\n{\"name\": \"bash\", \"arguments\": {\"command\": \"git_status\"}}";
+        let input = "<think>long reasoning never closed\n{\"name\": \"bash\", \"arguments\": {\"command\": \"git_status\"}}";
         let (clean, calls) = recover_tool_calls_from_content(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "bash");
