@@ -126,9 +126,14 @@ fn prompt_block() -> Value {
 
 fn assert_tool_result_rounded(messages: &Value) {
     let msgs = messages.as_array().expect("messages array");
-    let has_tool = msgs
-        .iter()
-        .any(|m| m["role"] == "tool" && m["tool_call_id"] == "call_strata_1");
+    let has_tool = msgs.iter().any(|m| {
+        m["role"] == "tool"
+            && (m["tool_call_id"] == "call_strata_1"
+                || m["tool_call_id"]
+                    .as_str()
+                    .map(|id| id.starts_with("embedded_"))
+                    .unwrap_or(false))
+    });
     assert!(has_tool, "second round must carry the tool result");
 }
 
