@@ -269,24 +269,29 @@ pub fn strip_thinking_blocks(text: &str) -> String {
 ///   `{"function": {"name": …, "arguments": …}}`
 pub fn recover_tool_calls_from_content(text: &str) -> (String, Vec<Value>) {
     let stripped = strip_thinking_blocks(text);
-    if stripped.trim().is_empty() {
-        return (String::new(), vec![]);
-    }
 
-    // (byte start, byte end, raw slice) of every candidate object
+    // When the reasoning scaffolding swallowed the whole text (unterminated
+    // opener), fall back to scanning the raw content so an embedded tool
+    // call after the reasoning is still recoverable.
+    let scan_source = if stripped.trim().is_empty() && !text.trim().is_empty() {
+        text
+    } else {
+        stripped.as_str()
+    };
+
     let mut candidates: Vec<(usize, usize)> = Vec::new();
 
-    // fenced blocks are preferred signal — scan them first
-    let mut rest = stripped.as_str();
-    while let Some(start) = rest.find("```") {
-        let after = &rest[start + 3..];
-        let body_start = after.find('\n').map(|nl| nl + 1).unwrap_or(0);
+    // fenced blocks are preferred signal // scan them first
+    let mut rest = scan_source;
+    while let Some(open) = rest.find(TRIPLE_TICK) {
+        let after = &rest[open + 3..];
+        let body_start = after.find(NEWLINE).map(|nl| nl + 1).unwrap_or(0);
         let body = &after[body_start..];
-        match body.find("```") {
+        match body.find(TRIPLE_TICK) {
             Some(end) => {
                 candidates.push((
-                    stripped.len() - rest.len() + start,
-                    stripped.len() - rest.len() + start + 3 + body_start + end,
+                    scan_source.len() - rest.len() + open,
+                    scan_source.len() - rest.len() + open + 3 + body_start + end + 3,
                 ));
                 rest = &body[end + 3..];
             }
@@ -295,31 +300,31 @@ pub fn recover_tool_calls_from_content(text: &str) -> (String, Vec<Value>) {
     }
 
     // bare balanced objects (string-aware depth scan)
-    let bytes = stripped.as_bytes();
+    let bytes = scan_source.as_bytes();
     let mut depth = 0usize;
     let mut start = None;
     let mut in_str = false;
     let mut esc = false;
-    for (i, c) in bytes.iter().enumerate() {
-        let c = *c as char;
+    for (i, b) in bytes.iter().enumerate() {
+        let c = *b as char;
         match c {
             _ if in_str => {
                 if esc {
                     esc = false;
-                } else if c == '\\' {
+                } else if c == BACKSLASH {
                     esc = true;
-                } else if c == '"' {
+                } else if c == QUOTE {
                     in_str = false;
                 }
             }
-            '"' => in_str = true,
-            '{' => {
+            QUOTE => in_str = true,
+            BRACE_OPEN => {
                 if depth == 0 {
                     start = Some(i);
                 }
                 depth += 1;
             }
-            '}' if depth > 0 => {
+            BRACE_CLOSE if depth > 0 => {
                 depth -= 1;
                 if depth == 0 && start.is_some() {
                     candidates.push((start.unwrap(), i + 1));
@@ -329,14 +334,13 @@ pub fn recover_tool_calls_from_content(text: &str) -> (String, Vec<Value>) {
             _ => {}
         }
     }
-    // discard fenced ranges already covered by the balanced scan: dedupe by overlap
+
+    // merge overlapping windows (fence bodies contain balanced objects too)
     candidates.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (s, e) in candidates {
         match merged.last_mut() {
-            // disjoint candidate; keep
             Some(last) if s < last.1 => {
-                // overlapping with previous — keep the larger window
                 if e > last.1 {
                     last.1 = e;
                 }
@@ -346,67 +350,97 @@ pub fn recover_tool_calls_from_content(text: &str) -> (String, Vec<Value>) {
     }
     let candidates = merged;
 
-    let embedded_call = |raw: &str| -> Option<Value> {
-        let val: Value = serde_json::from_str(raw).ok()?;
-        let func = val.get("function").filter(|f| f.is_object());
-        let name = func
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-            .or_else(|| val.get("name").and_then(Value::as_str))?;
-        let args = {
-            let src = func.or(Some(&val));
-            src.and_then(|o| {
-                o.get("arguments")
-                    .or_else(|| o.get("args"))
-                    .or_else(|| o.get("parameters"))
-                    .or_else(|| o.get("input"))
-            })
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default()))
-        };
-        // arguments must survive serialization as a JSON string (OpenAI shape)
-        let args_str = match &args {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        Some(json!({
-            "id": format!("embedded_{}", uuid::Uuid::new_v4()),
-            "type": "function",
-            "function": {"name": name, "arguments": args_str},
-        }))
-    };
-
-    /// If `raw` is a fenced code block, return the JSON body between the
-    /// fence markers (dropping the optional language-tag line).
-    fn fenced_inner(raw: &str) -> Option<&str> {
-        let t = raw.trim();
-        if !t.starts_with("```") {
-            return None;
-        }
-        let nl = t[3..].find('\n')? + 3;
-        let body_start = nl + 1;
-        if body_start >= t.len() {
-            return None;
-        }
-        let end_rel = t[body_start..].rfind("```")?;
-        Some(&t[body_start..body_start + end_rel])
-    }
-
+    let used_raw = !candidates.is_empty() && scan_source.as_ptr() == text.as_ptr();
     for (s, e) in candidates.iter().rev() {
-        let raw = &stripped[*s..*e];
+        let raw = &scan_source[*s..*e];
         let parseable = fenced_inner(raw).unwrap_or(raw);
-        if let Some(call) = embedded_call(parseable) {
-            let mut clean = stripped[..*s].trim().to_string();
-            // remove any dangling fence remnants before the block
-            while clean.ends_with("```") {
-                clean.truncate(clean.len() - 3);
-                clean = clean.trim_end().to_string();
-            }
+        if let Some(call) = embedded_call_from_json(parseable) {
+            let prefix: &str = scan_source[..*s].trim_end();
+            let clean = if used_raw {
+                strip_thinking_blocks(prefix).trim().to_string()
+            } else {
+                strip_fence_remnants(prefix.to_string())
+            };
             return (clean, vec![call]);
         }
     }
 
     (stripped.trim().to_string(), vec![])
+}
+
+const TRIPLE_TICK: char = 96 as char;
+const BRACE_OPEN: char = 123 as char;
+const BRACE_CLOSE: char = 125 as char;
+const QUOTE: char = 34 as char;
+const BACKSLASH: char = 92 as char;
+const NEWLINE: char = 10 as char;
+
+/// Remove dangling fence markers (and surrounding newlines) from text.
+fn strip_fence_remnants(mut clean: String) -> String {
+    while clean.ends_with(TRIPLE_TICK) {
+        let cut = clean.len() - 3;
+        clean.truncate(cut);
+        clean = clean.trim_end().to_string();
+    }
+    clean
+}
+
+/// Rebuild an OpenAI-style tool-call Value from embedded JSON if it looks
+/// like a tool call (has a tool name plus optional argument struct).
+fn embedded_call_from_json(raw: &str) -> Option<Value> {
+    let val: Value = serde_json::from_str(raw).ok()?;
+    let func = val.get("function").filter(|f| f.is_object());
+    let name = func
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| val.get("name").and_then(Value::as_str))?;
+    let args = {
+        let src = func.or(Some(&val));
+        src.and_then(|o| {
+            o.get("arguments")
+                .or_else(|| o.get("args"))
+                .or_else(|| o.get("parameters"))
+                .or_else(|| o.get("input"))
+        })
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()))
+    };
+    // arguments must survive serialization as a JSON string (OpenAI shape)
+    let args_str = match &args {
+        Value::String(a) => a.clone(),
+        other => other.to_string(),
+    };
+    Some(json!({
+        "id": format!("embedded_{}", uuid::Uuid::new_v4()),
+        "type": "function",
+        "function": {"name": name, "arguments": args_str},
+    }))
+}
+
+/// If `raw` is a fenced code block, return the JSON body between the fence
+/// markers (dropping the optional language-tag line). Tolerates the closing
+/// marker being outside the passed slice.
+fn fenced_inner(raw: &str) -> Option<&str> {
+    let t = raw.trim();
+    if !t.starts_with(TRIPLE_TICK) {
+        return None;
+    }
+    let nl = match t[3..].find(NEWLINE) {
+        Some(p) => p + 3,
+        None => {
+            // no language-tag line: try stripping trailing fence instead
+            return None;
+        }
+    };
+    let body_start = nl + 1;
+    if body_start >= t.len() {
+        return None;
+    }
+    let end_rel = match t[body_start..].rfind(TRIPLE_TICK) {
+        Some(p) => p,
+        None => t.len() - body_start,
+    };
+    Some(t[body_start..body_start + end_rel].trim())
 }
 
 /// Probe the backend on startup: check connectivity and list available models.
@@ -1558,7 +1592,10 @@ mod thinking_recovery_tests {
         let input = "the config is {\"model\": \"qwen3\"} right?";
         let (clean, calls) = recover_tool_calls_from_content(input);
         assert!(calls.is_empty());
-        assert!(clean.contains("{\"model\"}"), "clean was: {clean}");
+        assert!(
+            clean.contains("{\"model\": \"qwen3\"}"),
+            "clean was: {clean}"
+        );
     }
 
     #[test]
