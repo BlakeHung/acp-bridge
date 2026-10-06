@@ -6,6 +6,7 @@ authors = ["Blake Labs"]
 description = "ACP adapter for local AI — bridges local LLM backends to Agent Client Protocol"
 license = "MIT"
 repository = "https://github.com/BlakeHung/acp-bridge"
+homepage = "https://wchung.tw/acp-bridge/"
 keywords = ["acp", "ollama", "local-ai", "agent-protocol"]
 categories = ["command-line-utilities"]
 

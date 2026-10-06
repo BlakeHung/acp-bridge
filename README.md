@@ -2,6 +2,8 @@
 
 ACP ([Agent Client Protocol](https://agentclientprotocol.com)) adapter for **self-hosted AI** — the zero-cloud, zero-dependency bridge for air-gapped and enterprise environments.
 
+> Project page & docs: **[wchung.tw/acp-bridge/](https://wchung.tw/acp-bridge/)** ([中文](https://wchung.tw/zh/acp-bridge/))
+
 When OpenCode can't reach the internet, acp-bridge can still run.
 
 Written in Rust. Single ~5MB binary. Zero runtime dependencies. Fully offline.
