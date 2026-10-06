@@ -366,6 +366,13 @@ fn strip_fence_remnants(mut clean: String) -> String {
         clean.truncate(cut);
         clean = clean.trim_end().to_string();
     }
+    // a dangling opening fence ("```json" / "```tool_call" / "```") left
+    // before the embedded object — drop the whole line
+    let last_line_start = clean.rfind(NEWLINE).map(|p| p + 1).unwrap_or(0);
+    if clean[last_line_start..].starts_with(TRIPLE_TICK) {
+        clean.truncate(last_line_start);
+        clean = clean.trim_end().to_string();
+    }
     clean
 }
 
