@@ -14,7 +14,7 @@
 //!    fenced JSON inside an *unterminated* think-tag block (0.9.2
 //!    recovery path)
 
-use axum::{response::IntoResponse, routing::get, Json, Router};
+use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -111,8 +111,7 @@ async fn start(port: u16, embed_only: bool) -> (Agent, Arc<MockState>) {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let base: &'static str =
-        Box::leak(format!("http://127.0.0.1:{port}/v1").into_boxed_str());
+    let base: &'static str = Box::leak(format!("http://127.0.0.1:{port}/v1").into_boxed_str());
     let agent = Agent::spawn(&[
         ("LLM_BASE_URL", base),
         ("LLM_MODEL", "Qwen3.8-Flash-Next"),
@@ -134,7 +133,11 @@ fn assert_tool_result_rounded(messages: &Value) {
 }
 
 fn assert_rounded_dispatch(agent: &mut Agent, state: &Arc<MockState>) {
-    agent.request(1, "initialize", json!({"protocolVersion": 1, "clientCapabilities": {}}));
+    agent.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
     let (_nodes, _init) = agent.recv_response(&json!(1), Duration::from_secs(5));
     agent.request(2, "session/new", json!({}));
     let (_nodes, new) = agent.recv_response(&json!(2), Duration::from_secs(5));
@@ -148,11 +151,15 @@ fn assert_rounded_dispatch(agent: &mut Agent, state: &Arc<MockState>) {
 
     // a tool ran: both tool_call and tool_call_update surfaced
     assert!(
-        notifs.iter().any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call"),
+        notifs
+            .iter()
+            .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call"),
         "tool_call update missing; notifs = {notifs:?}"
     );
     assert!(
-        notifs.iter().any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update"),
+        notifs
+            .iter()
+            .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update"),
         "tool_call_update missing"
     );
 
@@ -160,7 +167,11 @@ fn assert_rounded_dispatch(agent: &mut Agent, state: &Arc<MockState>) {
     let final_text: String = notifs
         .iter()
         .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
-        .filter_map(|m| m["params"]["update"]["content"]["text"].as_str().map(String::from))
+        .filter_map(|m| {
+            m["params"]["update"]["content"]["text"]
+                .as_str()
+                .map(String::from)
+        })
         .collect();
     assert!(
         !final_text.contains(THINK_TAG) && !final_text.contains("```json"),
@@ -168,7 +179,11 @@ fn assert_rounded_dispatch(agent: &mut Agent, state: &Arc<MockState>) {
     );
 
     // two rounds: tool dispatch + answer
-    assert_eq!(state.chat_calls.load(Ordering::SeqCst), 2, "expected tool round + answer round");
+    assert_eq!(
+        state.chat_calls.load(Ordering::SeqCst),
+        2,
+        "expected tool round + answer round"
+    );
     let messages = state.last_messages.lock().unwrap().clone().unwrap();
     assert_tool_result_rounded(&messages);
 }
