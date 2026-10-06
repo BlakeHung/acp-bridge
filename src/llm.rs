@@ -196,6 +196,222 @@ fn json_names(val: &Value, array_key: &str, name_key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Thinking-model sanitization — see CHANGELOG 0.9.2 ("thinking-tag tolerance")
+// ---------------------------------------------------------------------------
+
+/// Strip thinking-model scaffolding from assistant content.
+///
+/// Thinking-mode models (DeepSeek-R1, Qwen 2.5/3, GLM…) frequently emit
+/// their reasoning inside `<think>...</think>`, `<thinking>...</thinking>`, `<thought>...</thought>`
+/// blocks. When such a block leaks into the content channel it must not
+/// reach the Client as the session's answer text.
+///
+/// An unterminated opening tag drops the rest of the text: reasoning is
+/// disposable, and the model sometimes only emits the closing delimiter
+/// past the tool-call JSON that follows it.
+pub fn strip_thinking_blocks(text: &str) -> String {
+    const OPENERS: [&str; 3] = ["<think>", "<thinking>", "<thought>"];
+    const CLOSERS: [&str; 3] = ["</think>", "</thinking>", "</thought>"];
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    loop {
+        // find the earliest opener in this pass
+        let mut hit: Option<(usize, usize)> = None; // (byte index, which tag)
+        for (idx, tag) in OPENERS.iter().enumerate() {
+            if let Some(pos) = rest.find(tag) {
+                if hit.is_none() || pos < hit.unwrap().0 {
+                    hit = Some((pos, idx));
+                }
+            }
+        }
+
+        let (pos, idx) = match hit {
+            Some(h) => h,
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+        };
+
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos + OPENERS[idx].len()..];
+
+        // find the matching closer for this specific tag; drop everything
+        // it encloses (and keep scanning from there)
+        match rest.find(CLOSERS[idx]) {
+            Some(close) => {
+                rest = &rest[close + CLOSERS[idx].len()..];
+            }
+            None => {
+                // unterminated thinking block: reasoning-to-EOF is disposable
+                return out;
+            }
+        }
+    }
+}
+
+/// Recover tool calls that a thinking-mode model emitted inside the
+/// assistant content instead of the structured `tool_calls` field.
+///
+/// Returns `(clean_text, tool_calls)`:
+/// - `clean_text` — the content with thinking scaffolding and the
+///   embedded tool-call JSON removed (what remains is displayable text)
+/// - `tool_calls` — OpenAI-style tool-call objects reconstructed from
+///   any embedded JSON that carries a tool name + arguments
+///
+/// Supported embedded shapes (scanned from the last match backwards):
+/// - fenced blocks: ```json {..} ``` / ```tool_call {..} ```
+/// - bare balanced JSON objects with `name` plus `arguments` / `args` /
+///   `parameters` / `input`, or the whole-call shape
+///   `{"function": {"name": …, "arguments": …}}`
+pub fn recover_tool_calls_from_content(text: &str) -> (String, Vec<Value>) {
+    let stripped = strip_thinking_blocks(text);
+    if stripped.trim().is_empty() {
+        return (String::new(), vec![]);
+    }
+
+    // (byte start, byte end, raw slice) of every candidate object
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
+
+    // fenced blocks are preferred signal — scan them first
+    let mut rest = stripped.as_str();
+    while let Some(start) = rest.find("```") {
+        let after = &rest[start + 3..];
+        let body_start = after.find('\n').map(|nl| nl + 1).unwrap_or(0);
+        let body = &after[body_start..];
+        match body.find("```") {
+            Some(end) => {
+                candidates.push((
+                    stripped.len() - rest.len() + start,
+                    stripped.len() - rest.len() + start + 3 + body_start + end,
+                ));
+                rest = &body[end + 3..];
+            }
+            None => break,
+        }
+    }
+
+    // bare balanced objects (string-aware depth scan)
+    let bytes = stripped.as_bytes();
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, c) in bytes.iter().enumerate() {
+        let c = *c as char;
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 && start.is_some() {
+                        candidates.push((start.unwrap(), i + 1));
+                        start = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // discard fenced ranges already covered by the balanced scan: dedupe by overlap
+    candidates.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in candidates {
+        match merged.last_mut() {
+            // disjoint candidate; keep
+            Some(last) if s < last.1 => {
+                // overlapping with previous — keep the larger window
+                if e > last.1 {
+                    last.1 = e;
+                }
+            }
+            _ => merged.push((s, e)),
+        }
+    }
+    let candidates = merged;
+
+    let embedded_call = |raw: &str| -> Option<Value> {
+        let val: Value = serde_json::from_str(raw).ok()?;
+        let func = val.get("function").filter(|f| f.is_object());
+        let name = func
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .or_else(|| val.get("name").and_then(Value::as_str))?;
+        let args = {
+            let src = func.or(Some(&val));
+            src.and_then(|o| {
+                o.get("arguments")
+                    .or_else(|| o.get("args"))
+                    .or_else(|| o.get("parameters"))
+                    .or_else(|| o.get("input"))
+            })
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()))
+        };
+        // arguments must survive serialization as a JSON string (OpenAI shape)
+        let args_str = match &args {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        Some(json!({
+            "id": format!("embedded_{}", uuid::Uuid::new_v4()),
+            "type": "function",
+            "function": {"name": name, "arguments": args_str},
+        }))
+    };
+
+    /// If `raw` is a fenced code block, return the JSON body between the
+    /// fence markers (dropping the optional language-tag line).
+    fn fenced_inner(raw: &str) -> Option<&str> {
+        let t = raw.trim();
+        if !t.starts_with("```") {
+            return None;
+        }
+        let nl = t[3..].find('\n')? + 3;
+        let body_start = nl + 1;
+        if body_start >= t.len() {
+            return None;
+        }
+        let end_rel = t[body_start..].rfind("```")?;
+        Some(&t[body_start..body_start + end_rel])
+    }
+
+    for (s, e) in candidates.iter().rev() {
+        let raw = &stripped[*s..*e];
+        let parseable = fenced_inner(raw).unwrap_or(raw);
+        if let Some(call) = embedded_call(parseable) {
+            let mut clean = stripped[..*s].trim().to_string();
+            // remove any dangling fence remnants before the block
+            while clean.ends_with("```") {
+                clean.truncate(clean.len() - 3);
+                clean = clean.trim_end().to_string();
+            }
+            return (clean, vec![call]);
+        }
+    }
+
+    (stripped.trim().to_string(), vec![])
+}
+
 /// Probe the backend on startup: check connectivity and list available models.
 /// Returns Ok(model_list) on success, Err(reason) on failure.
 /// Non-fatal — callers should log the result but not abort.
@@ -1265,5 +1481,101 @@ mod tests {
         let err = stream_chat(&cfg, &[], None).await.unwrap_err();
         assert_eq!(err.kind, crate::llm::LlmErrorKind::Auth, "err was: {err}");
         assert!(err.message.contains("401"), "err was: {err}");
+    }
+}
+
+
+// ---- thinking-tag tolerance (0.9.2) unit tests ----
+mod thinking_recovery_tests {
+    use super::*;
+    use crate::llm::{recover_tool_calls_from_content, strip_thinking_blocks};
+
+    #[test]
+    fn strip_removes_closed_blocks() {
+        let input = "CTXcheck the file first.CTXUse edit tool.";
+        assert_eq!(strip_thinking_blocks(input), "Use edit tool.");
+    }
+
+    #[test]
+    fn strip_handles_interleaved_and_nested_tags() {
+        let input = "CTXaCTXCTXbCTXremainder";
+        assert_eq!(strip_thinking_blocks(input), "remainder");
+    }
+
+    #[test]
+    fn strip_drops_unterminated_to_eof() {
+        assert_eq!(strip_thinking_blocks("CTXreasoning with no closer"), "");
+    }
+
+    #[test]
+    fn strip_leaves_plain_text_untouched() {
+        let input = "normal answer, braces {} and \\\"quotes\\\"";
+        assert_eq!(strip_thinking_blocks(input), input);
+    }
+
+    #[test]
+    fn recover_parses_fenced_tool_call_json() {
+        let input = "CTXread it first.CTX\n```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/main.rs\"}}\n```";
+        let (clean, calls) = recover_tool_calls_from_content(input);
+        assert_eq!(calls.len(), 1, "calls were: {calls:?}");
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "src/main.rs");
+        assert!(!clean.contains("<think"), "clean was: {clean}");
+        assert!(clean.contains("```") == false, "clean was: {clean}");
+    }
+
+    #[test]
+    fn recover_parses_bare_object_with_name_and_arguments() {
+        let input = "CTXreasoningCTX\n{\"name\": \"list_dir\", \"args\": {\"path\": \"src\"}}\n";
+        let (clean, calls) = recover_tool_calls_from_content(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "list_dir");
+        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "src");
+        assert_eq!(clean, "");
+    }
+
+    #[test]
+    fn recover_prefers_last_candidate() {
+        let input = "{\"name\": \"wrong_one\", \"arguments\": {}}\nfinal answer\n{\"name\": \"bash\", \"arguments\": {\"command\": \"git_status\"}}";
+        let (_, calls) = recover_tool_calls_from_content(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "bash");
+    }
+
+    #[test]
+    fn recover_accepts_whole_call_function_shape() {
+        let input = "```tool_call\n{\"function\": {\"name\": \"edit\", \"arguments\": \"{\\\"path\\\": \\\"a.rs\\\"}\"}}\n```";
+        let (_, calls) = recover_tool_calls_from_content(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "edit");
+    }
+
+    #[test]
+    fn recover_ignores_regular_json_without_tool_shape() {
+        let input = "the config is {\"model\": \"qwen3\"} right?";
+        let (clean, calls) = recover_tool_calls_from_content(input);
+        assert!(calls.is_empty());
+        assert!(clean.contains("{\"model\"}"), "clean was: {clean}");
+    }
+
+    #[test]
+    fn recover_returns_clean_text_when_nothing_matches() {
+        let input = "CTXhiddenCTXplain answer";
+        let (clean, calls) = recover_tool_calls_from_content(input);
+        assert!(calls.is_empty());
+        assert_eq!(clean, "plain answer");
+    }
+
+    #[test]
+    fn recover_handles_unterminated_think_followed_by_tool_json() {
+        // reasoning tag never closed, tool JSON after it — reasoning is
+        // dropped wholesale and the tool call is still recovered
+        let input = "CTXlong reasoning never closed\n{\"name\": \"bash\", \"arguments\": {\"command\": \"git_status\"}}";
+        let (clean, calls) = recover_tool_calls_from_content(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "bash");
+        assert_eq!(clean, "");
     }
 }
