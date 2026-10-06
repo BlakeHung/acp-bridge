@@ -590,24 +590,50 @@ pub async fn session_prompt(
 
         match chat_result {
             Ok(response) => {
-                let tool_calls = backend.extract_tool_calls(&response);
+                let mut tool_calls = backend.extract_tool_calls(&response);
 
+                // Thinking-mode workarounds (0.9.2): reasoning models
+                // sometimes embed the tool call inside the content
+                // channel instead of the structured `tool_calls` field.
+                // Recover it before giving up on dispatching this round.
                 if tool_calls.is_empty() {
-                    got_final_response = true;
-                    let text = backend.extract_response_text(&response);
-                    if !text.is_empty() {
-                        final_text = text.clone();
+                    let raw_text = backend.extract_response_text(&response);
+                    let (clean_text, recovered) = llm::recover_tool_calls_from_content(&raw_text);
+                    if !recovered.is_empty() {
+                        info!(
+                            round,
+                            count = recovered.len(),
+                            "Recovered tool calls embedded in content (thinking-mode workaround)"
+                        );
+                        tool_calls = recovered;
                         {
                             let mut sessions = state.sessions_write();
                             if let Some(session) = sessions.get_mut(session_id) {
-                                session
-                                    .messages
-                                    .push(json!({"role": "assistant", "content": &text}));
+                                let assistant_msg = backend.format_assistant_message(
+                                    &clean_text,
+                                    &tool_calls,
+                                    &response,
+                                );
+                                session.messages.push(assistant_msg);
                             }
                         }
-                        notify(Notification::TextChunk(text));
+                    } else {
+                        got_final_response = true;
+                        let text = clean_text;
+                        if !text.is_empty() {
+                            final_text = text.clone();
+                            {
+                                let mut sessions = state.sessions_write();
+                                if let Some(session) = sessions.get_mut(session_id) {
+                                    session
+                                        .messages
+                                        .push(json!({"role": "assistant", "content": &text}));
+                                }
+                            }
+                            notify(Notification::TextChunk(text));
+                        }
+                        break;
                     }
-                    break;
                 }
 
                 // Execute tool calls
