@@ -302,17 +302,16 @@ pub fn recover_tool_calls_from_content(text: &str) -> (String, Vec<Value>) {
     let mut esc = false;
     for (i, c) in bytes.iter().enumerate() {
         let c = *c as char;
-        if in_str {
-            if esc {
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else if c == '"' {
-                in_str = false;
-            }
-            continue;
-        }
         match c {
+            _ if in_str => {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            }
             '"' => in_str = true,
             '{' => {
                 if depth == 0 {
@@ -1484,11 +1483,10 @@ mod tests {
     }
 }
 
-
 // ---- thinking-tag tolerance (0.9.2) unit tests ----
+#[cfg(test)]
 mod thinking_recovery_tests {
     use super::*;
-    use crate::llm::{recover_tool_calls_from_content, strip_thinking_blocks};
 
     #[test]
     fn strip_removes_closed_blocks() {
@@ -1519,10 +1517,11 @@ mod thinking_recovery_tests {
         let (clean, calls) = recover_tool_calls_from_content(input);
         assert_eq!(calls.len(), 1, "calls were: {calls:?}");
         assert_eq!(calls[0]["function"]["name"], "read_file");
-        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["path"], "src/main.rs");
         assert!(!clean.contains("<think"), "clean was: {clean}");
-        assert!(clean.contains("```") == false, "clean was: {clean}");
+        assert!(!clean.contains("```"), "clean was: {clean}");
     }
 
     #[test]
@@ -1531,7 +1530,8 @@ mod thinking_recovery_tests {
         let (clean, calls) = recover_tool_calls_from_content(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "list_dir");
-        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["path"], "src");
         assert_eq!(clean, "");
     }

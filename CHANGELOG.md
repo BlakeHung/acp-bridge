@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-10-06
+
+### Added
+- **Thinking-mode tool-call recovery** — reasoning models (DeepSeek-R1,
+  Qwen 2.5/3, GLM) frequently emit tool-call JSON inside the content
+  channel instead of the structured `tool_calls` field. acp-bridge
+  previously treated such responses as a final text answer, meaning the
+  agent never dispatched the requested tool and the session stalled.
+  The engine now sanitizes the reasoning scaffolding
+  (`strip_thinking_blocks`) and recovers embedded tool-call JSON —
+  fenced \`\`\`json / \`\`\`tool_call blocks, bare balanced objects with
+  `name` + `arguments`/`args`/`parameters`/`input`, or the whole-call
+  `{"function": {…}}` shape — reproducing the OpenAI-style tool_call
+  objects the structured path would have produced. Recovered rounds
+  continue the normal agentic loop and are logged for debugging.
+  Eleven new unit tests (`thinking_recovery_tests`). Project page:
+  [wchung.tw/acp-bridge/](https://wchung.tw/acp-bridge/).
+
 ## [0.9.1] - 2026-10-03
 
 ### Fixed — ACP v2 wire-shape blockers

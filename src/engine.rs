@@ -609,8 +609,11 @@ pub async fn session_prompt(
                         {
                             let mut sessions = state.sessions_write();
                             if let Some(session) = sessions.get_mut(session_id) {
-                                let assistant_msg = backend
-                                    .format_assistant_message(&clean_text, &tool_calls, &response);
+                                let assistant_msg = backend.format_assistant_message(
+                                    &clean_text,
+                                    &tool_calls,
+                                    &response,
+                                );
                                 session.messages.push(assistant_msg);
                             }
                         }
