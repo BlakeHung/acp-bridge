@@ -281,25 +281,9 @@ pub fn recover_tool_calls_from_content(text: &str) -> (String, Vec<Value>) {
 
     let mut candidates: Vec<(usize, usize)> = Vec::new();
 
-    // fenced blocks are preferred signal // scan them first
-    let mut rest = scan_source;
-    while let Some(open) = rest.find(TRIPLE_TICK) {
-        let after = &rest[open + 3..];
-        let body_start = after.find(NEWLINE).map(|nl| nl + 1).unwrap_or(0);
-        let body = &after[body_start..];
-        match body.find(TRIPLE_TICK) {
-            Some(end) => {
-                candidates.push((
-                    scan_source.len() - rest.len() + open,
-                    scan_source.len() - rest.len() + open + 3 + body_start + end + 3,
-                ));
-                rest = &body[end + 3..];
-            }
-            None => break,
-        }
-    }
-
-    // bare balanced objects (string-aware depth scan)
+    // bare balanced objects (string-aware depth scan). Fenced ```json
+    // bodies are covered by this scan alone: the object span excludes the
+    // fence markers, so fenced_inner() is only needed for clean-text work.
     let bytes = scan_source.as_bytes();
     let mut depth = 0usize;
     let mut start = None;
