@@ -26,7 +26,7 @@ mod harness;
 use harness::{prompt, Agent};
 
 const THINK_TAG: &str = "\u{3c}think\u{3e}";
-const THINK_CLOSE: &str = "\u{3c}\/think\u{3e}";
+const THINK_CLOSE: &str = "\u{3c}\u{2f}think\u{3e}";
 
 #[derive(Default)]
 struct MockState {
