@@ -319,13 +319,11 @@ pub fn recover_tool_calls_from_content(text: &str) -> (String, Vec<Value>) {
                 }
                 depth += 1;
             }
-            '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                    if depth == 0 && start.is_some() {
-                        candidates.push((start.unwrap(), i + 1));
-                        start = None;
-                    }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 && start.is_some() {
+                    candidates.push((start.unwrap(), i + 1));
+                    start = None;
                 }
             }
             _ => {}
