@@ -945,7 +945,23 @@ pub async fn chat(
     let model = model_override.unwrap_or(&config.model);
     let body = build_body(config, messages, model, false, tools);
     let response = send_with_retry(config, &url, &body, "chat").await?;
-    response.json().await.map_err(|e| LlmError {
+    // A body cut off after a 2xx (connection dropped mid-read) is retried
+    // once; nothing from this round has reached the Client yet. Read errors
+    // come from `bytes()`; JSON errors are not retried.
+    let bytes = match response.bytes().await {
+        Err(e) => {
+            warn!(error = %e, "LLM response body truncated; retrying once");
+            send_with_retry(config, &url, &body, "chat")
+                .await?
+                .bytes()
+                .await
+        }
+        bytes => bytes,
+    };
+    let parsed = bytes
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()));
+    parsed.map_err(|e| LlmError {
         kind: LlmErrorKind::ParseError,
         message: format!("Failed to parse response as JSON: {e}"),
         status: None,
@@ -1491,6 +1507,38 @@ mod tests {
         let (text, done) = collect_stream(rx).await;
         assert_eq!(text, "foobar");
         assert!(done);
+    }
+
+    #[tokio::test]
+    async fn chat_retries_once_on_truncated_body() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let handler = move || {
+            let counter = counter.clone();
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Partial JSON, then an error once headers are flushed:
+                    // the server aborts the connection mid-body.
+                    let stream = futures_lite::stream::unfold(0, |step| async move {
+                        match step {
+                            0 => Some((Ok(r#"{"choices":"#.to_string()), 1)),
+                            1 => {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                Some((Err(std::io::Error::other("connection dropped")), 2))
+                            }
+                            _ => None,
+                        }
+                    });
+                    return Response::builder().body(Body::from_stream(stream)).unwrap();
+                }
+                Json(json!({"choices": [{"message": {"content": "ok"}}]})).into_response()
+            }
+        };
+        let url = serve(Router::new().route("/v1/chat/completions", post(handler))).await;
+        let cfg = test_config(&format!("{url}/v1"));
+        let response = chat(&cfg, &[], None, None).await.unwrap();
+        assert_eq!(response["choices"][0]["message"]["content"], "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

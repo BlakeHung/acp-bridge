@@ -8,7 +8,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
-- `session/cancel` aborts an active ACP prompt and reports cancellation on both wire versions; concurrent prompts for one session are rejected; a cancelled turn is closed in history with a `[cancelled by user]` reply.
+- `session/cancel` aborts an active ACP prompt and reports cancellation on both wire versions; concurrent prompts for one session are rejected; a cancelled turn is closed in history with a `[cancelled by user]` reply; an LLM response cut off mid-body is retried once.
 
 ## [0.9.2] - 2026-10-06
 
