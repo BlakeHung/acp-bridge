@@ -218,6 +218,8 @@ pub struct AppState {
     /// negotiated `protocol_version` after `initialize` without
     /// disturbing the live-spawned session map.
     pub sessions: Arc<RwLock<HashMap<String, Session>>>,
+    /// One cancellation channel per active ACP prompt. Shared across initialize clones.
+    pub turn_registry: Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     pub config: LlmConfig,
     /// ACP wire-format protocol version negotiated at `initialize`.
     /// All session(s) opened by this Client inherit this version; the
@@ -230,6 +232,7 @@ impl Clone for AppState {
     fn clone(&self) -> Self {
         Self {
             sessions: Arc::clone(&self.sessions),
+            turn_registry: Arc::clone(&self.turn_registry),
             config: self.config.clone(),
             protocol_version: self.protocol_version,
         }
@@ -240,6 +243,7 @@ impl AppState {
     pub fn new(config: LlmConfig) -> Arc<Self> {
         Arc::new(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config,
             // Default to V1 for safety. `main::run_acp_loop` overwrites
             // this with whatever the Client negotiated during
@@ -794,6 +798,19 @@ pub fn estimate_tokens(messages: &[Value]) -> u64 {
         })
         .sum();
     ((total_chars / 4) as u64).max(1)
+}
+
+/// Close a turn aborted by `session/cancel`. A trailing user message with
+/// no reply would put two user messages in a row on the next prompt,
+/// which chat templates that require alternating roles reject.
+pub fn session_cancelled(state: &AppState, session_id: &str) {
+    if let Some(session) = state.sessions_write().get_mut(session_id) {
+        if session.messages.last().is_some_and(|m| m["role"] == "user") {
+            session
+                .messages
+                .push(json!({"role": "assistant", "content": "[cancelled by user]"}));
+        }
+    }
 }
 
 /// Handle `session/end` — removes a session.

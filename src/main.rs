@@ -250,6 +250,7 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
+    let mut prompts = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
@@ -285,10 +286,10 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                             .get("sessionId")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
-                                        info!(
-                                            session_id = %sid,
-                                            "Received session/cancel notification (acknowledged; in-flight cancel not yet implemented)"
-                                        );
+                                        if let Some(cancel) = state.turn_registry.lock()
+                                            .expect("turn registry lock").get(sid) {
+                                            let _ = cancel.send(true);
+                                        }
                                     }
                                     _ => {
                                         debug!(method, "Ignoring unknown notification");
@@ -350,7 +351,25 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 }
                             }
                             "session/prompt" => {
-                                handle_acp_prompt(id, &params, &state).await;
+                                let sid = params.get("sessionId").and_then(Value::as_str)
+                                    .unwrap_or("").to_string();
+                                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                                {
+                                    let mut registry = state.turn_registry.lock().expect("turn registry lock");
+                                    if registry.contains_key(&sid) {
+                                        acp::send_error_with_data(&id, -32001,
+                                            "A turn is already in progress for this session; send session/cancel first",
+                                            json!({"reason": "turn_in_progress"}));
+                                        continue;
+                                    }
+                                    // Register before spawning: an immediately following cancel must see this turn.
+                                    registry.insert(sid, cancel_tx);
+                                }
+                                let state_task = Arc::clone(&state);
+                                while prompts.try_join_next().is_some() {}
+                                prompts.spawn(async move {
+                                    handle_acp_prompt(id, &params, &state_task, cancel_rx).await;
+                                });
                             }
                             "session/end" | "session/close" => {
                                 let session_id = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
@@ -475,10 +494,14 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received shutdown signal, exiting");
+                prompts.abort_all();
                 break;
             }
         }
     }
+
+    // In-flight prompts still answer: a Client may close stdin right after sending one.
+    while prompts.join_next().await.is_some() {}
 
     // Cleanup
     let session_count = state.cleanup();
@@ -487,14 +510,53 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
     }
 }
 
+fn emit_prompt_notification(version: ProtocolVersion, session_id: &str, notif: Notification) {
+    match notif {
+        Notification::Thinking => acp::notify_thinking_for(version, session_id),
+        Notification::ToolStart { id, name } => {
+            acp::notify_tool_start_for(version, session_id, &id, &name)
+        }
+        Notification::ToolDone { id, name, status } => {
+            acp::notify_tool_done_for(version, session_id, &id, &name, &status)
+        }
+        Notification::TextChunk(text) => acp::notify_text_for(version, session_id, &text),
+    }
+}
+
 /// Handle ACP session/prompt — runs engine and streams notifications to stdout.
-async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>) {
+async fn handle_acp_prompt(
+    id: RequestId,
+    params: &Value,
+    state: &Arc<AppState>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    struct TurnGuard<'a> {
+        state: &'a AppState,
+        session_id: &'a str,
+    }
+    impl Drop for TurnGuard<'_> {
+        fn drop(&mut self) {
+            self.state
+                .turn_registry
+                .lock()
+                .expect("turn registry lock")
+                .remove(self.session_id);
+        }
+    }
+    let guard = TurnGuard {
+        state,
+        session_id: params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    };
     let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
             let err = AcpError::MissingParam {
                 field: "sessionId".into(),
             };
+            drop(guard);
             acp::send_error(&id, err.code(), &err.to_string());
             return;
         }
@@ -524,6 +586,7 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
         let err = AcpError::MissingParam {
             field: "prompt (expected non-empty text or image content)".into(),
         };
+        drop(guard);
         acp::send_error(&id, err.code(), &err.to_string());
         return;
     }
@@ -553,7 +616,7 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
     let state_clone = Arc::clone(state);
     let sid = session_id.clone();
     let mid = message_id.clone();
-    let handle = tokio::spawn(async move {
+    let mut handle = tokio::spawn(async move {
         engine::session_prompt(
             &state_clone,
             &sid,
@@ -565,23 +628,41 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
         .await
     });
 
-    // Drain notifications to ACP stdout. Each notification is routed
-    // through the `_for` dispatcher so v2 Clients receive v2-shaped
-    // payloads (e.g. `tool_call_update` instead of `tool_call`) and v1
-    // Clients receive the legacy shapes they were written against.
-    while let Some(notif) = notify_rx.recv().await {
-        match notif {
-            Notification::Thinking => acp::notify_thinking_for(state.protocol_version, &session_id),
-            Notification::ToolStart { id, name } => {
-                acp::notify_tool_start_for(state.protocol_version, &session_id, &id, &name)
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            // `changed` also fires for a cancel sent before this task first polls.
+            _ = cancel_rx.changed() => {
+                handle.abort();
+                // Wait for the engine to release its session access before accepting another turn.
+                let _ = (&mut handle).await;
+                engine::session_cancelled(state, &session_id);
+                while let Ok(notif) = notify_rx.try_recv() {
+                    emit_prompt_notification(state.protocol_version, &session_id, notif);
+                }
+                cancelled = true;
+                break;
             }
-            Notification::ToolDone { id, name, status } => {
-                acp::notify_tool_done_for(state.protocol_version, &session_id, &id, &name, &status)
-            }
-            Notification::TextChunk(text) => {
-                acp::notify_text_for(state.protocol_version, &session_id, &text)
+            notif = notify_rx.recv() => {
+                match notif {
+                    Some(notif) => emit_prompt_notification(state.protocol_version, &session_id, notif),
+                    None => break,
+                }
             }
         }
+    }
+    if cancelled {
+        drop(guard);
+        if state.protocol_version == ProtocolVersion::V2 {
+            acp::notify_state_idle_for(state.protocol_version, &session_id, Some("cancelled"));
+            acp::send_response(&id, json!({"messageId": message_id}));
+        } else {
+            acp::send_response(
+                &id,
+                json!({"stopReason": "cancelled", "status": "cancelled", "text": ""}),
+            );
+        }
+        return;
     }
 
     let result = handle.await.unwrap_or_else(|_| engine::PromptResult {
@@ -596,6 +677,8 @@ async fn handle_acp_prompt(id: RequestId, params: &Value, state: &Arc<AppState>)
         error_retryable: false,
         message_id: message_id.clone(),
     });
+
+    drop(guard);
 
     // If the engine returned a protocol error (e.g. unknown session), send JSON-RPC error
     if let Some(err) = &result.error {
