@@ -800,6 +800,19 @@ pub fn estimate_tokens(messages: &[Value]) -> u64 {
     ((total_chars / 4) as u64).max(1)
 }
 
+/// Close a turn aborted by `session/cancel`. A trailing user message with
+/// no reply would put two user messages in a row on the next prompt,
+/// which chat templates that require alternating roles reject.
+pub fn session_cancelled(state: &AppState, session_id: &str) {
+    if let Some(session) = state.sessions_write().get_mut(session_id) {
+        if session.messages.last().is_some_and(|m| m["role"] == "user") {
+            session
+                .messages
+                .push(json!({"role": "assistant", "content": "[cancelled by user]"}));
+        }
+    }
+}
+
 /// Handle `session/end` — removes a session.
 pub fn session_end(state: &AppState, session_id: &str) -> Result<(), AcpError> {
     let removed = state.sessions_write().remove(session_id).is_some();

@@ -124,10 +124,13 @@ async fn cancel_and_follow_up_work_on_both_wire_versions() {
     for version in [1, 2] {
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let signal = entered.clone();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let recorded = bodies.clone();
         let app = router().route(
             "/v1/chat/completions",
-            post(move || {
+            post(move |axum::Json(body): axum::Json<Value>| {
                 let signal = signal.clone();
+                recorded.lock().unwrap().push(body);
                 async move {
                     signal.notify_one();
                     std::future::pending::<axum::Json<Value>>().await
@@ -166,10 +169,40 @@ async fn cancel_and_follow_up_work_on_both_wire_versions() {
                 );
             }
         }
+        // The cancelled turn must not leave two user messages in a row for the follow-up.
+        let roles: Vec<Value> = bodies.lock().unwrap()[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].clone())
+            .collect();
+        assert!(
+            roles
+                .windows(2)
+                .all(|w| w != [json!("user"), json!("user")]),
+            "{roles:?}"
+        );
         // Prompt and cancel written back-to-back: the flag can predate the handler's first poll.
         client.prompt(&sid, 6);
         client.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}}));
         let (_, response) = client.response(6);
         assert!(response.get("error").is_none());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_answers_after_stdin_closes() {
+    let app = router().route(
+        "/v1/chat/completions",
+        post(|| async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            axum::Json(json!({"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}))
+        }),
+    );
+    let mut client = Client::start(app, false, 1).await;
+    let sid = client.session();
+    client.prompt(&sid, 2);
+    client.child.stdin.take();
+    let (_, response) = client.response(2);
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
 }

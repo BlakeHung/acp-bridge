@@ -250,6 +250,7 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
+    let mut prompts = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
@@ -365,7 +366,8 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                     registry.insert(sid, cancel_tx);
                                 }
                                 let state_task = Arc::clone(&state);
-                                tokio::spawn(async move {
+                                while prompts.try_join_next().is_some() {}
+                                prompts.spawn(async move {
                                     handle_acp_prompt(id, &params, &state_task, cancel_rx).await;
                                 });
                             }
@@ -492,10 +494,14 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received shutdown signal, exiting");
+                prompts.abort_all();
                 break;
             }
         }
     }
+
+    // In-flight prompts still answer: a Client may close stdin right after sending one.
+    while prompts.join_next().await.is_some() {}
 
     // Cleanup
     let session_count = state.cleanup();
@@ -625,15 +631,12 @@ async fn handle_acp_prompt(
     let mut cancelled = false;
     loop {
         tokio::select! {
-            // borrow_and_update catches cancellation delivered before this task first polls.
-            _ = async {
-                if !*cancel_rx.borrow_and_update() {
-                    let _ = cancel_rx.changed().await;
-                }
-            } => {
+            // `changed` also fires for a cancel sent before this task first polls.
+            _ = cancel_rx.changed() => {
                 handle.abort();
                 // Wait for the engine to release its session access before accepting another turn.
                 let _ = (&mut handle).await;
+                engine::session_cancelled(state, &session_id);
                 while let Ok(notif) = notify_rx.try_recv() {
                     emit_prompt_notification(state.protocol_version, &session_id, notif);
                 }
