@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `session/cancel` aborts an active ACP prompt and reports cancellation on both wire versions; concurrent prompts for one session are rejected.
+
 ## [0.9.2] - 2026-10-06
 
 ### Added
