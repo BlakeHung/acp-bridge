@@ -36,7 +36,7 @@ spec-compliant v2 payloads.
 | `initialize` | ✅ | Negotiates v1/v2; emits the corresponding `agentCapabilities` + `agentInfo` shape (v1) or `capabilities` + `info` shape (v2) |
 | `session/new` | ✅ | Multi-session with per-session conversation history. `mcpServers` accepted but ignored (acp-bridge does not relay MCP) |
 | `session/prompt` | ✅ | Streaming via SSE → `session/update` notifications. v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` (per schema) |
-| `session/cancel` notification | ✅ | Acknowledged with a log line; in-flight cancellation is not yet implemented |
+| `session/cancel` notification | ✅ | Aborts active LLM requests and reports cancellation on both wire versions. Synchronous tools finish before cancellation takes effect |
 | `session/end` (v1) / `session/close` (v2 baseline) | ✅ | Removes the session and frees its history. Both methods share the same implementation |
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |
 | Streaming `agent_message_chunk` | ✅ | Typed `content: {type: "text", text: …}`. v1 and v2 use the same discriminator |
@@ -119,9 +119,6 @@ above are a safety net for Clients that don't.
 
 ## Roadmap
 
-- **`session/cancel` cancellation.** Acknowledge the notification and
-  propagate cancellation into the in-flight LLM request (currently the
-  in-flight prompt is allowed to run to completion).
 - **Optional MCP relay.** Opt-in via config to honor `mcpServers` in
   `session/new`.
 - **ACP v2 `agent_message` upsert.** Currently acp-bridge emits the
