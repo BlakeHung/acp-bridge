@@ -40,6 +40,17 @@ pub struct LlmSection {
     /// `usage_update` notifications.
     #[serde(default)]
     pub model_context: Option<u64>,
+    /// Max tool-call rounds per turn (`0` = unlimited). Mirrors
+    /// `LLM_MAX_TOOL_ROUNDS`.
+    #[serde(default)]
+    pub max_tool_rounds: Option<usize>,
+    /// Timeout in seconds for one `bash` tool call (`0` = none). Mirrors
+    /// `LLM_BASH_TIMEOUT`.
+    #[serde(default)]
+    pub bash_timeout_secs: Option<u64>,
+    /// Stream agent-loop responses. Mirrors `LLM_STREAM`.
+    #[serde(default)]
+    pub stream: Option<bool>,
 }
 
 impl ConfigFile {
@@ -134,6 +145,22 @@ impl ConfigFile {
             .or(file.model_context)
             .unwrap_or(32768);
 
+        let max_tool_rounds = std::env::var("LLM_MAX_TOOL_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.max_tool_rounds)
+            .unwrap_or(crate::llm::DEFAULT_MAX_TOOL_ROUNDS);
+
+        let bash_timeout_secs = std::env::var("LLM_BASH_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.bash_timeout_secs)
+            .unwrap_or(crate::llm::DEFAULT_BASH_TIMEOUT_SECS);
+
+        let stream = crate::llm::parse_bool_env("LLM_STREAM")
+            .or(file.stream)
+            .unwrap_or(true);
+
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(4)
@@ -153,6 +180,9 @@ impl ConfigFile {
             session_idle_timeout_secs,
             prompt_supports_image,
             context_size,
+            max_tool_rounds,
+            bash_timeout_secs,
+            stream,
             client,
         }
     }

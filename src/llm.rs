@@ -509,6 +509,10 @@ pub async fn query_running_models(config: &LlmConfig) -> Option<Vec<String>> {
         return None;
     }
     let val: Value = resp.json().await.ok()?;
+    // Only a genuine Ollama `/api/ps` reply has a `models` array. Other
+    // servers (LM Studio, vLLM) may answer this path with 200 and some
+    // other JSON; treat that as "unknown" rather than "nothing loaded".
+    val.get("models")?.as_array()?;
     Some(json_names(&val, "models", "name"))
 }
 
@@ -520,6 +524,23 @@ pub struct ModelInfo {
 const MAX_RETRIES: u32 = 3;
 /// Initial backoff delay in milliseconds (doubles each retry).
 const INITIAL_BACKOFF_MS: u64 = 500;
+
+/// Default maximum number of tool-call rounds per prompt turn.
+/// `0` (via config/env) means unlimited.
+pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 100;
+
+/// Parse a boolean env var (`1/true/yes/on`, `0/false/no/off`).
+pub fn parse_bool_env(key: &str) -> Option<bool> {
+    match std::env::var(key).ok()?.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Default timeout for a single `bash` tool call, in seconds.
+/// `0` (via config/env) disables the timeout.
+pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub struct LlmConfig {
@@ -548,11 +569,37 @@ pub struct LlmConfig {
     /// still display the percentage used.
     /// Override via `LLM_MODEL_CONTEXT` env var; defaults to 32768.
     pub context_size: u64,
+    /// Maximum tool-call rounds per prompt turn before the turn is
+    /// aborted with `max_turn_requests`. `0` = unlimited. Override via
+    /// `LLM_MAX_TOOL_ROUNDS`; defaults to [`DEFAULT_MAX_TOOL_ROUNDS`].
+    pub max_tool_rounds: usize,
+    /// Timeout in seconds for one `bash` tool call; the command's process
+    /// group is killed when it elapses. `0` = no timeout. Override via
+    /// `LLM_BASH_TIMEOUT`; defaults to [`DEFAULT_BASH_TIMEOUT_SECS`].
+    pub bash_timeout_secs: u64,
+    /// Stream responses in the agent loop (live text / reasoning, tool
+    /// calls assembled from deltas). Set `LLM_STREAM=false` for backends
+    /// that cannot stream together with `tools`.
+    pub stream: bool,
     /// Shared HTTP client for connection pooling.
     pub client: Client,
 }
 
 impl LlmConfig {
+    /// Effective tool-round cap (`usize::MAX` when configured as `0`).
+    pub fn tool_round_cap(&self) -> usize {
+        if self.max_tool_rounds == 0 {
+            usize::MAX
+        } else {
+            self.max_tool_rounds
+        }
+    }
+
+    /// Effective `bash` timeout (`None` when configured as `0`).
+    pub fn bash_timeout(&self) -> Option<std::time::Duration> {
+        (self.bash_timeout_secs > 0).then(|| std::time::Duration::from_secs(self.bash_timeout_secs))
+    }
+
     /// Returns the backend family inferred from the configured base URL.
     pub fn backend(&self) -> Backend {
         Backend::from_url(&self.base_url)
@@ -630,6 +677,15 @@ impl LlmConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32768),
+            max_tool_rounds: std::env::var("LLM_MAX_TOOL_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MAX_TOOL_ROUNDS),
+            bash_timeout_secs: std::env::var("LLM_BASH_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS),
+            stream: parse_bool_env("LLM_STREAM").unwrap_or(true),
             client,
         }
     }
@@ -775,31 +831,44 @@ impl LlmError {
 
 const MAX_STREAM_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 
+/// Accumulates raw stream bytes and yields complete lines.
+///
+/// Bytes are buffered undecoded and each *line* is decoded once complete,
+/// so a multi-byte UTF-8 character split across network chunks is not
+/// mangled into replacement characters.
 #[derive(Default)]
 struct LineBuffer {
-    data: String,
+    data: Vec<u8>,
 }
 
 impl LineBuffer {
     fn push(&mut self, chunk: &[u8]) -> bool {
-        let chunk = String::from_utf8_lossy(chunk);
         if self.data.len() + chunk.len() > MAX_STREAM_BUFFER_SIZE {
             return false;
         }
-        self.data.push_str(&chunk);
+        self.data.extend_from_slice(chunk);
         true
     }
 
     fn next_line(&mut self) -> Option<String> {
-        let newline_pos = self.data.find('\n').or_else(|| self.data.find('\r'))?;
-        let skip = if self.data[newline_pos..].starts_with("\r\n") {
+        let newline_pos = self.data.iter().position(|&b| b == b'\n' || b == b'\r')?;
+        let skip = if self.data[newline_pos..].starts_with(b"\r\n") {
             2
         } else {
             1
         };
-        let line = self.data[..newline_pos].trim_end().to_string();
+        let line = String::from_utf8_lossy(&self.data[..newline_pos])
+            .trim_end()
+            .to_string();
         self.data.drain(..newline_pos + skip);
         Some(line)
+    }
+
+    /// Whatever is left after the stream ends (a final line with no newline).
+    fn take_rest(&mut self) -> String {
+        let rest = String::from_utf8_lossy(&self.data).trim().to_string();
+        self.data.clear();
+        rest
     }
 }
 
@@ -1110,8 +1179,506 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
 
     let _ = tx.send(StreamChunk::Done).await;
 }
+
+// ---------------------------------------------------------------------------
+// Streaming chat with tool-call assembly (agent loop)
+// ---------------------------------------------------------------------------
+
+/// A live delta from a streamed chat response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDelta {
+    /// User-visible answer text.
+    Content(String),
+    /// Model reasoning (`reasoning_content`, Ollama `thinking`, or text
+    /// inside `<think>`-style tags in the content channel).
+    Reasoning(String),
+}
+
+/// Splits a streamed content channel into answer text and `<think>`-style
+/// reasoning, tolerating tags that are split across chunks.
+#[derive(Default)]
+pub struct ThinkSplitter {
+    in_think: bool,
+    /// Closing tag to look for while `in_think`.
+    close_tag: &'static str,
+    /// Held-back text that may be the start of a tag.
+    pending: String,
+}
+
+const THINK_TAGS: [(&str, &str); 3] = [
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<thought>", "</thought>"),
+];
+
+impl ThinkSplitter {
+    /// Feed a content delta; returns the resulting deltas in order.
+    pub fn feed(&mut self, chunk: &str) -> Vec<StreamDelta> {
+        let mut out = Vec::new();
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.push_str(chunk);
+        loop {
+            if self.in_think {
+                if let Some(pos) = buf.find(self.close_tag) {
+                    push_delta(&mut out, StreamDelta::Reasoning(buf[..pos].to_string()));
+                    buf = buf[pos + self.close_tag.len()..].to_string();
+                    self.in_think = false;
+                    continue;
+                }
+                let keep = partial_suffix_len(&buf, &[self.close_tag]);
+                let emit_to = buf.len() - keep;
+                push_delta(&mut out, StreamDelta::Reasoning(buf[..emit_to].to_string()));
+                self.pending = buf[emit_to..].to_string();
+                return out;
+            }
+            let next_open = THINK_TAGS
+                .iter()
+                .filter_map(|(o, c)| buf.find(o).map(|p| (p, *o, *c)))
+                .min_by_key(|(p, _, _)| *p);
+            if let Some((pos, open, close)) = next_open {
+                push_delta(&mut out, StreamDelta::Content(buf[..pos].to_string()));
+                buf = buf[pos + open.len()..].to_string();
+                self.in_think = true;
+                self.close_tag = close;
+                continue;
+            }
+            let opens: Vec<&str> = THINK_TAGS.iter().map(|(o, _)| *o).collect();
+            let keep = partial_suffix_len(&buf, &opens);
+            let emit_to = buf.len() - keep;
+            push_delta(&mut out, StreamDelta::Content(buf[..emit_to].to_string()));
+            self.pending = buf[emit_to..].to_string();
+            return out;
+        }
+    }
+
+    /// Flush held-back text at end of stream.
+    pub fn finish(&mut self) -> Vec<StreamDelta> {
+        let rest = std::mem::take(&mut self.pending);
+        let mut out = Vec::new();
+        if self.in_think {
+            push_delta(&mut out, StreamDelta::Reasoning(rest));
+        } else {
+            push_delta(&mut out, StreamDelta::Content(rest));
+        }
+        out
+    }
+}
+
+fn push_delta(out: &mut Vec<StreamDelta>, d: StreamDelta) {
+    match &d {
+        StreamDelta::Content(t) | StreamDelta::Reasoning(t) if t.is_empty() => {}
+        _ => out.push(d),
+    }
+}
+
+/// Length of the longest suffix of `buf` that is a proper prefix of any tag.
+fn partial_suffix_len(buf: &str, tags: &[&str]) -> usize {
+    let mut best = 0;
+    for tag in tags {
+        for len in (1..tag.len()).rev() {
+            if len <= buf.len() && buf.is_char_boundary(buf.len() - len) && tag.starts_with(&buf[buf.len() - len..]) {
+                best = best.max(len);
+                break;
+            }
+        }
+    }
+    best
+}
+
+/// Accumulates a streamed response into the same JSON shape the
+/// non-streaming endpoint returns, so the agent loop can treat both alike.
+#[derive(Default)]
+struct StreamAssembler {
+    content: String,
+    reasoning: String,
+    /// OpenAI tool calls keyed by `index`, arguments concatenated.
+    tool_calls: Vec<Value>,
+    finish_reason: Option<String>,
+    splitter: ThinkSplitter,
+}
+
+impl StreamAssembler {
+    fn on_content<F: FnMut(StreamDelta)>(&mut self, text: &str, on_delta: &mut F) {
+        if text.is_empty() {
+            return;
+        }
+        self.content.push_str(text);
+        for d in self.splitter.feed(text) {
+            on_delta(d);
+        }
+    }
+
+    fn on_reasoning<F: FnMut(StreamDelta)>(&mut self, text: &str, on_delta: &mut F) {
+        if text.is_empty() {
+            return;
+        }
+        self.reasoning.push_str(text);
+        on_delta(StreamDelta::Reasoning(text.to_string()));
+    }
+
+    /// Merge an OpenAI `delta.tool_calls` fragment.
+    fn on_openai_tool_delta(&mut self, frag: &Value) {
+        let index = frag.get("index").and_then(|i| i.as_u64()).unwrap_or(self.tool_calls.len() as u64) as usize;
+        while self.tool_calls.len() <= index {
+            self.tool_calls.push(json!({
+                "id": "", "type": "function",
+                "function": {"name": "", "arguments": ""}
+            }));
+        }
+        let call = &mut self.tool_calls[index];
+        if let Some(id) = frag.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                call["id"] = json!(id);
+            }
+        }
+        if let Some(f) = frag.get("function") {
+            if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
+                let cur = call["function"]["name"].as_str().unwrap_or("").to_string();
+                call["function"]["name"] = json!(cur + name);
+            }
+            match f.get("arguments") {
+                Some(Value::String(a)) => {
+                    let cur = call["function"]["arguments"].as_str().unwrap_or("").to_string();
+                    call["function"]["arguments"] = json!(cur + a);
+                }
+                Some(other @ Value::Object(_)) => call["function"]["arguments"] = other.clone(),
+                _ => {}
+            }
+        }
+    }
+
+    fn finish<F: FnMut(StreamDelta)>(&mut self, on_delta: &mut F) {
+        for d in self.splitter.finish() {
+            on_delta(d);
+        }
+        // Calls that never received an id get a stable synthetic one.
+        for (i, call) in self.tool_calls.iter_mut().enumerate() {
+            if call["id"].as_str().unwrap_or("").is_empty() {
+                call["id"] = json!(format!("call_{i}"));
+            }
+        }
+    }
+
+    fn into_openai_response(self) -> Value {
+        let mut message = json!({"role": "assistant", "content": self.content});
+        if !self.tool_calls.is_empty() {
+            if self.content.is_empty() {
+                message["content"] = Value::Null;
+            }
+            message["tool_calls"] = json!(self.tool_calls);
+        }
+        json!({"choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": self.finish_reason.unwrap_or_else(|| "stop".into()),
+        }]})
+    }
+
+    fn into_ollama_response(self) -> Value {
+        let mut message = json!({"role": "assistant", "content": self.content});
+        if !self.reasoning.is_empty() {
+            message["thinking"] = json!(self.reasoning);
+        }
+        if !self.tool_calls.is_empty() {
+            message["tool_calls"] = json!(self.tool_calls);
+        }
+        json!({"message": message, "done": true})
+    }
+}
+
+fn stream_error(message: String) -> LlmError {
+    LlmError {
+        kind: LlmErrorKind::Unknown,
+        message,
+        status: None,
+    }
+}
+
+/// Streaming chat completion with tool support.
+///
+/// Sends `stream: true`, forwards answer text and reasoning to `on_delta`
+/// as it arrives, and returns the assembled response in the same shape as
+/// [`chat`] (OpenAI `choices[0].message` / Ollama `message`), including
+/// fully assembled `tool_calls`. A server that ignores `stream` and returns
+/// a plain JSON body is handled too.
+pub async fn chat_streaming<F: FnMut(StreamDelta) + Send>(
+    config: &LlmConfig,
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    mut on_delta: F,
+) -> Result<Value, LlmError> {
+    let url = config.chat_url();
+    let native = config.is_ollama_native();
+    let body = build_body(config, messages, &config.model, true, tools);
+    let mut response = send_with_retry(config, &url, &body, "chat_stream").await?;
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_stream = content_type.contains("event-stream") || content_type.contains("ndjson");
+
+    let mut asm = StreamAssembler::default();
+
+    if !is_stream {
+        // Server ignored `stream: true` — parse the whole body.
+        let bytes = response.bytes().await.map_err(|e| LlmError::from_reqwest(&e, &url))?;
+        let parsed: Value = serde_json::from_slice(&bytes).map_err(|e| LlmError {
+            kind: LlmErrorKind::ParseError,
+            message: format!("Failed to parse response as JSON: {e}"),
+            status: None,
+        })?;
+        let msg = if native {
+            parsed.get("message")
+        } else {
+            parsed.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"))
+        };
+        if let Some(msg) = msg {
+            for key in ["reasoning_content", "reasoning", "thinking"] {
+                if let Some(r) = msg.get(key).and_then(|v| v.as_str()) {
+                    on_delta(StreamDelta::Reasoning(r.to_string()));
+                }
+            }
+            if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
+                let mut splitter = ThinkSplitter::default();
+                for d in splitter.feed(c).into_iter().chain(splitter.finish()) {
+                    on_delta(d);
+                }
+            }
+        }
+        return Ok(parsed);
+    }
+
+    let mut buffer = LineBuffer::default();
+    let mut done = false;
+    while !done {
+        let chunk = match response.chunk().await {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => return Err(LlmError::from_reqwest(&e, &url)),
+        };
+        if !buffer.push(&chunk) {
+            return Err(stream_error("Stream buffer overflow".into()));
+        }
+        while let Some(line) = buffer.next_line() {
+            if native {
+                done = handle_ollama_line(&line, &mut asm, &mut on_delta)?;
+            } else {
+                done = handle_sse_line(&line, &mut asm, &mut on_delta)?;
+            }
+            if done {
+                break;
+            }
+        }
+    }
+    if !done {
+        let rest = buffer.take_rest();
+        if !rest.is_empty() {
+            if native {
+                handle_ollama_line(&rest, &mut asm, &mut on_delta)?;
+            } else {
+                handle_sse_line(&rest, &mut asm, &mut on_delta)?;
+            }
+        }
+    }
+
+    asm.finish(&mut on_delta);
+    Ok(if native {
+        asm.into_ollama_response()
+    } else {
+        asm.into_openai_response()
+    })
+}
+
+/// Handle one SSE line. Returns `Ok(true)` on `[DONE]`.
+fn handle_sse_line<F: FnMut(StreamDelta)>(
+    line: &str,
+    asm: &mut StreamAssembler,
+    on_delta: &mut F,
+) -> Result<bool, LlmError> {
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(false);
+    };
+    let data = data.trim_start();
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+        return Ok(false);
+    };
+    if let Some(err) = parsed.get("error") {
+        let msg = err.get("message").and_then(|m| m.as_str()).map(str::to_string).unwrap_or_else(|| err.to_string());
+        return Err(stream_error(format!("Backend error in stream: {msg}")));
+    }
+    let Some(choice) = parsed.get("choices").and_then(|c| c.get(0)) else {
+        return Ok(false);
+    };
+    if let Some(delta) = choice.get("delta") {
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(r) = delta.get(key).and_then(|v| v.as_str()) {
+                asm.on_reasoning(r, on_delta);
+            }
+        }
+        if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+            asm.on_content(c, on_delta);
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            for frag in calls {
+                asm.on_openai_tool_delta(frag);
+            }
+        }
+    }
+    if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+        asm.finish_reason = Some(fr.to_string());
+    }
+    Ok(false)
+}
+
+/// Handle one Ollama NDJSON line. Returns `Ok(true)` when `done`.
+fn handle_ollama_line<F: FnMut(StreamDelta)>(
+    line: &str,
+    asm: &mut StreamAssembler,
+    on_delta: &mut F,
+) -> Result<bool, LlmError> {
+    if line.is_empty() {
+        return Ok(false);
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(line) else {
+        return Ok(false);
+    };
+    if let Some(err) = parsed.get("error") {
+        let msg = err.as_str().map(str::to_string).unwrap_or_else(|| err.to_string());
+        return Err(stream_error(format!("Backend error in stream: {msg}")));
+    }
+    if let Some(msg) = parsed.get("message") {
+        if let Some(t) = msg.get("thinking").and_then(|v| v.as_str()) {
+            asm.on_reasoning(t, on_delta);
+        }
+        if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
+            asm.on_content(c, on_delta);
+        }
+        if let Some(calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+            asm.tool_calls.extend(calls.iter().cloned());
+        }
+    }
+    Ok(parsed.get("done").and_then(|d| d.as_bool()) == Some(true))
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn collect(splitter: &mut ThinkSplitter, chunks: &[&str]) -> Vec<StreamDelta> {
+        let mut out: Vec<StreamDelta> = Vec::new();
+        for c in chunks {
+            out.extend(splitter.feed(c));
+        }
+        out.extend(splitter.finish());
+        // merge adjacent same-kind deltas for easy assertions
+        let mut merged: Vec<StreamDelta> = Vec::new();
+        for d in out {
+            match (merged.last_mut(), d) {
+                (Some(StreamDelta::Content(a)), StreamDelta::Content(b)) => a.push_str(&b),
+                (Some(StreamDelta::Reasoning(a)), StreamDelta::Reasoning(b)) => a.push_str(&b),
+                (_, d) => merged.push(d),
+            }
+        }
+        merged
+    }
+
+    #[test]
+    fn think_splitter_handles_tags_split_across_chunks() {
+        let mut sp = ThinkSplitter::default();
+        let out = collect(&mut sp, &["Hi <th", "ink>plan", " it</thi", "nk> done"]);
+        assert_eq!(
+            out,
+            vec![
+                StreamDelta::Content("Hi ".into()),
+                StreamDelta::Reasoning("plan it".into()),
+                StreamDelta::Content(" done".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn think_splitter_passes_plain_text_and_lone_angle_brackets() {
+        let mut sp = ThinkSplitter::default();
+        let out = collect(&mut sp, &["if a <", " b { x }"]);
+        assert_eq!(out, vec![StreamDelta::Content("if a < b { x }".into())]);
+    }
+
+    #[test]
+    fn sse_assembly_builds_tool_calls_and_forwards_deltas() {
+        let mut asm = StreamAssembler::default();
+        let mut seen: Vec<StreamDelta> = Vec::new();
+        let mut cb = |d: StreamDelta| seen.push(d);
+        let lines = [
+            r#"data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"think"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"Let me look."}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"list_dir","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\": "}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\".\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let mut done = false;
+        for l in lines {
+            done = handle_sse_line(l, &mut asm, &mut cb).unwrap();
+        }
+        assert!(done);
+        asm.finish(&mut cb);
+        let resp = asm.into_openai_response();
+        let msg = &resp["choices"][0]["message"];
+        assert_eq!(msg["content"], "Let me look.");
+        assert_eq!(msg["tool_calls"][0]["id"], "call_a");
+        assert_eq!(msg["tool_calls"][0]["function"]["name"], "list_dir");
+        assert_eq!(msg["tool_calls"][0]["function"]["arguments"], "{\"path\": \".\"}");
+        assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            seen,
+            vec![
+                StreamDelta::Reasoning("think".into()),
+                StreamDelta::Content("Let me look.".into())
+            ]
+        );
+        // The engine extracts tool calls from the assembled shape unchanged.
+        assert_eq!(Backend::OpenAi.extract_tool_calls(&resp).len(), 1);
+    }
+
+    #[test]
+    fn sse_error_event_becomes_llm_error() {
+        let mut asm = StreamAssembler::default();
+        let mut cb = |_d: StreamDelta| {};
+        let err = handle_sse_line(r#"data: {"error":{"message":"context length exceeded"}}"#, &mut asm, &mut cb)
+            .unwrap_err();
+        assert!(err.message.contains("context length exceeded"));
+    }
+
+    #[test]
+    fn line_buffer_keeps_utf8_split_across_chunks() {
+        let mut b = LineBuffer::default();
+        let bytes = "data: héllo 🙂\n".as_bytes();
+        // split inside the multi-byte 'é'
+        let cut = "data: h".len() + 1;
+        assert!(b.push(&bytes[..cut]));
+        assert!(b.next_line().is_none());
+        assert!(b.push(&bytes[cut..]));
+        assert_eq!(b.next_line().as_deref(), Some("data: héllo 🙂"));
+    }
+
+    #[test]
+    fn zero_means_unlimited_for_rounds_and_bash_timeout() {
+        let mut c = LlmConfig::from_env();
+        c.max_tool_rounds = 0;
+        c.bash_timeout_secs = 0;
+        assert_eq!(c.tool_round_cap(), usize::MAX);
+        assert_eq!(c.bash_timeout(), None);
+        c.max_tool_rounds = 7;
+        c.bash_timeout_secs = 3;
+        assert_eq!(c.tool_round_cap(), 7);
+        assert_eq!(c.bash_timeout(), Some(std::time::Duration::from_secs(3)));
+    }
     use super::*;
     use axum::body::Body;
     use axum::response::{IntoResponse, Response};
@@ -1194,6 +1761,9 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,
             context_size: 32768,
+            max_tool_rounds: crate::llm::DEFAULT_MAX_TOOL_ROUNDS,
+            bash_timeout_secs: crate::llm::DEFAULT_BASH_TIMEOUT_SECS,
+            stream: true,
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()

@@ -196,3 +196,53 @@ fn acp_error_codes() {
     assert_eq!(limit.code(), -32004);
     assert!(limit.to_string().contains("10"));
 }
+
+#[test]
+fn trim_history_never_orphans_tool_results() {
+    // Agent turns carry assistant tool_calls + tool results; trimming must
+    // cut at user messages only.
+    let mut messages = vec![json!({"role": "system", "content": "sys"})];
+    for i in 0..3 {
+        messages.push(json!({"role": "user", "content": format!("q{i}")}));
+        messages.push(json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": format!("c{i}"), "type": "function",
+                "function": {"name": "list_dir", "arguments": "{}"}}]}));
+        messages.push(json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "x"}));
+        messages.push(json!({"role": "assistant", "content": format!("a{i}")}));
+    }
+    let mut session = make_session(messages);
+    session.trim_history(2);
+    assert_eq!(session.messages.len(), 1 + 2 * 4);
+    assert_eq!(session.messages[1]["content"], "q1");
+    assert_eq!(session.messages[2]["tool_calls"][0]["id"], "c1");
+    assert_eq!(session.messages[3]["role"], "tool");
+}
+
+#[test]
+fn trim_history_to_token_budget_drops_oldest_turns_but_keeps_latest() {
+    let big = "x".repeat(4000); // ~1000 tokens
+    let mut session = make_session(vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "q0"}),
+        json!({"role": "assistant", "content": big.clone()}),
+        json!({"role": "user", "content": "q1"}),
+        json!({"role": "assistant", "content": big.clone()}),
+        json!({"role": "user", "content": "q2"}),
+        json!({"role": "assistant", "content": big.clone()}),
+    ]);
+    // Budget fits ~2 turns.
+    let removed = session.trim_history_to(0, Some(2100));
+    assert_eq!(removed, 2);
+    assert_eq!(session.messages[1]["content"], "q1");
+    // A budget smaller than the latest turn still keeps the latest turn.
+    session.trim_history_to(0, Some(10));
+    assert_eq!(session.messages.len(), 3);
+    assert_eq!(session.messages[1]["content"], "q2");
+}
+
+#[test]
+fn estimate_counts_tool_call_arguments() {
+    let m = json!({"role": "assistant", "content": null, "tool_calls": [{
+        "function": {"name": "write_file", "arguments": "y".repeat(400)}}]});
+    assert!(acp_bridge::protocol::estimate_message_tokens(&m) >= 100);
+}

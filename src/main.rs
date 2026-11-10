@@ -513,13 +513,34 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
 fn emit_prompt_notification(version: ProtocolVersion, session_id: &str, notif: Notification) {
     match notif {
         Notification::Thinking => acp::notify_thinking_for(version, session_id),
-        Notification::ToolStart { id, name } => {
-            acp::notify_tool_start_for(version, session_id, &id, &name)
-        }
-        Notification::ToolDone { id, name, status } => {
-            acp::notify_tool_done_for(version, session_id, &id, &name, &status)
-        }
+        Notification::ToolStart {
+            id,
+            name,
+            input,
+            location,
+        } => acp::notify_tool_start_for(
+            version,
+            session_id,
+            &id,
+            &name,
+            input.as_ref(),
+            location.as_deref(),
+        ),
+        Notification::ToolDone {
+            id,
+            name,
+            status,
+            output,
+        } => acp::notify_tool_done_for(
+            version,
+            session_id,
+            &id,
+            &name,
+            &status,
+            output.as_deref(),
+        ),
         Notification::TextChunk(text) => acp::notify_text_for(version, session_id, &text),
+        Notification::ThoughtChunk(text) => acp::notify_thought_text(session_id, &text),
     }
 }
 
@@ -603,11 +624,7 @@ async fn handle_acp_prompt(
     // Clients can surface a meaningful name in their session list. Done
     // before spawning the engine task because `user_text` is moved into
     // the task below.
-    let derived_title = user_text
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.trim().chars().take(80).collect::<String>())
-        .filter(|s: &String| !s.is_empty());
+    let derived_title = engine::derive_prompt_title(&prompt_value);
 
     // Set up notification channel for ACP streaming
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Notification>();

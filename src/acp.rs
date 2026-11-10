@@ -93,6 +93,18 @@ pub fn notify_thinking(session_id: &str) {
     );
 }
 
+/// Stream a piece of model reasoning as `agent_thought_chunk`. The shape is
+/// identical on the v1 and v2 wire.
+pub fn notify_thought_text(session_id: &str, text: &str) {
+    send_session_update(
+        session_id,
+        json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": text}
+        }),
+    );
+}
+
 /// Map an acp-bridge tool name to the ACP `ToolKind` enum.
 ///
 /// ACP v1 defines the kind as one of `read | edit | delete | move | search |
@@ -122,21 +134,105 @@ pub fn kind_for_tool(name: &str) -> &'static str {
     }
 }
 
+/// Maximum bytes of tool output forwarded to the Client in a
+/// `tool_call_update`. The full result still goes to the LLM.
+const TOOL_OUTPUT_PREVIEW_BYTES: usize = 8 * 1024;
+
+/// Build a human-readable tool-call title from the tool name and its
+/// arguments, so Clients show *what* runs (`git status`, the bash command,
+/// `Read src/main.rs`) rather than just the tool name.
+pub fn tool_title(name: &str, input: Option<&Value>) -> String {
+    let arg = |k: &str| {
+        input
+            .and_then(|v| v.get(k))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let title = match name {
+        "bash" | "shell" | "exec" => arg("command"),
+        "read_file" => arg("path").map(|p| format!("Read {p}")),
+        "list_dir" => arg("path").map(|p| format!("List {p}")),
+        "write_file" => arg("path").map(|p| format!("Write {p}")),
+        "edit" => arg("path").map(|p| format!("Edit {p}")),
+        "search_code" | "search" | "grep" => arg("pattern").map(|p| format!("Search \"{p}\"")),
+        "web_fetch" | "fetch" | "http_get" => arg("url").map(|u| format!("Fetch {u}")),
+        "git_status" => Some("git status".into()),
+        "git_diff" => Some("git diff".into()),
+        "git_log" => Some("git log".into()),
+        "git_commit" => arg("message").map(|m| {
+            let first = m.lines().next().unwrap_or("").to_string();
+            format!("git commit -m \"{first}\"")
+        }),
+        _ => None,
+    };
+    let title = title.unwrap_or_else(|| name.to_string());
+    // Keep titles to a single readable line.
+    let one_line = title.replace('\n', " ⏎ ");
+    if one_line.chars().count() > 200 {
+        let mut t: String = one_line.chars().take(199).collect();
+        t.push('…');
+        t
+    } else {
+        one_line
+    }
+}
+
+fn tool_start_payload(
+    session_update: &str,
+    tool_call_id: &str,
+    name: &str,
+    input: Option<&Value>,
+    location: Option<&str>,
+) -> Value {
+    let mut payload = json!({
+        "sessionUpdate": session_update,
+        "toolCallId": tool_call_id,
+        "title": tool_title(name, input),
+        "kind": kind_for_tool(name),
+        "status": "in_progress"
+    });
+    if let Some(input) = input {
+        payload["rawInput"] = input.clone();
+    }
+    if let Some(path) = location {
+        payload["locations"] = json!([{ "path": path }]);
+    }
+    payload
+}
+
+fn truncate_output(output: &str) -> String {
+    if output.len() <= TOOL_OUTPUT_PREVIEW_BYTES {
+        return output.to_string();
+    }
+    let mut end = TOOL_OUTPUT_PREVIEW_BYTES;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n… [truncated, {} bytes total]",
+        &output[..end],
+        output.len()
+    )
+}
+
 /// Notify a tool_call start.
 ///
 /// `tool_call_id` is required by ACP v1: clients use it to pair subsequent
 /// `tool_call_update` notifications with the originating tool call. Without
-/// it the client cannot render a coherent per-tool timeline.
-pub fn notify_tool_start(session_id: &str, tool_call_id: &str, title: &str) {
+/// it the client cannot render a coherent per-tool timeline. `input` is
+/// forwarded as `rawInput` and used to derive a descriptive `title`;
+/// `location` (absolute path) is forwarded as `locations`.
+pub fn notify_tool_start(
+    session_id: &str,
+    tool_call_id: &str,
+    name: &str,
+    input: Option<&Value>,
+    location: Option<&str>,
+) {
     send_session_update(
         session_id,
-        json!({
-            "sessionUpdate": "tool_call",
-            "toolCallId": tool_call_id,
-            "title": title,
-            "kind": kind_for_tool(title),
-            "status": "in_progress"
-        }),
+        tool_start_payload("tool_call", tool_call_id, name, input, location),
     );
 }
 
@@ -144,17 +240,29 @@ pub fn notify_tool_start(session_id: &str, tool_call_id: &str, title: &str) {
 ///
 /// `tool_call_id` is required. `status` is one of `pending | in_progress |
 /// completed | failed`. Spec-compliant clients ignore notifications whose
-/// toolCallId they have not seen.
-pub fn notify_tool_done(session_id: &str, tool_call_id: &str, title: &str, status: &str) {
-    send_session_update(
-        session_id,
-        json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": tool_call_id,
-            "title": title,
-            "status": status
-        }),
-    );
+/// toolCallId they have not seen. When `output` is given it is attached
+/// as `rawOutput` and as a text `content` block (truncated for display).
+pub fn notify_tool_done(
+    session_id: &str,
+    tool_call_id: &str,
+    _name: &str,
+    status: &str,
+    output: Option<&str>,
+) {
+    let mut payload = json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_call_id,
+        "status": status
+    });
+    if let Some(output) = output {
+        let preview = truncate_output(output);
+        payload["rawOutput"] = json!({ "output": preview });
+        payload["content"] = json!([{
+            "type": "content",
+            "content": { "type": "text", "text": preview }
+        }]);
+    }
+    send_session_update(session_id, payload);
 }
 
 /// One entry in an `agent_plan` notification.
@@ -361,41 +469,31 @@ pub fn notify_tool_start_for(
     version: ProtocolVersion,
     session_id: &str,
     tool_call_id: &str,
-    title: &str,
+    name: &str,
+    input: Option<&Value>,
+    location: Option<&str>,
 ) {
     match version {
-        ProtocolVersion::V2 => notify_tool_start_v2(session_id, tool_call_id, title),
-        _ => notify_tool_start(session_id, tool_call_id, title),
+        ProtocolVersion::V2 => send_session_update(
+            session_id,
+            tool_start_payload("tool_call_update", tool_call_id, name, input, location),
+        ),
+        _ => notify_tool_start(session_id, tool_call_id, name, input, location),
     }
-}
-
-fn notify_tool_start_v2(session_id: &str, tool_call_id: &str, title: &str) {
-    send_session_update(
-        session_id,
-        json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": tool_call_id,
-            "title": title,
-            "kind": kind_for_tool(title),
-            "status": "in_progress"
-        }),
-    );
 }
 
 /// Dispatch a tool-call update (status change). The v1 and v2 shapes
 /// are both `tool_call_update` and same schema, so this dispatcher just
 /// routes.
 pub fn notify_tool_done_for(
-    version: ProtocolVersion,
+    _version: ProtocolVersion,
     session_id: &str,
     tool_call_id: &str,
-    title: &str,
+    name: &str,
     status: &str,
+    output: Option<&str>,
 ) {
-    match version {
-        ProtocolVersion::V2 => notify_tool_done(session_id, tool_call_id, title, status),
-        _ => notify_tool_done(session_id, tool_call_id, title, status),
-    }
+    notify_tool_done(session_id, tool_call_id, name, status, output)
 }
 
 /// Dispatch a plan update.
@@ -576,6 +674,40 @@ pub fn notify_state_idle_for(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tool_title_surfaces_bash_command_and_paths() {
+        let cmd = json!({"command": "swift build -c release"});
+        assert_eq!(tool_title("bash", Some(&cmd)), "swift build -c release");
+        assert_eq!(
+            tool_title("read_file", Some(&json!({"path": "Sources/App.swift"}))),
+            "Read Sources/App.swift"
+        );
+        assert_eq!(tool_title("git_status", Some(&json!({}))), "git status");
+        assert_eq!(tool_title("bash", None), "bash");
+        assert_eq!(tool_title("bash", Some(&json!({"command": "a\nb"}))), "a ⏎ b");
+    }
+
+    #[test]
+    fn tool_start_payload_includes_raw_input_and_locations() {
+        let input = json!({"path": "a.swift"});
+        let p = tool_start_payload("tool_call", "tc1", "read_file", Some(&input), Some("/x/a.swift"));
+        assert_eq!(p["title"], "Read a.swift");
+        assert_eq!(p["kind"], "read");
+        assert_eq!(p["rawInput"], input);
+        assert_eq!(p["locations"][0]["path"], "/x/a.swift");
+        let bare = tool_start_payload("tool_call", "llm", "llm_chat", None, None);
+        assert!(bare.get("rawInput").is_none() && bare.get("locations").is_none());
+    }
+
+    #[test]
+    fn truncate_output_caps_and_respects_char_boundaries() {
+        assert_eq!(truncate_output("short"), "short");
+        let long = "é".repeat(TOOL_OUTPUT_PREVIEW_BYTES);
+        let t = truncate_output(&long);
+        assert!(t.contains("[truncated,"));
+        assert!(t.len() < long.len());
+    }
     use super::*;
 
     #[test]

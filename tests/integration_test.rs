@@ -454,19 +454,17 @@ async fn test_session_prompt_streaming() {
     let full_text: String = text_chunks.join("");
     assert_eq!(full_text, "Hello world");
 
-    // Verify thinking + tool notifications exist
+    // Verify thinking notification exists, and that a plain-text turn
+    // emits no tool notifications (there is no synthetic `llm_chat` entry).
     let has_thinking = notifications
         .iter()
         .any(|m| m["params"]["update"]["sessionUpdate"] == "agent_thought_chunk");
-    let has_tool_start = notifications
-        .iter()
-        .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call");
-    let has_tool_done = notifications
-        .iter()
-        .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update");
+    let has_tool = notifications.iter().any(|m| {
+        let k = &m["params"]["update"]["sessionUpdate"];
+        k == "tool_call" || k == "tool_call_update"
+    });
     assert!(has_thinking, "Should have thinking notification");
-    assert!(has_tool_start, "Should have tool_call notification");
-    assert!(has_tool_done, "Should have tool_call_update notification");
+    assert!(!has_tool, "Plain-text turn should not emit tool notifications");
 
     assert_eq!(response["result"]["status"], "completed");
 
@@ -1317,10 +1315,13 @@ async fn test_initialize_does_not_advertise_image_by_default() {
 /// without it the per-tool timeline collapses and rendering degrades.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_call_notification_carries_tool_call_id_and_kind() {
-    std::env::set_var("LLM_SCENARIO", "tool_round_trip");
-
     let port = free_port();
-    let mut h = TestHarness::start(port).await;
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_tool_call_router(),
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
 
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
     let resp = h.read_line();
@@ -1373,6 +1374,15 @@ async fn test_tool_call_notification_carries_tool_call_id_and_kind() {
         assert!(status.is_some(), "tool_call must include status, got {n}");
         assert_eq!(status.unwrap(), "in_progress");
         assert!(title.is_some(), "tool_call must include title, got {n}");
+        assert_ne!(
+            title.unwrap(),
+            "llm_chat",
+            "synthetic llm_chat entry must not be emitted"
+        );
+        assert!(
+            update.get("rawInput").is_some(),
+            "tool_call must include rawInput, got {n}"
+        );
     }
 
     // Every tool_call_update must also carry toolCallId and a valid status.
