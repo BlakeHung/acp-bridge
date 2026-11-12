@@ -113,6 +113,9 @@ pub fn notify_thought_text(session_id: &str, text: &str) {
 /// back to `"other"` so clients still render the tool call instead of
 /// dropping it on the floor.
 pub fn kind_for_tool(name: &str) -> &'static str {
+    // MCP tools that collided with another name are exposed as
+    // `<server>__<tool>`; classify by the tool part.
+    let name = name.rsplit("__").next().unwrap_or(name);
     match name {
         // File inspection
         "read_file" | "list_dir" => "read",
@@ -128,6 +131,17 @@ pub fn kind_for_tool(name: &str) -> &'static str {
         // Clients that group "execute" tools together (Zed's terminal
         // affordance) get a sensible default.
         "git_status" | "git_diff" | "git_log" | "git_commit" => "execute",
+        // Xcode's MCP tools (`xcrun mcpbridge`)
+        "XcodeRead" | "XcodeLS" | "XcodeGlob" | "GetBuildLog" | "GetTestList"
+        | "GetConsoleOutput" | "XcodeRefreshCodeIssuesInFile" | "GetTargetBuildSettings"
+        | "XcodeListWorkspaces" | "XcodeListSchemes" | "XcodeListTargets" => "read",
+        "XcodeWrite" | "XcodeUpdate" | "XcodeMakeDir" | "AddInfoPlist" | "AddEntitlement"
+        | "UpdateTargetBuildSetting" | "UpdateFileCompilerFlags" => "edit",
+        "XcodeRM" => "delete",
+        "XcodeMV" => "move",
+        "XcodeGrep" | "DocumentationSearch" => "search",
+        "BuildProject" | "RunAllTests" | "RunSomeTests" | "RunProject" | "StopProject"
+        | "RenderPreview" | "RunCodeSnippet" | "InvokeDebuggerCommand" => "execute",
         // Everything else (delete/move/think are not yet in the default
         // toolset but we list the enum values for completeness).
         _ => "other",
@@ -149,7 +163,8 @@ pub fn tool_title(name: &str, input: Option<&Value>) -> String {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    let title = match name {
+    let base = name.rsplit("__").next().unwrap_or(name);
+    let title = match base {
         "bash" | "shell" | "exec" => arg("command"),
         "read_file" => arg("path").map(|p| format!("Read {p}")),
         "list_dir" => arg("path").map(|p| format!("List {p}")),
@@ -164,6 +179,29 @@ pub fn tool_title(name: &str, input: Option<&Value>) -> String {
             let first = m.lines().next().unwrap_or("").to_string();
             format!("git commit -m \"{first}\"")
         }),
+        // Xcode's MCP tools
+        "BuildProject" => Some("Build project".into()),
+        "RunAllTests" => Some("Run all tests".into()),
+        "RunSomeTests" => Some(match input.and_then(|v| v.get("tests")).and_then(Value::as_array) {
+            Some(t) if !t.is_empty() => format!("Run tests ({})", t.len()),
+            _ => "Run tests".into(),
+        }),
+        "RunProject" => Some("Run app".into()),
+        "StopProject" => Some("Stop app".into()),
+        "GetBuildLog" => Some("Build log".into()),
+        "XcodeRefreshCodeIssuesInFile" => {
+            arg("filePath").map(|p| format!("Check issues in {p}"))
+        }
+        "XcodeRead" => arg("filePath").map(|p| format!("Read {p}")),
+        "XcodeWrite" => arg("filePath").map(|p| format!("Write {p}")),
+        "XcodeUpdate" => arg("filePath").map(|p| format!("Edit {p}")),
+        "XcodeRM" => arg("path").map(|p| format!("Remove {p}")),
+        "XcodeLS" => arg("path").map(|p| format!("List {p}")),
+        "XcodeGrep" => arg("pattern").map(|p| format!("Search \"{p}\"")),
+        "DocumentationSearch" => arg("query").map(|q| format!("Search docs \"{q}\"")),
+        "RenderPreview" => arg("sourceFilePath")
+            .or_else(|| arg("filePath"))
+            .map(|p| format!("Render preview {p}")),
         _ => None,
     };
     let title = title.unwrap_or_else(|| name.to_string());

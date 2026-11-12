@@ -281,6 +281,10 @@ pub struct AppState {
     /// emit helpers (`acp::notify_*`) branch on it so v1 Clients see
     /// v1 notifications and v2 Clients see v2.
     pub protocol_version: crate::protocol::ProtocolVersion,
+    /// How the Client's `mcpServers` (and Xcode's tool server) are handled.
+    pub mcp: crate::mcp::McpConfig,
+    /// `clientInfo.name` / `title` from `initialize`, used to detect Xcode.
+    pub client_name: Option<String>,
 }
 
 impl Clone for AppState {
@@ -290,12 +294,18 @@ impl Clone for AppState {
             turn_registry: Arc::clone(&self.turn_registry),
             config: self.config.clone(),
             protocol_version: self.protocol_version,
+            mcp: self.mcp.clone(),
+            client_name: self.client_name.clone(),
         }
     }
 }
 
 impl AppState {
     pub fn new(config: LlmConfig) -> Arc<Self> {
+        Self::with_mcp(config, crate::mcp::McpConfig::default())
+    }
+
+    pub fn with_mcp(config: LlmConfig, mcp: crate::mcp::McpConfig) -> Arc<Self> {
         Arc::new(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -305,6 +315,8 @@ impl AppState {
             // `initialize`. We pick V1 here so unit tests that build an
             // AppState directly get v1 wire format without ceremony.
             protocol_version: crate::protocol::ProtocolVersion::V1,
+            mcp,
+            client_name: None,
         })
     }
 
@@ -434,7 +446,10 @@ pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::Protoco
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "agentCapabilities": {
-                    "promptCapabilities": prompt_capabilities_v1
+                    "promptCapabilities": prompt_capabilities_v1,
+                    // stdio MCP servers (the ACP baseline) are relayed;
+                    // http / sse transports are not.
+                    "mcpCapabilities": {"http": false, "sse": false}
                 },
                 "authMethods": []
             })
@@ -451,6 +466,19 @@ pub fn session_new(
     state: &AppState,
     cwd: &str,
     protocol_version: crate::protocol::ProtocolVersion,
+) -> Result<String, AcpError> {
+    session_new_with_mcp(state, cwd, protocol_version, None)
+}
+
+/// [`session_new`] plus the Client's `mcpServers` param. The servers
+/// (and Xcode's tool server, see [`crate::mcp::resolve_servers`]) start
+/// connecting in the background; their tools join the built-in ones from
+/// the first prompt on.
+pub fn session_new_with_mcp(
+    state: &AppState,
+    cwd: &str,
+    protocol_version: crate::protocol::ProtocolVersion,
+    mcp_servers: Option<&Value>,
 ) -> Result<String, AcpError> {
     // Enforce max_sessions limit
     if state.config.max_sessions > 0 {
@@ -480,11 +508,23 @@ pub fn session_new(
         })
     });
 
-    let session = Session::new(
+    let mut session = Session::new(
         json!({"role": "system", "content": system_prompt}),
         PathBuf::from(&cwd),
         protocol_version,
     );
+    let specs =
+        crate::mcp::resolve_servers(&state.mcp, mcp_servers, state.client_name.as_deref());
+    if !specs.is_empty() {
+        let set = crate::mcp::McpSet::start(
+            specs,
+            PathBuf::from(&cwd),
+            state.mcp.clone(),
+            state.config.context_size,
+        );
+        info!(session_id = %session_id, servers = ?set.server_names(), "Starting MCP servers");
+        session.mcp = Some(set);
+    }
     state.sessions_write().insert(session_id.clone(), session);
 
     info!(session_id = %session_id, max_history = state.config.max_history_turns, "New session");
@@ -614,7 +654,7 @@ pub async fn session_prompt(
         {
             let removed = session.trim_history_to(
                 state.config.max_history_turns,
-                Some(history_token_budget(&state.config)),
+                Some(history_token_budget(&state.config, &tools::tool_definitions())),
             );
             if removed > 0 {
                 debug!(removed, "Trimmed conversation history");
@@ -624,11 +664,20 @@ pub async fn session_prompt(
 
     notify(Notification::Thinking);
 
+    let mcp = state
+        .sessions_read()
+        .get(session_id)
+        .and_then(|s| s.mcp.clone());
+    if let Some(mcp) = &mcp {
+        prepare_mcp(state, session_id, mcp, &notify).await;
+    }
+
     let mut had_error = false;
     let mut got_final_response = false;
     let mut final_text = String::new();
     let mut last_error_class: Option<crate::llm::LlmErrorKind> = None;
-    let tool_defs = tools::tool_definitions();
+    let builtin_defs = tools::tool_definitions();
+    let mut tool_defs = builtin_defs.clone();
 
     // Tool call loop
     let max_rounds = state.config.max_tool_rounds;
@@ -636,15 +685,21 @@ pub async fn session_prompt(
     // a later round is separated from earlier commentary.
     let mut emitted_any_text = false;
     for round in 0..state.config.tool_round_cap() {
+        // MCP servers may change their tool list between rounds
+        // (`notifications/tools/list_changed`).
+        if let Some(mcp) = &mcp {
+            tool_defs = builtin_defs.clone();
+            tool_defs.extend(mcp.tool_definitions().await);
+        }
+        let budget = history_token_budget(&state.config, &tool_defs);
         let (messages, working_dir) = {
             let mut sessions = state.sessions_write();
             match sessions.get_mut(session_id) {
                 Some(s) => {
                     // Tool rounds grow the history within a turn; drop
                     // older turns (never the current one) to stay in budget.
-                    if round > 0 {
-                        let removed =
-                            s.trim_history_to(0, Some(history_token_budget(&state.config)));
+                    if round > 0 || mcp.is_some() {
+                        let removed = s.trim_history_to(0, Some(budget));
                         if removed > 0 {
                             info!(round, removed, "Trimmed older turns to fit context budget");
                         }
@@ -771,7 +826,13 @@ pub async fn session_prompt(
                     };
                     let tool_call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
 
-                    let location = args.get("path").and_then(|p| p.as_str()).map(|p| {
+                    // Xcode's tools take project-navigator paths, not
+                    // filesystem paths, so only built-ins get a location.
+                    let location = args
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .filter(|_| crate::mcp::is_builtin_tool(name))
+                        .map(|p| {
                         let p = std::path::Path::new(p);
                         if p.is_absolute() {
                             p.display().to_string()
@@ -787,13 +848,22 @@ pub async fn session_prompt(
                     });
                     // Async + cancellable: a `session/cancel` aborts this
                     // future and kills the command's process group.
-                    let result = tools::execute_tool_async(
-                        &working_dir,
-                        name,
-                        &args,
-                        state.config.bash_timeout(),
-                    )
-                    .await;
+                    let mcp_result = match &mcp {
+                        Some(mcp) => mcp.call(name, &args).await,
+                        None => None,
+                    };
+                    let result = match mcp_result {
+                        Some(r) => r,
+                        None => {
+                            tools::execute_tool_async(
+                                &working_dir,
+                                name,
+                                &args,
+                                state.config.bash_timeout(),
+                            )
+                            .await
+                        }
+                    };
                     notify(Notification::ToolDone {
                         id: tool_call_id.to_string(),
                         name: name.into(),
@@ -893,10 +963,56 @@ pub async fn session_prompt(
     }
 }
 
-/// Token budget for conversation history: 75% of the model context,
-/// leaving room for the tool definitions and the model's reply.
-fn history_token_budget(config: &crate::llm::LlmConfig) -> u64 {
-    config.context_size / 4 * 3
+/// Token budget for conversation history: 75% of the model context minus
+/// the tool definitions sent with every request, leaving the rest for the
+/// model's reply. Never below 1/4 of the context, so a large tool set
+/// cannot starve the conversation entirely.
+fn history_token_budget(config: &crate::llm::LlmConfig, tool_defs: &[Value]) -> u64 {
+    let tools: u64 = tool_defs.iter().map(|d| (d.to_string().len() / 4) as u64).sum();
+    (config.context_size / 4 * 3)
+        .saturating_sub(tools)
+        .max(config.context_size / 4)
+}
+
+/// Wait for the session's MCP servers, report any that failed to start
+/// (as a thought, once), and append their tool guidance to the system
+/// prompt the first time tools are available.
+async fn prepare_mcp(
+    state: &AppState,
+    session_id: &str,
+    mcp: &crate::mcp::McpSet,
+    notify: &impl Fn(Notification),
+) {
+    // Servers connect in the background from `session/new`; Xcode's can
+    // take a while the first time. Say so instead of stalling silently.
+    if !mcp.is_ready() && !mcp.wait_ready(Duration::from_millis(1500)).await {
+        let what = if mcp.has_xcode() { "Xcode tools" } else { "MCP tools" };
+        notify(Notification::ThoughtChunk(format!("Connecting to {what}…\n")));
+        // Bounded by the servers' connect timeout.
+        mcp.wait_connected().await;
+    }
+    for failure in mcp.take_failures().await {
+        notify(Notification::ThoughtChunk(format!(
+            "acp-bridge: MCP server unavailable ({failure})\n"
+        )));
+    }
+    let applied = state
+        .sessions_read()
+        .get(session_id)
+        .is_none_or(|s| s.mcp_prompt_applied);
+    if applied {
+        return;
+    }
+    let Some(addendum) = mcp.system_prompt_addendum().await else {
+        return;
+    };
+    let mut sessions = state.sessions_write();
+    if let Some(s) = sessions.get_mut(session_id) {
+        s.mcp_prompt_applied = true;
+        if let Some(Value::String(content)) = s.messages.first_mut().and_then(|m| m.get_mut("content")) {
+            content.push_str(&addendum);
+        }
+    }
 }
 
 /// Rough token estimate from a list of chat messages. Sums the textual

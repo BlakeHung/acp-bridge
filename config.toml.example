@@ -22,7 +22,7 @@ model = "gemma4:26b"
 # max_tokens = 4096
 
 # HTTP timeout in seconds
-timeout_secs = 300
+timeout_secs = 300   # idle timeout: fail after this long with no data from the backend (0 = none)
 
 # Max conversation turns to keep (0 = unlimited). A turn = one user prompt
 # plus its tool calls/results and answer. History is also trimmed to 75%
@@ -41,6 +41,19 @@ max_history_turns = 50
 # Timeout in seconds for one bash tool call (default 120, 0 = none).
 # The command's whole process group is killed on timeout or cancel.
 # bash_timeout_secs = 120
+
+# ---------------------------------------------------------------------------
+# MCP relay — tools from the Client's mcpServers (e.g. Xcode's xcrun mcpbridge)
+# Env vars LLM_MCP, LLM_XCODE_TOOLS, LLM_MCP_TOOLS, LLM_MCP_EXCLUDE_TOOLS and
+# LLM_MCP_TOOL_TIMEOUT take precedence.
+# ---------------------------------------------------------------------------
+# [mcp]
+# enabled = true              # relay stdio mcpServers from session/new
+# xcode_tools = "auto"        # auto | on | off — add xcrun mcpbridge if missing
+# tools = ["Build*", "Run*Tests", "GetBuildLog", "XcodeRefreshCodeIssuesInFile"]
+# exclude_tools = ["GetTop*", "DeviceInteraction*"]
+# tool_timeout_secs = 600     # per MCP tool call, 0 = none
+# connect_timeout_secs = 120  # MCP handshake (Xcode can take 15-40 s), 0 = none
 
 # ---------------------------------------------------------------------------
 # Client mode — spawn an external ACP agent (used with --client flag)

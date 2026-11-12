@@ -93,6 +93,11 @@ pub struct Session {
     /// on it so a v2 Client gets v2-shaped notifications even if a v1
     /// Client later connects to the same process.
     pub protocol_version: ProtocolVersion,
+    /// MCP servers the Client passed in `session/new` (e.g. Xcode's tool
+    /// server). Their processes live as long as the session.
+    pub mcp: Option<std::sync::Arc<crate::mcp::McpSet>>,
+    /// Whether the MCP tool guidance has been appended to the system prompt.
+    pub mcp_prompt_applied: bool,
 }
 
 impl Session {
@@ -106,6 +111,8 @@ impl Session {
             last_active: Instant::now(),
             working_dir,
             protocol_version,
+            mcp: None,
+            mcp_prompt_applied: false,
         }
     }
 

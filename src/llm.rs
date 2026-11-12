@@ -538,6 +538,24 @@ pub fn parse_bool_env(key: &str) -> Option<bool> {
     }
 }
 
+/// HTTP client for the LLM backend.
+///
+/// `timeout_secs` (`LLM_TIMEOUT`) is an *idle* timeout: the request fails
+/// only when the backend sends nothing for that long. It is deliberately
+/// not a total deadline — a streamed agent turn with long reasoning on a
+/// local model can legitimately run for many minutes, and a total deadline
+/// cut such responses off mid-body ("error decoding response body").
+/// `0` disables it. Connecting is bounded separately (30 s).
+pub fn build_http_client(timeout_secs: u64) -> Client {
+    let mut b = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(4);
+    if timeout_secs > 0 {
+        b = b.read_timeout(Duration::from_secs(timeout_secs));
+    }
+    b.build().expect("Failed to create HTTP client")
+}
+
 /// Default timeout for a single `bash` tool call, in seconds.
 /// `0` (via config/env) disables the timeout.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
@@ -632,11 +650,7 @@ impl LlmConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .pool_max_idle_per_host(4)
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = build_http_client(timeout_secs);
 
         Self {
             base_url: std::env::var("LLM_BASE_URL")
@@ -2004,6 +2018,65 @@ mod tests {
     }
 
     // -- streaming ----------------------------------------------------------
+
+    /// Serve one SSE response by hand: headers, then `chunks` content
+    /// deltas `gap` apart, then (unless `stall`) `[DONE]`.
+    async fn slow_sse_server(chunks: usize, gap: Duration, stall: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n")
+                .await;
+            for _ in 0..chunks {
+                tokio::time::sleep(gap).await;
+                let ev = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n";
+                if sock.write_all(ev.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            if stall {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            let _ = sock.write_all(b"data: [DONE]\n\n").await;
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn llm_timeout_is_idle_not_total_for_streams() {
+        // 6 chunks 400 ms apart = 2.4 s total, with a 1 s timeout: the
+        // backend is never silent for 1 s, so the stream must complete.
+        let url = slow_sse_server(6, Duration::from_millis(400), false).await;
+        let mut cfg = test_config(&url);
+        cfg.timeout_secs = 1;
+        cfg.client = build_http_client(1);
+        let mut text = String::new();
+        let r = chat_streaming(&cfg, &[json!({"role": "user", "content": "hi"})], None, |d| {
+            if let StreamDelta::Content(t) = d {
+                text.push_str(&t);
+            }
+        })
+        .await;
+        assert!(r.is_ok(), "stream should not hit a total deadline: {:?}", r.err().map(|e| e.message));
+        assert_eq!(text, "aaaaaa");
+    }
+
+    #[tokio::test]
+    async fn llm_timeout_still_fires_when_backend_goes_silent() {
+        let url = slow_sse_server(1, Duration::from_millis(10), true).await;
+        let mut cfg = test_config(&url);
+        cfg.timeout_secs = 1;
+        cfg.client = build_http_client(1);
+        let started = std::time::Instant::now();
+        let r = chat_streaming(&cfg, &[json!({"role": "user", "content": "hi"})], None, |_| {}).await;
+        assert!(r.is_err(), "a silent backend must time out");
+        assert!(started.elapsed() < Duration::from_secs(9));
+    }
 
     async fn collect_stream(mut rx: mpsc::Receiver<StreamChunk>) -> (String, bool) {
         let mut text = String::new();

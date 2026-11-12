@@ -9,14 +9,75 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::llm::LlmConfig;
-use reqwest::Client;
-use std::time::Duration;
 
 /// On-disk config file structure.
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
     #[serde(default)]
     pub llm: LlmSection,
+    #[serde(default)]
+    pub mcp: McpSection,
+}
+
+/// `[mcp]` — relaying the Client's MCP servers (e.g. Xcode's tools).
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct McpSection {
+    /// Honour `mcpServers` from `session/new`. Mirrors `LLM_MCP`.
+    pub enabled: Option<bool>,
+    /// `auto` | `on` | `off`. Mirrors `LLM_XCODE_TOOLS`.
+    pub xcode_tools: Option<String>,
+    /// Only expose these MCP tools (`*` wildcard). Mirrors `LLM_MCP_TOOLS`.
+    pub tools: Option<Vec<String>>,
+    /// Never expose these MCP tools. Mirrors `LLM_MCP_EXCLUDE_TOOLS`.
+    pub exclude_tools: Option<Vec<String>>,
+    /// Timeout for one MCP tool call (`0` = none). Mirrors `LLM_MCP_TOOL_TIMEOUT`.
+    pub tool_timeout_secs: Option<u64>,
+    /// Max time for an MCP server's handshake (`0` = none). Mirrors
+    /// `LLM_MCP_CONNECT_TIMEOUT`.
+    pub connect_timeout_secs: Option<u64>,
+}
+
+/// Build the MCP relay config: env var > `[mcp]` section > default.
+pub fn mcp_config(file: Option<&McpSection>) -> crate::mcp::McpConfig {
+    use crate::mcp::{parse_list, McpConfig, XcodeMode};
+    let file = file.cloned().unwrap_or_default();
+    let defaults = McpConfig::default();
+    let xcode = std::env::var("LLM_XCODE_TOOLS")
+        .ok()
+        .or(file.xcode_tools)
+        .map(|v| {
+            XcodeMode::parse(&v).unwrap_or_else(|| {
+                warn!(value = %v, "Invalid LLM_XCODE_TOOLS (expected auto|on|off), using auto");
+                XcodeMode::Auto
+            })
+        })
+        .unwrap_or(defaults.xcode);
+    McpConfig {
+        enabled: crate::llm::parse_bool_env("LLM_MCP")
+            .or(file.enabled)
+            .unwrap_or(defaults.enabled),
+        xcode,
+        include: std::env::var("LLM_MCP_TOOLS")
+            .ok()
+            .map(|v| parse_list(&v))
+            .or(file.tools)
+            .unwrap_or_default(),
+        exclude: std::env::var("LLM_MCP_EXCLUDE_TOOLS")
+            .ok()
+            .map(|v| parse_list(&v))
+            .or(file.exclude_tools)
+            .unwrap_or_default(),
+        tool_timeout_secs: std::env::var("LLM_MCP_TOOL_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.tool_timeout_secs)
+            .unwrap_or(defaults.tool_timeout_secs),
+        connect_timeout_secs: std::env::var("LLM_MCP_CONNECT_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(file.connect_timeout_secs)
+            .unwrap_or(defaults.connect_timeout_secs),
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -161,11 +222,7 @@ impl ConfigFile {
             .or(file.stream)
             .unwrap_or(true);
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .pool_max_idle_per_host(4)
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::llm::build_http_client(timeout_secs);
 
         LlmConfig {
             base_url,
@@ -201,6 +258,7 @@ mod tests {
                 system_prompt: Some("from file".into()),
                 ..LlmSection::default()
             },
+            ..ConfigFile::default()
         };
 
         let llm = cfg.into_llm_config();
@@ -216,6 +274,7 @@ mod tests {
                 system_prompt: Some("from file".into()),
                 ..LlmSection::default()
             },
+            ..ConfigFile::default()
         };
 
         let llm = cfg.into_llm_config();

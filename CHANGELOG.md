@@ -7,6 +7,30 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- **MCP relay / Xcode tools** — stdio `mcpServers` from `session/new` are
+  started per session and their tools offered to the model next to the
+  built-ins (name collisions get a `<server>__` prefix; `tools/list_changed`
+  is honoured; handshakes time out after `LLM_MCP_CONNECT_TIMEOUT` (120 s; Xcode's bridge is slow to list tools the first time, and the first prompt shows "Connecting to Xcode tools…" meanwhile), calls after `LLM_MCP_TOOL_TIMEOUT` and are cancelled
+  with `session/cancel`). Under Xcode, `xcrun mcpbridge` is added when the
+  Client passes no Xcode server (`LLM_XCODE_TOOLS=auto|on|off`). The system
+  prompt gains guidance to prefer Xcode's build/test/diagnostics/docs and
+  project-file tools over shell equivalents, listing only exposed tools.
+  `LLM_MCP_TOOLS` / `LLM_MCP_EXCLUDE_TOOLS` filter tools; on small contexts
+  the Xcode tool set falls back to a core subset. `initialize` advertises
+  `mcpCapabilities: {http: false, sse: false}`. Xcode tool calls get
+  descriptive titles and ACP tool kinds.
+
+### Fixed
+- `LLM_TIMEOUT` is now an idle (read) timeout instead of a total request
+  deadline. Long streamed turns — e.g. a reasoning model on a large Xcode
+  context — were cut off at exactly 300 s with "error decoding response
+  body" while the backend was still producing tokens.
+
+### Changed
+- The history token budget subtracts the tool schemas sent with each
+  request (never below 1/4 of `LLM_MODEL_CONTEXT`).
+
 ### Fixed
 - `session/cancel` aborts an active ACP prompt and reports cancellation on both wire versions; concurrent prompts for one session are rejected; a cancelled turn is closed in history with a `[cancelled by user]` reply; an LLM response cut off mid-body is retried once.
 
