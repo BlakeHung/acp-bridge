@@ -37,13 +37,30 @@ pub struct McpSection {
     pub connect_timeout_secs: Option<u64>,
 }
 
+/// An env var lookup: `Fn(name) -> Option<String>`, `None` when unset.
+///
+/// Config merging takes this instead of reading [`std::env`] directly so
+/// tests can supply values from a map instead of mutating the process
+/// environment — env mutation races other tests running on parallel
+/// threads. Production goes through [`mcp_config`] /
+/// [`ConfigFile::into_llm_config`], which pass `|k| std::env::var(k).ok()`.
+pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 /// Build the MCP relay config: env var > `[mcp]` section > default.
 pub fn mcp_config(file: Option<&McpSection>) -> crate::mcp::McpConfig {
+    mcp_config_with_env(file, &process_env)
+}
+
+/// [`mcp_config`] with an injected env lookup (see [`EnvLookup`]).
+pub fn mcp_config_with_env(file: Option<&McpSection>, env: EnvLookup) -> crate::mcp::McpConfig {
     use crate::mcp::{parse_list, McpConfig, XcodeMode};
     let file = file.cloned().unwrap_or_default();
     let defaults = McpConfig::default();
-    let xcode = std::env::var("LLM_XCODE_TOOLS")
-        .ok()
+    let xcode = env("LLM_XCODE_TOOLS")
         .or(file.xcode_tools)
         .map(|v| {
             XcodeMode::parse(&v).unwrap_or_else(|| {
@@ -53,27 +70,25 @@ pub fn mcp_config(file: Option<&McpSection>) -> crate::mcp::McpConfig {
         })
         .unwrap_or(defaults.xcode);
     McpConfig {
-        enabled: crate::llm::parse_bool_env("LLM_MCP")
+        enabled: env("LLM_MCP")
+            .as_deref()
+            .and_then(crate::llm::parse_bool_value)
             .or(file.enabled)
             .unwrap_or(defaults.enabled),
         xcode,
-        include: std::env::var("LLM_MCP_TOOLS")
-            .ok()
+        include: env("LLM_MCP_TOOLS")
             .map(|v| parse_list(&v))
             .or(file.tools)
             .unwrap_or_default(),
-        exclude: std::env::var("LLM_MCP_EXCLUDE_TOOLS")
-            .ok()
+        exclude: env("LLM_MCP_EXCLUDE_TOOLS")
             .map(|v| parse_list(&v))
             .or(file.exclude_tools)
             .unwrap_or_default(),
-        tool_timeout_secs: std::env::var("LLM_MCP_TOOL_TIMEOUT")
-            .ok()
+        tool_timeout_secs: env("LLM_MCP_TOOL_TIMEOUT")
             .and_then(|v| v.parse().ok())
             .or(file.tool_timeout_secs)
             .unwrap_or(defaults.tool_timeout_secs),
-        connect_timeout_secs: std::env::var("LLM_MCP_CONNECT_TIMEOUT")
-            .ok()
+        connect_timeout_secs: env("LLM_MCP_CONNECT_TIMEOUT")
             .and_then(|v| v.parse().ok())
             .or(file.connect_timeout_secs)
             .unwrap_or(defaults.connect_timeout_secs),
@@ -134,91 +149,86 @@ impl ConfigFile {
 
     /// Merge config file values into LlmConfig. Env vars always take precedence.
     pub fn into_llm_config(self) -> LlmConfig {
+        self.into_llm_config_with_env(&process_env)
+    }
+
+    /// [`ConfigFile::into_llm_config`] with an injected env lookup (see
+    /// [`EnvLookup`]). Tests use this to avoid mutating the process
+    /// environment, which races with other tests.
+    pub fn into_llm_config_with_env(self, env: EnvLookup) -> LlmConfig {
         let file = self.llm;
 
         // Helper: env var wins, then config file, then default
-        let base_url = std::env::var("LLM_BASE_URL")
-            .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
-            .ok()
+        let base_url = env("LLM_BASE_URL")
+            .or_else(|| env("OLLAMA_BASE_URL"))
             .or(file.base_url)
             .unwrap_or_else(|| "http://localhost:11434/v1".into());
 
-        let model = std::env::var("LLM_MODEL")
-            .or_else(|_| std::env::var("OLLAMA_MODEL"))
-            .ok()
+        let model = env("LLM_MODEL")
+            .or_else(|| env("OLLAMA_MODEL"))
             .or(file.model)
             .unwrap_or_else(|| "gemma4:26b".into());
 
-        let api_key = std::env::var("LLM_API_KEY")
-            .or_else(|_| std::env::var("OLLAMA_API_KEY"))
-            .ok()
+        let api_key = env("LLM_API_KEY")
+            .or_else(|| env("OLLAMA_API_KEY"))
             .or(file.api_key)
             .unwrap_or_else(|| "local-ai".into());
 
-        let system_prompt = std::env::var("LLM_SYSTEM_PROMPT")
-            .ok()
-            .or(file.system_prompt);
+        let system_prompt = env("LLM_SYSTEM_PROMPT").or(file.system_prompt);
 
-        let temperature = std::env::var("LLM_TEMPERATURE")
-            .ok()
+        let temperature = env("LLM_TEMPERATURE")
             .and_then(|v| v.parse::<f64>().ok())
             .or(file.temperature)
             .filter(|t| t.is_finite());
 
-        let max_tokens = std::env::var("LLM_MAX_TOKENS")
-            .ok()
+        let max_tokens = env("LLM_MAX_TOKENS")
             .and_then(|v| v.parse().ok())
             .or(file.max_tokens);
 
-        let timeout_secs = std::env::var("LLM_TIMEOUT")
-            .ok()
+        let timeout_secs = env("LLM_TIMEOUT")
             .and_then(|v| v.parse().ok())
             .or(file.timeout_secs)
             .unwrap_or(300);
 
-        let max_history_turns = std::env::var("LLM_MAX_HISTORY_TURNS")
-            .ok()
+        let max_history_turns = env("LLM_MAX_HISTORY_TURNS")
             .and_then(|v| v.parse().ok())
             .or(file.max_history_turns)
             .unwrap_or(50);
 
-        let max_sessions = std::env::var("LLM_MAX_SESSIONS")
-            .ok()
+        let max_sessions = env("LLM_MAX_SESSIONS")
             .and_then(|v| v.parse().ok())
             .or(file.max_sessions)
             .unwrap_or(0);
 
-        let session_idle_timeout_secs = std::env::var("LLM_SESSION_IDLE_TIMEOUT")
-            .ok()
+        let session_idle_timeout_secs = env("LLM_SESSION_IDLE_TIMEOUT")
             .and_then(|v| v.parse().ok())
             .or(file.session_idle_timeout_secs)
             .unwrap_or(0);
 
-        let prompt_supports_image = match std::env::var("LLM_SUPPORTS_IMAGE").as_deref() {
-            Ok("1") | Ok("true") | Ok("yes") | Ok("on") => true,
-            Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
+        let prompt_supports_image = match env("LLM_SUPPORTS_IMAGE").as_deref() {
+            Some("1") | Some("true") | Some("yes") | Some("on") => true,
+            Some("0") | Some("false") | Some("no") | Some("off") => false,
             _ => file.supports_image.unwrap_or(false),
         };
 
-        let context_size = std::env::var("LLM_MODEL_CONTEXT")
-            .ok()
+        let context_size = env("LLM_MODEL_CONTEXT")
             .and_then(|v| v.parse().ok())
             .or(file.model_context)
             .unwrap_or(32768);
 
-        let max_tool_rounds = std::env::var("LLM_MAX_TOOL_ROUNDS")
-            .ok()
+        let max_tool_rounds = env("LLM_MAX_TOOL_ROUNDS")
             .and_then(|v| v.parse().ok())
             .or(file.max_tool_rounds)
             .unwrap_or(crate::llm::DEFAULT_MAX_TOOL_ROUNDS);
 
-        let bash_timeout_secs = std::env::var("LLM_BASH_TIMEOUT")
-            .ok()
+        let bash_timeout_secs = env("LLM_BASH_TIMEOUT")
             .and_then(|v| v.parse().ok())
             .or(file.bash_timeout_secs)
             .unwrap_or(crate::llm::DEFAULT_BASH_TIMEOUT_SECS);
 
-        let stream = crate::llm::parse_bool_env("LLM_STREAM")
+        let stream = env("LLM_STREAM")
+            .as_deref()
+            .and_then(crate::llm::parse_bool_value)
             .or(file.stream)
             .unwrap_or(true);
 
@@ -248,38 +258,60 @@ impl ConfigFile {
 #[cfg(test)]
 mod tests {
     use super::{ConfigFile, LlmSection};
+    use std::collections::HashMap;
 
-    #[test]
-    fn llm_config_uses_system_prompt_from_file_when_env_missing() {
-        std::env::remove_var("LLM_SYSTEM_PROMPT");
-
-        let cfg = ConfigFile {
+    /// A config file that sets only `system_prompt`, for precedence tests.
+    fn cfg_with_file_prompt() -> ConfigFile {
+        ConfigFile {
             llm: LlmSection {
                 system_prompt: Some("from file".into()),
                 ..LlmSection::default()
             },
             ..ConfigFile::default()
-        };
+        }
+    }
 
-        let llm = cfg.into_llm_config();
+    /// Build an env lookup from a map so tests never touch the process
+    /// environment (`set_var`/`remove_var` race other tests).
+    fn env_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn llm_config_uses_system_prompt_from_file_when_env_missing() {
+        let env = env_from(&[]);
+        let llm = cfg_with_file_prompt().into_llm_config_with_env(&|k| env.get(k).cloned());
         assert_eq!(llm.system_prompt.as_deref(), Some("from file"));
     }
 
     #[test]
     fn llm_config_env_system_prompt_overrides_file() {
-        std::env::set_var("LLM_SYSTEM_PROMPT", "from env");
-
-        let cfg = ConfigFile {
-            llm: LlmSection {
-                system_prompt: Some("from file".into()),
-                ..LlmSection::default()
-            },
-            ..ConfigFile::default()
-        };
-
-        let llm = cfg.into_llm_config();
+        let env = env_from(&[("LLM_SYSTEM_PROMPT", "from env")]);
+        let llm = cfg_with_file_prompt().into_llm_config_with_env(&|k| env.get(k).cloned());
         assert_eq!(llm.system_prompt.as_deref(), Some("from env"));
+    }
 
-        std::env::remove_var("LLM_SYSTEM_PROMPT");
+    #[test]
+    fn llm_config_ollama_fallback_vars_used_when_llm_vars_missing() {
+        let env = env_from(&[
+            ("OLLAMA_BASE_URL", "http://ollama:11434/v1"),
+            ("OLLAMA_MODEL", "qwen2:7b"),
+        ]);
+        let llm = ConfigFile::default().into_llm_config_with_env(&|k| env.get(k).cloned());
+        assert_eq!(llm.base_url, "http://ollama:11434/v1");
+        assert_eq!(llm.model, "qwen2:7b");
+    }
+
+    #[test]
+    fn llm_config_llm_vars_take_precedence_over_ollama_vars() {
+        let env = env_from(&[
+            ("LLM_BASE_URL", "http://vllm:8000/v1"),
+            ("OLLAMA_BASE_URL", "http://ollama:11434/v1"),
+        ]);
+        let llm = ConfigFile::default().into_llm_config_with_env(&|k| env.get(k).cloned());
+        assert_eq!(llm.base_url, "http://vllm:8000/v1");
     }
 }

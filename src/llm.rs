@@ -531,7 +531,14 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 100;
 
 /// Parse a boolean env var (`1/true/yes/on`, `0/false/no/off`).
 pub fn parse_bool_env(key: &str) -> Option<bool> {
-    match std::env::var(key).ok()?.to_ascii_lowercase().as_str() {
+    parse_bool_value(&std::env::var(key).ok()?)
+}
+
+/// [`parse_bool_env`] on an already-read value. Split out so config
+/// merging can run against an injected env lookup instead of the process
+/// environment.
+pub fn parse_bool_value(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,

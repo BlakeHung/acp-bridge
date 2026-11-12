@@ -184,7 +184,10 @@ impl TestHarness {
             .env("LLM_API_KEY", "test-key")
             .env("LLM_TIMEOUT", "10")
             .env("LLM_MAX_HISTORY_TURNS", "5")
-            .env("RUST_LOG", "acp_bridge=debug");
+            .env("RUST_LOG", "acp_bridge=debug")
+            // Hermetic spawn: the image opt-in must come from `extra_env`
+            // only, never from the ambient environment of the test run.
+            .env_remove("LLM_SUPPORTS_IMAGE");
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -1291,9 +1294,8 @@ async fn test_tool_unknown() {
 /// in via `LLM_SUPPORTS_IMAGE=true` or `[llm].supports_image = true`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_initialize_does_not_advertise_image_by_default() {
-    // Ensure the opt-in env var is unset for this test
-    std::env::remove_var("LLM_SUPPORTS_IMAGE");
-
+    // The opt-in env var is stripped from the spawned agent's environment
+    // by `start_with_router_and_env`, so ambient env can't leak in here.
     let port = free_port();
     let mut h = TestHarness::start(port).await;
 

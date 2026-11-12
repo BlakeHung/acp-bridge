@@ -1296,6 +1296,12 @@ fn execute_git(working_dir: &Path, args: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    /// Tests that mutate process-global env vars must run serially —
+    /// `set_var`/`remove_var` race reads in other tests on parallel
+    /// threads. Only tests that touch env need to take this.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn pid_alive(pid: &str) -> bool {
         std::process::Command::new("kill")
@@ -1369,16 +1375,12 @@ mod tests {
     use std::fs;
 
     fn tmpwd() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "acp-bridge-tools-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        // UUID, not pid+nanos: the clock is coarse enough that two tests
+        // calling this on parallel threads can get the *same* name, and one
+        // test's `remove_dir_all` then deletes the other's directory
+        // mid-run (spawns inside fail with ENOENT). `tempfile_dir` above
+        // already uses a UUID for the same reason.
+        tempfile_dir("tools-test")
     }
 
     #[test]
@@ -1453,6 +1455,7 @@ mod tests {
 
     #[test]
     fn web_fetch_blocks_when_allowlist_empty() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Default: no allowlist → every request is blocked.
         std::env::remove_var("LLM_WEB_ALLOWLIST");
         let result = execute_web_fetch("https://example.com/");
@@ -1464,6 +1467,7 @@ mod tests {
 
     #[test]
     fn web_fetch_rejects_non_http_schemes() {
+        let _lock = ENV_LOCK.lock().unwrap();
         std::env::set_var("LLM_WEB_ALLOWLIST", "example.com");
         let result = execute_web_fetch("file:///etc/passwd");
         assert!(result.contains("not allowed"), "got: {result}");
