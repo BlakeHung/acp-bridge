@@ -331,6 +331,9 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,
             context_size: 32768,
+            max_tool_rounds: crate::llm::DEFAULT_MAX_TOOL_ROUNDS,
+            bash_timeout_secs: crate::llm::DEFAULT_BASH_TIMEOUT_SECS,
+            stream: true,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()

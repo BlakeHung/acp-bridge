@@ -93,6 +93,11 @@ pub struct Session {
     /// on it so a v2 Client gets v2-shaped notifications even if a v1
     /// Client later connects to the same process.
     pub protocol_version: ProtocolVersion,
+    /// MCP servers the Client passed in `session/new` (e.g. Xcode's tool
+    /// server). Their processes live as long as the session.
+    pub mcp: Option<std::sync::Arc<crate::mcp::McpSet>>,
+    /// Whether the MCP tool guidance has been appended to the system prompt.
+    pub mcp_prompt_applied: bool,
 }
 
 impl Session {
@@ -106,6 +111,8 @@ impl Session {
             last_active: Instant::now(),
             working_dir,
             protocol_version,
+            mcp: None,
+            mcp_prompt_applied: false,
         }
     }
 
@@ -114,19 +121,93 @@ impl Session {
     }
 }
 
-impl Session {
-    /// Trim conversation history to keep the system prompt + last `max_turns` pairs.
-    /// Each "turn" = one user message + one assistant message.
-    /// The system prompt (first message) is always preserved.
-    pub fn trim_history(&mut self, max_turns: usize) {
-        // messages[0] = system prompt, then alternating user/assistant
-        let keep = max_turns * 2; // user + assistant per turn
-        if self.messages.len() > keep + 1 {
-            let system = self.messages[0].clone();
-            let tail = self.messages.split_off(self.messages.len() - keep);
-            self.messages = vec![system];
-            self.messages.extend(tail);
+/// Rough token estimate for one chat message (chars / 4). Counts text
+/// content and tool-call names/arguments — a `write_file` call carrying a
+/// whole file is as expensive as the file itself.
+pub fn estimate_message_tokens(m: &Value) -> u64 {
+    let mut chars = match m.get("content") {
+        Some(Value::String(s)) => s.len(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .map(|s| s.len())
+            .sum(),
+        _ => 0,
+    };
+    if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+        for c in calls {
+            let f = &c["function"];
+            chars += f["name"].as_str().map_or(0, str::len);
+            chars += match &f["arguments"] {
+                Value::String(s) => s.len(),
+                Value::Null => 0,
+                other => other.to_string().len(),
+            };
         }
+    }
+    (chars / 4) as u64
+}
+
+impl Session {
+    /// Keep the system prompt + the last `max_turns` turns.
+    /// See [`Session::trim_history_to`].
+    pub fn trim_history(&mut self, max_turns: usize) {
+        self.trim_history_to(max_turns, None);
+    }
+
+    /// Trim conversation history by turn count and/or token budget.
+    ///
+    /// A *turn* starts at a `user` message and includes everything up to the
+    /// next one: the assistant's tool calls, the tool results and the final
+    /// answer. Cutting only at user messages guarantees a tool result is
+    /// never separated from the assistant message that requested it
+    /// (OpenAI-compatible servers reject orphaned `tool` messages).
+    ///
+    /// - `max_turns`: keep at most this many turns (`0` = no turn cap).
+    /// - `max_tokens`: then drop the oldest turns while the estimated size
+    ///   exceeds this budget. The latest turn is always kept, even if it
+    ///   alone exceeds the budget.
+    ///
+    /// The system prompt (first message) is always preserved. Returns the
+    /// number of messages removed.
+    pub fn trim_history_to(&mut self, max_turns: usize, max_tokens: Option<u64>) -> usize {
+        let starts: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .map(|(i, _)| i)
+            .collect();
+        if starts.is_empty() {
+            return 0;
+        }
+
+        // Index into `starts` of the first turn to keep.
+        let mut k = 0;
+        if max_turns > 0 && starts.len() > max_turns {
+            k = starts.len() - max_turns;
+        }
+
+        if let Some(budget) = max_tokens {
+            let sizes: Vec<u64> = self.messages.iter().map(estimate_message_tokens).collect();
+            let system = sizes[0];
+            // suffix[i] = tokens of messages[i..]
+            let mut suffix = vec![0u64; sizes.len() + 1];
+            for i in (0..sizes.len()).rev() {
+                suffix[i] = suffix[i + 1] + sizes[i];
+            }
+            while k + 1 < starts.len() && system + suffix[starts[k]] > budget {
+                k += 1;
+            }
+        }
+
+        let first_keep = starts[k];
+        if first_keep <= 1 {
+            return 0;
+        }
+        self.messages.drain(1..first_keep);
+        first_keep - 1
     }
 }
 

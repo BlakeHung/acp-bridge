@@ -194,3 +194,90 @@ pub fn prompt(agent: &mut Agent, id: i64, session_id: &str, prompt: Value) -> (V
     );
     agent.recv_response(&id_v, Duration::from_secs(30))
 }
+
+/// Start a minimal std-only mock of an OpenAI-compatible backend on a
+/// random local port and return its base URL (`http://127.0.0.1:N/v1`).
+///
+/// `POST /v1/chat/completions` answers with a single `list_dir` tool call
+/// until the request history contains a `role: "tool"` message, then with
+/// a plain final answer. Every other request gets `{"data": []}`. This
+/// lets subprocess tests observe real `tool_call` / `tool_call_update`
+/// wire shapes without depending on a live LLM.
+#[allow(dead_code)]
+pub fn spawn_mock_tool_llm() -> String {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock llm");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                // Read headers, then the Content-Length body.
+                let (header_end, content_len) = loop {
+                    let n = match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (pos + 4, len);
+                    }
+                };
+                while buf.len() < header_end + content_len {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let body: Value =
+                    serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
+                let response = if head.starts_with("POST") && head.contains("/chat/completions") {
+                    let has_tool_result = body["messages"]
+                        .as_array()
+                        .map(|m| m.iter().any(|m| m["role"] == "tool"))
+                        .unwrap_or(false);
+                    if has_tool_result {
+                        serde_json::json!({"choices": [{
+                            "message": {"role": "assistant", "content": "Done."},
+                            "finish_reason": "stop"
+                        }]})
+                    } else {
+                        serde_json::json!({"choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{\"path\": \".\"}"}
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]})
+                    }
+                } else {
+                    serde_json::json!({"data": []})
+                };
+                let payload = response.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/v1")
+}

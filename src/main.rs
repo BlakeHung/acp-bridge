@@ -89,6 +89,7 @@ async fn main() {
         .as_ref()
         .map(|path| ConfigFile::load(std::path::Path::new(path)));
 
+    let mcp_config = acp_bridge::config::mcp_config(config_file.as_ref().map(|f| &f.mcp));
     let config = match config_file {
         Some(file) => file.into_llm_config(),
         None => llm::LlmConfig::from_env(),
@@ -127,7 +128,7 @@ async fn main() {
     probe_backend(&config).await;
 
     // Build shared state
-    let state = AppState::new(config);
+    let state = AppState::with_mcp(config, mcp_config);
 
     // Spawn idle session cleanup task
     let idle_timeout = state.config.session_idle_timeout_secs;
@@ -313,17 +314,29 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 // run_acp_loop the Arc has refcount 1, so
                                 // make_mut never actually clones.
                                 Arc::make_mut(&mut state).protocol_version = negotiated;
+                                // Remember who the Client is: under Xcode,
+                                // Xcode's tool server is added to sessions
+                                // even if `mcpServers` arrives empty.
+                                let client_name = ["/clientInfo/name", "/clientInfo/title", "/info/name", "/info/title"]
+                                    .iter()
+                                    .filter_map(|p| params.pointer(p).and_then(Value::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                if !client_name.is_empty() {
+                                    info!(client = %client_name, "Client identified");
+                                    Arc::make_mut(&mut state).client_name = Some(client_name);
+                                }
                                 let result = engine::initialize(&state.config, negotiated);
                                 acp::send_response(&id, result);
                             }
                             "session/new" => {
                                 let raw_cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or("/tmp");
-                                if let Some(servers) = params.get("mcpServers").and_then(|v| v.as_array()) {
-                                    if !servers.is_empty() {
-                                        debug!(count = servers.len(), "Ignoring mcpServers param (not supported in v0.7)");
-                                    }
-                                }
-                                match engine::session_new(&state, raw_cwd, state.protocol_version) {
+                                match engine::session_new_with_mcp(
+                                    &state,
+                                    raw_cwd,
+                                    state.protocol_version,
+                                    params.get("mcpServers"),
+                                ) {
                                     Ok(session_id) => {
                                         // Post-creation notifications first so
                                         // Clients that want to render the
@@ -513,13 +526,34 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
 fn emit_prompt_notification(version: ProtocolVersion, session_id: &str, notif: Notification) {
     match notif {
         Notification::Thinking => acp::notify_thinking_for(version, session_id),
-        Notification::ToolStart { id, name } => {
-            acp::notify_tool_start_for(version, session_id, &id, &name)
-        }
-        Notification::ToolDone { id, name, status } => {
-            acp::notify_tool_done_for(version, session_id, &id, &name, &status)
-        }
+        Notification::ToolStart {
+            id,
+            name,
+            input,
+            location,
+        } => acp::notify_tool_start_for(
+            version,
+            session_id,
+            &id,
+            &name,
+            input.as_ref(),
+            location.as_deref(),
+        ),
+        Notification::ToolDone {
+            id,
+            name,
+            status,
+            output,
+        } => acp::notify_tool_done_for(
+            version,
+            session_id,
+            &id,
+            &name,
+            &status,
+            output.as_deref(),
+        ),
         Notification::TextChunk(text) => acp::notify_text_for(version, session_id, &text),
+        Notification::ThoughtChunk(text) => acp::notify_thought_text(session_id, &text),
     }
 }
 
@@ -603,11 +637,7 @@ async fn handle_acp_prompt(
     // Clients can surface a meaningful name in their session list. Done
     // before spawning the engine task because `user_text` is moved into
     // the task below.
-    let derived_title = user_text
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.trim().chars().take(80).collect::<String>())
-        .filter(|s: &String| !s.is_empty());
+    let derived_title = engine::derive_prompt_title(&prompt_value);
 
     // Set up notification channel for ACP streaming
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Notification>();

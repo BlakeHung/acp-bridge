@@ -16,8 +16,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Maximum number of tool call rounds to prevent infinite loops.
-const MAX_TOOL_ROUNDS: usize = 5;
 
 /// Extract concatenated text from a slice of ACP/A2A content parts.
 ///
@@ -54,6 +52,56 @@ pub fn extract_text_parts(parts: &[Value]) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// Derive a short session title from a `session/prompt` payload.
+///
+/// Clients such as Xcode send several text blocks per prompt: an injected
+/// `<system-reminder>...</system-reminder>` block, project context, and
+/// the user's actual message last. Using the first line of the joined text
+/// would title every Xcode chat "<system-reminder>## Xcode", so this strips
+/// system-reminder blocks and takes the first non-empty line of the last
+/// non-empty text block (capped at 80 chars).
+pub fn derive_prompt_title(prompt: &Value) -> Option<String> {
+    let blocks: Vec<String> = match prompt {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    blocks
+        .iter()
+        .rev()
+        .map(|b| strip_system_reminders(b))
+        .find(|b| !b.trim().is_empty())
+        .and_then(|b| {
+            b.lines()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.trim().chars().take(80).collect::<String>())
+        })
+        .filter(|s| !s.is_empty())
+}
+
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        match rest[start..].find(CLOSE) {
+            Some(end) => rest = &rest[start + end + CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Extract base64 image content blocks from a slice of ACP/A2A content parts.
@@ -193,18 +241,25 @@ pub enum Notification {
     Thinking,
     ToolStart {
         /// ACP v1 `toolCallId` — required for clients to pair tool_call /
-        /// tool_call_update updates. The LLM assigns this id per call; for
-        /// the synthetic outer `llm_chat` event we mint a stable id derived
-        /// from the session/round so clients can render it.
+        /// tool_call_update updates. The LLM assigns this id per call.
         id: String,
         name: String,
+        /// Parsed tool arguments, surfaced to the Client as `rawInput` and
+        /// used to build a descriptive title (e.g. the bash command).
+        input: Option<Value>,
+        /// Absolute path the tool operates on, surfaced as `locations`.
+        location: Option<String>,
     },
     ToolDone {
         id: String,
         name: String,
         status: String,
+        /// Tool result text, surfaced as `content` / `rawOutput`.
+        output: Option<String>,
     },
     TextChunk(String),
+    /// Model reasoning streamed live (`agent_thought_chunk`).
+    ThoughtChunk(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +281,10 @@ pub struct AppState {
     /// emit helpers (`acp::notify_*`) branch on it so v1 Clients see
     /// v1 notifications and v2 Clients see v2.
     pub protocol_version: crate::protocol::ProtocolVersion,
+    /// How the Client's `mcpServers` (and Xcode's tool server) are handled.
+    pub mcp: crate::mcp::McpConfig,
+    /// `clientInfo.name` / `title` from `initialize`, used to detect Xcode.
+    pub client_name: Option<String>,
 }
 
 impl Clone for AppState {
@@ -235,12 +294,18 @@ impl Clone for AppState {
             turn_registry: Arc::clone(&self.turn_registry),
             config: self.config.clone(),
             protocol_version: self.protocol_version,
+            mcp: self.mcp.clone(),
+            client_name: self.client_name.clone(),
         }
     }
 }
 
 impl AppState {
     pub fn new(config: LlmConfig) -> Arc<Self> {
+        Self::with_mcp(config, crate::mcp::McpConfig::default())
+    }
+
+    pub fn with_mcp(config: LlmConfig, mcp: crate::mcp::McpConfig) -> Arc<Self> {
         Arc::new(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             turn_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -250,6 +315,8 @@ impl AppState {
             // `initialize`. We pick V1 here so unit tests that build an
             // AppState directly get v1 wire format without ceremony.
             protocol_version: crate::protocol::ProtocolVersion::V1,
+            mcp,
+            client_name: None,
         })
     }
 
@@ -379,7 +446,10 @@ pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::Protoco
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "agentCapabilities": {
-                    "promptCapabilities": prompt_capabilities_v1
+                    "promptCapabilities": prompt_capabilities_v1,
+                    // stdio MCP servers (the ACP baseline) are relayed;
+                    // http / sse transports are not.
+                    "mcpCapabilities": {"http": false, "sse": false}
                 },
                 "authMethods": []
             })
@@ -396,6 +466,19 @@ pub fn session_new(
     state: &AppState,
     cwd: &str,
     protocol_version: crate::protocol::ProtocolVersion,
+) -> Result<String, AcpError> {
+    session_new_with_mcp(state, cwd, protocol_version, None)
+}
+
+/// [`session_new`] plus the Client's `mcpServers` param. The servers
+/// (and Xcode's tool server, see [`crate::mcp::resolve_servers`]) start
+/// connecting in the background; their tools join the built-in ones from
+/// the first prompt on.
+pub fn session_new_with_mcp(
+    state: &AppState,
+    cwd: &str,
+    protocol_version: crate::protocol::ProtocolVersion,
+    mcp_servers: Option<&Value>,
 ) -> Result<String, AcpError> {
     // Enforce max_sessions limit
     if state.config.max_sessions > 0 {
@@ -417,15 +500,31 @@ pub fn session_new(
 
     let system_prompt = state.config.system_prompt.clone().unwrap_or_else(|| {
         std::env::var("LLM_SYSTEM_PROMPT").unwrap_or_else(|_| {
-            format!("You are a helpful coding assistant. The user's working directory is: {cwd}")
+            format!(
+                "You are a helpful coding assistant running locally through acp-bridge. \
+                 The underlying model is `{}`. The user's working directory is: {cwd}",
+                state.config.model
+            )
         })
     });
 
-    let session = Session::new(
+    let mut session = Session::new(
         json!({"role": "system", "content": system_prompt}),
         PathBuf::from(&cwd),
         protocol_version,
     );
+    let specs =
+        crate::mcp::resolve_servers(&state.mcp, mcp_servers, state.client_name.as_deref());
+    if !specs.is_empty() {
+        let set = crate::mcp::McpSet::start(
+            specs,
+            PathBuf::from(&cwd),
+            state.mcp.clone(),
+            state.config.context_size,
+        );
+        info!(session_id = %session_id, servers = ?set.server_names(), "Starting MCP servers");
+        session.mcp = Some(set);
+    }
     state.sessions_write().insert(session_id.clone(), session);
 
     info!(session_id = %session_id, max_history = state.config.max_history_turns, "New session");
@@ -552,34 +651,61 @@ pub async fn session_prompt(
                 .format_user_message(user_text, user_images),
         );
 
-        if state.config.max_history_turns > 0 {
-            let before = session.messages.len();
-            session.trim_history(state.config.max_history_turns);
-            let after = session.messages.len();
-            if before != after {
-                debug!(before, after, "Trimmed conversation history");
+        {
+            let removed = session.trim_history_to(
+                state.config.max_history_turns,
+                Some(history_token_budget(&state.config, &tools::tool_definitions())),
+            );
+            if removed > 0 {
+                debug!(removed, "Trimmed conversation history");
             }
         }
     }
 
     notify(Notification::Thinking);
-    notify(Notification::ToolStart {
-        id: format!("llm_chat:{session_id}"),
-        name: "llm_chat".into(),
-    });
+
+    let mcp = state
+        .sessions_read()
+        .get(session_id)
+        .and_then(|s| s.mcp.clone());
+    if let Some(mcp) = &mcp {
+        prepare_mcp(state, session_id, mcp, &notify).await;
+    }
 
     let mut had_error = false;
     let mut got_final_response = false;
     let mut final_text = String::new();
     let mut last_error_class: Option<crate::llm::LlmErrorKind> = None;
-    let tool_defs = tools::tool_definitions();
+    let builtin_defs = tools::tool_definitions();
+    let mut tool_defs = builtin_defs.clone();
 
     // Tool call loop
-    for round in 0..MAX_TOOL_ROUNDS {
+    let max_rounds = state.config.max_tool_rounds;
+    // Whether any answer text has reached the Client this turn, so text from
+    // a later round is separated from earlier commentary.
+    let mut emitted_any_text = false;
+    for round in 0..state.config.tool_round_cap() {
+        // MCP servers may change their tool list between rounds
+        // (`notifications/tools/list_changed`).
+        if let Some(mcp) = &mcp {
+            tool_defs = builtin_defs.clone();
+            tool_defs.extend(mcp.tool_definitions().await);
+        }
+        let budget = history_token_budget(&state.config, &tool_defs);
         let (messages, working_dir) = {
-            let sessions = state.sessions_read();
-            match sessions.get(session_id) {
-                Some(s) => (s.messages.clone(), s.working_dir.clone()),
+            let mut sessions = state.sessions_write();
+            match sessions.get_mut(session_id) {
+                Some(s) => {
+                    // Tool rounds grow the history within a turn; drop
+                    // older turns (never the current one) to stay in budget.
+                    if round > 0 || mcp.is_some() {
+                        let removed = s.trim_history_to(0, Some(budget));
+                        if removed > 0 {
+                            info!(round, removed, "Trimmed older turns to fit context budget");
+                        }
+                    }
+                    (s.messages.clone(), s.working_dir.clone())
+                }
                 None => {
                     warn!(session_id, "Session removed during prompt processing");
                     had_error = true;
@@ -590,7 +716,35 @@ pub async fn session_prompt(
         };
 
         let backend = state.config.backend();
-        let chat_result = llm::chat(&state.config, &messages, None, Some(&tool_defs)).await;
+        let mut streamed_text = false;
+        let chat_result = if state.config.stream {
+            let separate = emitted_any_text;
+            llm::chat_streaming(&state.config, &messages, Some(&tool_defs), |delta| match delta {
+                llm::StreamDelta::Content(t) => {
+                    if streamed_text {
+                        notify(Notification::TextChunk(t));
+                        return;
+                    }
+                    // Drop leading whitespace of a round's text (models
+                    // often emit bare newlines around tool calls) and
+                    // separate it from the previous round's commentary.
+                    let t = t.trim_start();
+                    if t.is_empty() {
+                        return;
+                    }
+                    if separate {
+                        notify(Notification::TextChunk("\n\n".into()));
+                    }
+                    streamed_text = true;
+                    notify(Notification::TextChunk(t.to_string()));
+                }
+                llm::StreamDelta::Reasoning(t) => notify(Notification::ThoughtChunk(t)),
+            })
+            .await
+        } else {
+            llm::chat(&state.config, &messages, None, Some(&tool_defs)).await
+        };
+        emitted_any_text |= streamed_text;
 
         match chat_result {
             Ok(response) => {
@@ -634,7 +788,10 @@ pub async fn session_prompt(
                                         .push(json!({"role": "assistant", "content": &text}));
                                 }
                             }
-                            notify(Notification::TextChunk(text));
+                            // Already delivered live when streaming.
+                            if !streamed_text && !text.trim().is_empty() {
+                                notify(Notification::TextChunk(text));
+                            }
                         }
                         break;
                     }
@@ -669,15 +826,49 @@ pub async fn session_prompt(
                     };
                     let tool_call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
 
+                    // Xcode's tools take project-navigator paths, not
+                    // filesystem paths, so only built-ins get a location.
+                    let location = args
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .filter(|_| crate::mcp::is_builtin_tool(name))
+                        .map(|p| {
+                        let p = std::path::Path::new(p);
+                        if p.is_absolute() {
+                            p.display().to_string()
+                        } else {
+                            std::path::Path::new(&working_dir).join(p).display().to_string()
+                        }
+                    });
                     notify(Notification::ToolStart {
                         id: tool_call_id.to_string(),
                         name: name.into(),
+                        input: Some(args.clone()),
+                        location,
                     });
-                    let result = tools::execute_tool(&working_dir, name, &args);
+                    // Async + cancellable: a `session/cancel` aborts this
+                    // future and kills the command's process group.
+                    let mcp_result = match &mcp {
+                        Some(mcp) => mcp.call(name, &args).await,
+                        None => None,
+                    };
+                    let result = match mcp_result {
+                        Some(r) => r,
+                        None => {
+                            tools::execute_tool_async(
+                                &working_dir,
+                                name,
+                                &args,
+                                state.config.bash_timeout(),
+                            )
+                            .await
+                        }
+                    };
                     notify(Notification::ToolDone {
                         id: tool_call_id.to_string(),
                         name: name.into(),
                         status: "completed".into(),
+                        output: Some(result.clone()),
                     });
 
                     debug!(tool = name, result_len = result.len(), "Tool executed");
@@ -724,29 +915,23 @@ pub async fn session_prompt(
         }
     }
 
-    // The loop can also exit by exhausting MAX_TOOL_ROUNDS while the model
+    // The loop can also exit by exhausting max_tool_rounds while the model
     // keeps requesting tools. Without this the turn would be reported as a
     // successful "completed" with empty text, silently swallowing the fact
     // that the model never produced a final answer.
     if !had_error && !got_final_response {
         warn!(
-            max_rounds = MAX_TOOL_ROUNDS,
+            max_rounds,
             "Tool-call loop hit round limit without a final response"
         );
         let msg = format!(
-            "\n\n**Error:** reached the tool-call limit ({MAX_TOOL_ROUNDS} rounds) without a final answer\n"
+            "\n\n**Error:** reached the tool-call limit ({max_rounds} rounds) without a final answer\n"
         );
         notify(Notification::TextChunk(msg.clone()));
         final_text = msg;
         had_error = true;
     }
 
-    let status = if had_error { "failed" } else { "completed" };
-    notify(Notification::ToolDone {
-        id: format!("llm_chat:{session_id}"),
-        name: "llm_chat".into(),
-        status: status.into(),
-    });
 
     // Estimate the current context utilization for `usage_update`. Local
     // backends rarely stream per-turn token counts in a stable shape, so
@@ -754,6 +939,8 @@ pub async fn session_prompt(
     // session history and dividing by 4 chars per token (the canonical
     // LLM rule of thumb). This is intentionally approximate; clients use
     // it for progress bars and not for cost attribution.
+    let status = if had_error { "failed" } else { "completed" };
+
     let used_tokens = {
         let sessions = state.sessions_read();
         sessions
@@ -776,28 +963,68 @@ pub async fn session_prompt(
     }
 }
 
+/// Token budget for conversation history: 75% of the model context minus
+/// the tool definitions sent with every request, leaving the rest for the
+/// model's reply. Never below 1/4 of the context, so a large tool set
+/// cannot starve the conversation entirely.
+fn history_token_budget(config: &crate::llm::LlmConfig, tool_defs: &[Value]) -> u64 {
+    let tools: u64 = tool_defs.iter().map(|d| (d.to_string().len() / 4) as u64).sum();
+    (config.context_size / 4 * 3)
+        .saturating_sub(tools)
+        .max(config.context_size / 4)
+}
+
+/// Wait for the session's MCP servers, report any that failed to start
+/// (as a thought, once), and append their tool guidance to the system
+/// prompt the first time tools are available.
+async fn prepare_mcp(
+    state: &AppState,
+    session_id: &str,
+    mcp: &crate::mcp::McpSet,
+    notify: &impl Fn(Notification),
+) {
+    // Servers connect in the background from `session/new`; Xcode's can
+    // take a while the first time. Say so instead of stalling silently.
+    if !mcp.is_ready() && !mcp.wait_ready(Duration::from_millis(1500)).await {
+        let what = if mcp.has_xcode() { "Xcode tools" } else { "MCP tools" };
+        notify(Notification::ThoughtChunk(format!("Connecting to {what}…\n")));
+        // Bounded by the servers' connect timeout.
+        mcp.wait_connected().await;
+    }
+    for failure in mcp.take_failures().await {
+        notify(Notification::ThoughtChunk(format!(
+            "acp-bridge: MCP server unavailable ({failure})\n"
+        )));
+    }
+    let applied = state
+        .sessions_read()
+        .get(session_id)
+        .is_none_or(|s| s.mcp_prompt_applied);
+    if applied {
+        return;
+    }
+    let Some(addendum) = mcp.system_prompt_addendum().await else {
+        return;
+    };
+    let mut sessions = state.sessions_write();
+    if let Some(s) = sessions.get_mut(session_id) {
+        s.mcp_prompt_applied = true;
+        if let Some(Value::String(content)) = s.messages.first_mut().and_then(|m| m.get_mut("content")) {
+            content.push_str(&addendum);
+        }
+    }
+}
+
 /// Rough token estimate from a list of chat messages. Sums the textual
 /// content of every message and divides by 4 chars/token. We do NOT try
 /// to be precise — local backends do not stream stable per-turn token
 /// counts, and clients use this only for progress visualisation.
 pub fn estimate_tokens(messages: &[Value]) -> u64 {
-    let total_chars: usize = messages
+    messages
         .iter()
-        .map(|m| {
-            // `content` may be a string, an array of ContentBlocks, or
-            // null; extract any text we can find.
-            match m.get("content") {
-                Some(Value::String(s)) => s.len(),
-                Some(Value::Array(arr)) => arr
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
-                    .map(|s| s.len())
-                    .sum(),
-                _ => 0,
-            }
-        })
-        .sum();
-    ((total_chars / 4) as u64).max(1)
+        .map(crate::protocol::estimate_message_tokens)
+        .sum::<u64>()
+        .max(1)
 }
 
 /// Close a turn aborted by `session/cancel`. A trailing user message with
@@ -888,6 +1115,28 @@ pub struct UsageReport {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn derive_prompt_title_skips_xcode_system_reminder() {
+        let prompt = json!([
+            {"type": "text", "text": "<system-reminder>## Xcode\nstuff\n</system-reminder>"},
+            {"type": "text", "text": "HFCache/Models.swift\nThe user has no file currently open.\n"},
+            {"type": "text", "text": "what model are you currently using?"}
+        ]);
+        assert_eq!(
+            derive_prompt_title(&prompt).as_deref(),
+            Some("what model are you currently using?")
+        );
+    }
+
+    #[test]
+    fn derive_prompt_title_single_block_and_string() {
+        let prompt = json!([{"type": "text", "text": "\n  Fix the bug\nmore"}]);
+        assert_eq!(derive_prompt_title(&prompt).as_deref(), Some("Fix the bug"));
+        assert_eq!(derive_prompt_title(&json!("hello")).as_deref(), Some("hello"));
+        let only_reminder = json!([{"type": "text", "text": "<system-reminder>x</system-reminder>"}]);
+        assert_eq!(derive_prompt_title(&only_reminder), None);
+    }
     use super::*;
     use crate::llm::Backend;
     use crate::protocol::ProtocolVersion;
@@ -1087,6 +1336,9 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: supports_image,
             context_size: 32768,
+            max_tool_rounds: crate::llm::DEFAULT_MAX_TOOL_ROUNDS,
+            bash_timeout_secs: crate::llm::DEFAULT_BASH_TIMEOUT_SECS,
+            stream: true,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
@@ -1178,9 +1430,11 @@ mod tests {
         let n = Notification::ToolStart {
             id: "tc_42".into(),
             name: "read_file".into(),
+            input: None,
+            location: None,
         };
         match n {
-            Notification::ToolStart { id, name } => {
+            Notification::ToolStart { id, name, .. } => {
                 assert_eq!(id, "tc_42");
                 assert_eq!(name, "read_file");
             }
@@ -1194,9 +1448,10 @@ mod tests {
             id: "tc_42".into(),
             name: "read_file".into(),
             status: "completed".into(),
+            output: None,
         };
         match n {
-            Notification::ToolDone { id, name, status } => {
+            Notification::ToolDone { id, name, status, .. } => {
                 assert_eq!(id, "tc_42");
                 assert_eq!(name, "read_file");
                 assert_eq!(status, "completed");

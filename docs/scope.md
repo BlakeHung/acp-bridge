@@ -34,7 +34,7 @@ spec-compliant v2 payloads.
 | ACP surface | Status | Notes |
 |---|---|---|
 | `initialize` | ✅ | Negotiates v1/v2; emits the corresponding `agentCapabilities` + `agentInfo` shape (v1) or `capabilities` + `info` shape (v2) |
-| `session/new` | ✅ | Multi-session with per-session conversation history. `mcpServers` accepted but ignored (acp-bridge does not relay MCP) |
+| `session/new` | ✅ | Multi-session with per-session conversation history. stdio `mcpServers` are started and their tools relayed to the model (`LLM_MCP`, default on); under Xcode, `xcrun mcpbridge` is added when missing (`LLM_XCODE_TOOLS`) |
 | `session/prompt` | ✅ | Streaming via SSE → `session/update` notifications. v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` (per schema) |
 | `session/cancel` notification | ✅ | Aborts active LLM requests and reports cancellation on both wire versions. Synchronous tools finish before cancellation takes effect |
 | `session/end` (v1) / `session/close` (v2 baseline) | ✅ | Removes the session and frees its history. Both methods share the same implementation |
@@ -72,7 +72,7 @@ spec-compliant v2 payloads.
 |---|---|---|
 | Image content blocks (`ContentBlock::Image`) | Off by default. Turning it on without a vision-capable backend causes Clients (Meuxe, ACP UI, …) to forward images that the LLM cannot parse | Set `LLM_SUPPORTS_IMAGE=true` or `[llm].supports_image = true` |
 | `session/prompt` with audio / embedded resource content | Not parsed; audio/resource blocks are silently dropped from the prompt | Out of scope; document if you need it |
-| `mcpServers` on `session/new` | Accepted for spec compatibility but **not relayed** to the underlying LLM. The agent uses its own built-in tool set | Future work; tracked but not scheduled |
+| `mcpServers` on `session/new` | Only stdio servers are relayed; `http` / `sse` entries are skipped (`mcpCapabilities` advertises both as `false`) | stdio is on by default; `LLM_MCP=0` disables the relay |
 
 ## Deliberately not implemented
 
@@ -106,8 +106,9 @@ above are a safety net for Clients that don't.
 - **Not an auth provider.** No login flow, no token storage, no user
   identity. If you need per-user sessions, route through a Client that
   gates on its own identity.
-- **Not an MCP server.** acp-bridge ignores `mcpServers` in `session/new`.
-  Built-in tools are the only tool surface.
+- **Not an MCP server.** acp-bridge is an MCP *client* only: it relays the
+  stdio `mcpServers` a Client passes in `session/new` and does not expose
+  its own tools over MCP.
 - **Not a v1-only agent.** acp-bridge supports both ACP v1 and v2
   on the same code base. See "Protocol versions" above.
 - **Not a web transport.** Transport is stdio JSON-RPC only — there is no
@@ -119,8 +120,8 @@ above are a safety net for Clients that don't.
 
 ## Roadmap
 
-- **Optional MCP relay.** Opt-in via config to honor `mcpServers` in
-  `session/new`.
+- **MCP over HTTP / SSE.** stdio MCP servers are relayed today; remote
+  transports would need an egress policy like `LLM_WEB_ALLOWLIST`.
 - **ACP v2 `agent_message` upsert.** Currently acp-bridge emits the
   `agent_message_chunk` variant only. The v2 RFD allows chunk-only
   emission; an upsert path can be added later without breaking

@@ -15,7 +15,7 @@
 #[path = "harness.rs"]
 mod harness;
 
-use harness::Agent;
+use harness::{spawn_mock_tool_llm, Agent};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -68,7 +68,8 @@ fn v2_tool_call_uses_tool_call_update_not_tool_call() {
     // v2 removed the `tool_call` sessionUpdate entirely. When the
     // Client is on v2, the tool-loop start notification must arrive
     // as `tool_call_update` with `status: "in_progress"`.
-    let mut a = Agent::spawn(&[]);
+    let llm = spawn_mock_tool_llm();
+    let mut a = Agent::spawn(&[("LLM_BASE_URL", &llm)]);
     a.request(1, "initialize", v2_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
@@ -98,8 +99,8 @@ fn v2_tool_call_uses_tool_call_update_not_tool_call() {
          use `tool_call_update` with status: in_progress instead"
     );
 
-    // And there should be at least one `tool_call_update` (the loop
-    // envelope plus the actual tool start).
+    // And there should be at least one `tool_call_update` (the tool
+    // start and its completion).
     let update_count = notifications
         .iter()
         .filter(|m| m["params"]["update"]["sessionUpdate"] == "tool_call_update")
@@ -211,7 +212,7 @@ fn v2_does_not_emit_state_update_for_v1_clients() {
     // The v2-only state_update must not leak into the v1 wire, or
     // v1 Clients (which have no idea what state_update means) would
     // get spurious sessionUpdate discriminators.
-    let mut a = Agent::spawn(&[]);
+    let mut a = Agent::spawn(&[("LLM_BASE_URL", &spawn_mock_tool_llm())]);
     a.request(
         1,
         "initialize",

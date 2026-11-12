@@ -79,7 +79,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a bash command and return its output. Use this for running scripts, git commands, or any shell operation. The command runs in the working directory.",
+                "description": "Execute a bash command and return its output. Use this for running scripts, git commands, or any shell operation. The command runs in the working directory with no stdin, and is killed if it exceeds the configured timeout (LLM_BASH_TIMEOUT, default 120 s) — start servers or watchers in the background with output redirected to a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -667,7 +667,43 @@ fn search_dir(
     }
 }
 
-/// Execute a bash command in the working directory with a timeout.
+/// Maximum bytes of combined command output returned to the LLM.
+const MAX_COMMAND_OUTPUT: usize = 50_000;
+
+/// Format captured stdout/stderr the way every shell-style tool reports
+/// it: stdout, then a `[stderr]`-prefixed block, truncated to
+/// [`MAX_COMMAND_OUTPUT`].
+fn format_command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut result = String::new();
+    if !stdout.is_empty() {
+        result.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str("[stderr] ");
+        result.push_str(&stderr);
+    }
+    if result.is_empty() {
+        return "(no output)".to_string();
+    }
+    if result.len() > MAX_COMMAND_OUTPUT {
+        let mut end = MAX_COMMAND_OUTPUT;
+        while !result.is_char_boundary(end) {
+            end -= 1;
+        }
+        result.truncate(end);
+        result.push_str("\n... (truncated)");
+    }
+    result
+}
+
+/// Execute a bash command synchronously (no timeout, not cancellable).
+/// The engine uses [`execute_bash_async`]; this path remains for direct
+/// callers of [`execute_tool`].
 fn execute_bash(working_dir: &Path, command: &str) -> String {
     if command.is_empty() {
         return "Error: command is empty".to_string();
@@ -679,34 +715,179 @@ fn execute_bash(working_dir: &Path, command: &str) -> String {
         .arg("-c")
         .arg(command)
         .current_dir(working_dir)
+        .stdin(std::process::Stdio::null())
         .output()
     {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let mut result = String::new();
-            if !stdout.is_empty() {
-                result.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !result.is_empty() {
-                    result.push('\n');
+        Ok(output) => format_command_output(&output.stdout, &output.stderr),
+        Err(e) => format!("Error executing command: {e}"),
+    }
+}
+
+/// Kills a command's whole process group when dropped, unless disarmed
+/// (it is disarmed once the shell exits normally).
+///
+/// The command is spawned as the leader of a new process group, so this
+/// also reaches anything it started (`swift test`, a dev server, a pipeline).
+/// Dropping happens on timeout and when the engine future is aborted by
+/// `session/cancel`, so neither leaves processes running behind.
+struct ProcessGroupGuard {
+    pgid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn kill(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            // Negative pid = the whole process group. `kill` is POSIX and
+            // always present on macOS/Linux; avoids a libc dependency.
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{pgid}"))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Execute a bash command asynchronously with an optional timeout.
+///
+/// Unlike [`execute_bash`] this does not block a runtime worker, kills the
+/// command's process group when `timeout` elapses, and also kills it when
+/// the returned future is dropped (turn cancelled). Output captured before
+/// a timeout is returned along with a note that the command was stopped.
+pub async fn execute_bash_async(
+    working_dir: &Path,
+    command: &str,
+    timeout: Option<std::time::Duration>,
+) -> String {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncReadExt;
+
+    if command.is_empty() {
+        return "Error: command is empty".to_string();
+    }
+    debug!(command, ?timeout, "bash (async)");
+
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("Error executing command: {e}"),
+    };
+    let mut guard = ProcessGroupGuard { pgid: child.id() };
+
+    // Drain both pipes concurrently into shared buffers so partial output
+    // survives a timeout (and a chatty command can't deadlock on a full pipe).
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::new()));
+    let spawn_reader = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+                        buf: Arc<Mutex<Vec<u8>>>| {
+        tokio::spawn(async move {
+            let Some(mut pipe) = pipe else { return };
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut b = buf.lock().unwrap();
+                        // Keep a little over the cap; the formatter truncates.
+                        if b.len() < MAX_COMMAND_OUTPUT * 2 {
+                            b.extend_from_slice(&chunk[..n]);
+                        }
+                    }
                 }
-                result.push_str("[stderr] ");
-                result.push_str(&stderr);
             }
-            if result.is_empty() {
-                "(no output)".to_string()
-            } else {
-                // Truncate very long output
-                if result.len() > 50_000 {
-                    result.truncate(50_000);
-                    result.push_str("\n... (truncated)");
-                }
-                result
+        })
+    };
+    let out_task = spawn_reader(
+        child.stdout.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        Arc::clone(&out_buf),
+    );
+    let err_task = spawn_reader(
+        child.stderr.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        Arc::clone(&err_buf),
+    );
+
+    let status = match timeout {
+        Some(t) => tokio::time::timeout(t, child.wait()).await.ok(),
+        None => Some(child.wait().await),
+    };
+
+    let timed_out = status.is_none();
+    if timed_out {
+        guard.kill();
+        let _ = child.wait().await;
+    } else {
+        // The shell exited normally. Leave the group alone: jobs the
+        // model deliberately backgrounded (`server > log 2>&1 &`) share
+        // it and must keep running.
+        guard.pgid = None;
+    }
+
+    // Readers finish at EOF once the group is gone. Bound the wait in case
+    // a process escaped the group (setsid) and still holds the pipe open.
+    let grace = std::time::Duration::from_secs(2);
+    let _ = tokio::time::timeout(grace, out_task).await;
+    let _ = tokio::time::timeout(grace, err_task).await;
+
+    let stdout = out_buf.lock().unwrap().clone();
+    let stderr = err_buf.lock().unwrap().clone();
+    let mut result = format_command_output(&stdout, &stderr);
+
+    if timed_out {
+        let secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
+        if result == "(no output)" {
+            result.clear();
+        } else {
+            result.push('\n');
+        }
+        result.push_str(&format!(
+            "[timeout] Command did not finish within {secs}s and was killed. \
+             For long-running processes (servers, watchers) run them in the \
+             background with output redirected, e.g. `cmd > out.log 2>&1 &`."
+        ));
+    } else if let Some(Ok(st)) = status {
+        if !st.success() {
+            if let Some(code) = st.code() {
+                result.push_str(&format!("\n[exit code {code}]"));
             }
         }
-        Err(e) => format!("Error executing command: {e}"),
+    }
+    result
+}
+
+/// Execute a tool, running `bash` asynchronously (timeout + cancellable)
+/// and every other tool through the synchronous [`execute_tool`].
+pub async fn execute_tool_async(
+    working_dir: &Path,
+    name: &str,
+    arguments: &Value,
+    bash_timeout: Option<std::time::Duration>,
+) -> String {
+    if name == "bash" {
+        let command = arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        execute_bash_async(working_dir, command, bash_timeout).await
+    } else {
+        execute_tool(working_dir, name, arguments)
     }
 }
 
@@ -1115,6 +1296,75 @@ fn execute_git(working_dir: &Path, args: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn pid_alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn bash_async_returns_output_and_exit_code() {
+        let dir = std::env::temp_dir();
+        let out = execute_bash_async(&dir, "echo hi; echo oops >&2; exit 3", None).await;
+        assert!(out.contains("hi"), "{out}");
+        assert!(out.contains("[stderr] oops"), "{out}");
+        assert!(out.contains("[exit code 3]"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn bash_async_timeout_kills_group_and_keeps_partial_output() {
+        let dir = tempfile_dir("bash_timeout");
+        let started = std::time::Instant::now();
+        // The inner `sleep` is a grandchild; it must die with the group.
+        let out = execute_bash_async(
+            &dir,
+            "echo started; sleep 30 & echo $! > child.pid; wait",
+            Some(std::time::Duration::from_millis(500)),
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(out.contains("started"), "{out}");
+        assert!(out.contains("[timeout]"), "{out}");
+        let pid = std::fs::read_to_string(dir.join("child.pid")).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!pid_alive(pid.trim()), "grandchild {pid} survived the timeout");
+    }
+
+    #[tokio::test]
+    async fn bash_async_cancel_by_drop_kills_group() {
+        let dir = tempfile_dir("bash_cancel");
+        let fut = execute_bash_async(&dir, "sleep 30 & echo $! > child.pid; wait", None);
+        // Simulate `session/cancel`: the engine future is aborted mid-command.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), fut).await;
+        let pid = std::fs::read_to_string(dir.join("child.pid")).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!pid_alive(pid.trim()), "child {pid} survived cancellation");
+    }
+
+    #[tokio::test]
+    async fn bash_async_background_job_survives_normal_exit() {
+        let dir = tempfile_dir("bash_bg");
+        let out = execute_bash_async(
+            &dir,
+            "sleep 5 > /dev/null 2>&1 & echo $! > bg.pid",
+            Some(std::time::Duration::from_secs(10)),
+        )
+        .await;
+        assert!(!out.contains("[timeout]"), "{out}");
+        let pid = std::fs::read_to_string(dir.join("bg.pid")).unwrap();
+        assert!(pid_alive(pid.trim()), "backgrounded job {pid} was killed");
+        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+    }
+
+    fn tempfile_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("acp-bridge-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
     use super::*;
     use std::fs;
 

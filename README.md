@@ -125,7 +125,7 @@ ACP Harness          │  ┌───────────────┐  �
 2. acp-bridge translates to OpenAI chat completion API call
 3. LLM response streams back as SSE chunks
 4. Chunks are emitted as ACP `agent_message_chunk` notifications via **stdout**
-5. Conversation history is kept per session, auto-trimmed to prevent memory growth
+5. Conversation history is kept per session, trimmed by turn count and by a token budget (75% of `LLM_MODEL_CONTEXT`) without splitting tool calls from their results
 
 ### Key design decisions
 
@@ -140,7 +140,7 @@ acp-bridge makes **zero outbound network calls** beyond the user-configured LLM 
 
 - No telemetry, no update checks, no anonymous usage stats
 - No remote model registry lookups (no calls to `models.dev` or similar)
-- No automatic MCP server fetching — `mcpServers` in `session/new` is logged but not executed
+- No automatic MCP server fetching — stdio `mcpServers` passed by the Client in `session/new` are started as local child processes (e.g. Xcode's `xcrun mcpbridge`); nothing is downloaded, and `LLM_MCP=0` turns the relay off
 - The only HTTP traffic is to `LLM_BASE_URL` (default `http://localhost:11434/v1`)
 
 This makes acp-bridge safe to run on truly air-gapped networks: the binary will work identically with a local Ollama instance on a disconnected machine, and there is no failure path that depends on internet reachability.
@@ -222,12 +222,21 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_SYSTEM_PROMPT` | (auto-generated) | Custom system prompt |
 | `LLM_TEMPERATURE` | (model default) | Sampling temperature (0.0-2.0) |
 | `LLM_MAX_TOKENS` | (model default) | Maximum tokens to generate |
-| `LLM_TIMEOUT` | `300` | HTTP request timeout in seconds |
-| `LLM_MAX_HISTORY_TURNS` | `50` | Max conversation turns to keep (0 = unlimited) |
+| `LLM_TIMEOUT` | `300` | Seconds the LLM backend may stay silent (no bytes received) before a request fails. Not a total deadline: a response that keeps streaming may run as long as it needs. `0` = no timeout. |
+| `LLM_MAX_HISTORY_TURNS` | `50` | Max conversation turns to keep (0 = unlimited). A turn is a user prompt plus all tool calls, tool results and the answer it produced; trimming never separates a tool result from its call. Independently, the oldest turns are dropped once history plus tool schemas exceed 75% of `LLM_MODEL_CONTEXT`. |
+| `LLM_STREAM` | `true` | Stream responses in the agent loop: answer text and reasoning reach the Client live, tool calls are assembled from deltas. Set `false` for backends that cannot stream together with `tools`. |
 | `LLM_MAX_SESSIONS` | `0` | Max concurrent sessions (0 = unlimited) |
 | `LLM_SESSION_IDLE_TIMEOUT` | `0` | Evict idle sessions after N seconds (0 = disabled) |
 | `LLM_SUPPORTS_IMAGE` | `false` | Opt-in: advertise `promptCapabilities.image: true` at `initialize`. Set to `true` only if the configured backend can actually accept image content blocks (e.g. a vision-capable model). |
 | `LLM_MODEL_CONTEXT` | `32768` | Model context window in tokens. Reported as `size` in `usage_update` notifications. |
+| `LLM_MAX_TOOL_ROUNDS` | `100` | Maximum tool-call rounds per prompt turn before the turn ends with `stopReason: max_turn_requests`. `0` = unlimited (rely on `session/cancel`). |
+| `LLM_BASH_TIMEOUT` | `120` | Seconds a single `bash` tool call may run before its process group is killed (output so far is returned to the model). `0` = no timeout. `session/cancel` always kills a running command. |
+| `LLM_MCP` | `true` | Relay the stdio MCP servers the Client passes in `session/new` (e.g. Xcode's tools): their tools are offered to the model next to the built-ins. `http`/`sse` servers are skipped. |
+| `LLM_XCODE_TOOLS` | `auto` | Start Xcode's tool server (`xcrun mcpbridge`) when the Client did not pass it. `auto` = only when running under Xcode (Client name or inherited bundle id), `on` = always (macOS), `off` = never. |
+| `LLM_MCP_TOOLS` | (all) | Comma-separated MCP tool names to expose (`*` wildcard, e.g. `Build*,Run*Tests,Xcode*`). When unset and the full Xcode tool set (~22k tokens of schema) would exceed 1/4 of `LLM_MODEL_CONTEXT`, a core set (build, diagnostics, tests, run, docs, project-file ops) is exposed instead. |
+| `LLM_MCP_EXCLUDE_TOOLS` | (none) | Comma-separated MCP tool names never to expose (`*` wildcard). |
+| `LLM_MCP_TOOL_TIMEOUT` | `600` | Seconds one MCP tool call (e.g. `BuildProject`, `RunAllTests`) may take. `0` = no timeout. `session/cancel` always aborts it. |
+| `LLM_MCP_CONNECT_TIMEOUT` | `120` | Seconds an MCP server may take for its handshake (`initialize` + `tools/list`). Xcode's bridge can take 15-40 s the first time; the first prompt shows "Connecting to Xcode tools…" while it waits. `0` = no timeout. |
 | `LLM_WEB_ALLOWLIST` | (empty) | Comma-separated host suffixes the `web_fetch` tool is allowed to reach. Empty = block all web access. |
 | `RUST_LOG` | `acp_bridge=info` | Log level (`debug`, `info`, `warn`, `error`) |
 
@@ -270,6 +279,70 @@ cargo install --git https://github.com/BlakeHung/acp-bridge
 | MacBook Pro M3/M4 | 18-24GB | `gemma4:26b` | `ollama pull gemma4:26b` |
 | MacBook Pro M4 Pro | 48GB | `qwen2.5:32b` | `ollama pull qwen2.5:32b` |
 | Mac Studio M2/M4 Ultra | 64-192GB | `llama3.1:70b` | `ollama pull llama3.1:70b` |
+
+## Use with Xcode (LM Studio)
+
+Xcode 27 can talk to any ACP agent. It reads one plist per agent from
+`~/Library/Developer/Xcode/CodingAssistant/ACP/<UUID>.plist`. Xcode does
+not inherit your shell environment, so put the backend settings in the
+plist's `environment` dict.
+
+```bash
+cargo build --release
+mkdir -p ~/.local/bin && cp target/release/acp-bridge ~/.local/bin/
+
+cat > ~/Library/Developer/Xcode/CodingAssistant/ACP/$(uuidgen).plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>name</key>        <string>LM Studio (acp-bridge)</string>
+  <key>agent</key>       <string>$HOME/.local/bin/acp-bridge</string>
+  <key>arguments</key>   <array/>
+  <key>environment</key>
+  <dict>
+    <key>LLM_BASE_URL</key>      <string>http://localhost:1234/v1</string>
+    <key>LLM_MODEL</key>         <string>qwen/qwen3-coder-next</string>
+    <key>LLM_MODEL_CONTEXT</key> <string>262144</string>
+    <!-- No round cap: Xcode's stop button cancels the turn -->
+    <key>LLM_MAX_TOOL_ROUNDS</key> <string>0</string>
+  </dict>
+</dict>
+</plist>
+EOF
+```
+
+Start LM Studio's server (Developer tab → Start Server, port 1234), load a
+model that supports tool use, and set `LLM_MODEL` to the id that
+`curl localhost:1234/v1/models` reports. Then restart Xcode. The agent
+appears under Settings → Intelligence and in the chat agent picker.
+
+### Xcode tools
+
+Xcode exposes its own tools over MCP (`xcrun mcpbridge`): `BuildProject`,
+`GetBuildLog`, `XcodeRefreshCodeIssuesInFile`, `RunSomeTests` /
+`RunAllTests`, `RunProject`, `RenderPreview`, `DocumentationSearch`,
+`XcodeWrite` / `XcodeMV` / `XcodeRM`, `AddInfoPlist`, `AddEntitlement`,
+build settings and more. acp-bridge connects to them for every session:
+
+- servers Xcode passes in `session/new` → `mcpServers` are started as-is;
+- if Xcode passes none, acp-bridge starts `xcrun mcpbridge` itself
+  (`LLM_XCODE_TOOLS=auto`).
+
+Their tools are offered to the model next to the built-in ones, and the
+system prompt gets a short "Xcode tools" section telling the model to build
+with `BuildProject` instead of `xcodebuild`, check edited files with
+`XcodeRefreshCodeIssuesInFile`, run tests with the test tools, create
+files with `XcodeWrite` so they join the target, use `AddInfoPlist` /
+`AddEntitlement` instead of editing those files, and look up APIs with
+`DocumentationSearch`. Only tools that are actually exposed are mentioned.
+
+The full Xcode tool set is ~22k tokens of schema per request. With a large
+context (`LLM_MODEL_CONTEXT=262144` above) all tools are exposed; with a
+small one acp-bridge falls back to a core set. Choose explicitly with
+`LLM_MCP_TOOLS` / `LLM_MCP_EXCLUDE_TOOLS`. If a tool reports that the agent
+isn't approved yet, approve it in Xcode (the model is told to call
+`XcodeOpenWorkspace`, which prompts for approval).
 
 ## Use with openab
 
@@ -367,7 +440,7 @@ the matching wire shape from the same code base.
 | Method | Status |
 |--------|--------|
 | `initialize` | Supported. v1: emits `agentCapabilities` + `agentInfo`. v2: emits unified `capabilities` + `info`. Image capability opt-in via `LLM_SUPPORTS_IMAGE`. |
-| `session/new` | Multi-session with per-session conversation history. `mcpServers` param accepted but ignored (acp-bridge has no MCP relay). |
+| `session/new` | Multi-session with per-session conversation history. stdio `mcpServers` are started and their tools relayed to the model (`mcpCapabilities: {http: false, sse: false}`). |
 | `session/prompt` | Streaming via SSE → `session/update` notifications. Text and `ContentBlock::ResourceLink` always supported; `ContentBlock::Image` only when `LLM_SUPPORTS_IMAGE=true`. Final response shape is version-aware (v1: `{stopReason, status, text}`; v2: `{messageId}` with `stopReason` on `state_update`). |
 | `session/cancel` notification | Aborts in-flight LLM requests and answers the prompt with cancellation. Synchronous tools finish before cancellation takes effect. |
 | `session/end` (v1) / `session/close` (v2 baseline) | Session cleanup. Both methods share the same implementation. |
@@ -427,7 +500,7 @@ When spawned by openab, logs go to the child process's stderr. To capture them, 
 
 - **Retry with exponential backoff** — transient errors (408, 429, 500, 502, 503, 504) and connection timeouts are retried up to 3 times with exponential backoff (500ms, 1s, 2s)
 - **Graceful shutdown** — handles SIGINT/SIGTERM and stdin EOF cleanly, drains in-flight requests
-- **Memory-bounded sessions** — conversation history auto-trims to `LLM_MAX_HISTORY_TURNS` (default 50 turns), preventing OOM in long sessions
+- **Memory-bounded sessions** — conversation history trims to `LLM_MAX_HISTORY_TURNS` (default 50 turns) and to 75% of `LLM_MODEL_CONTEXT`, preventing OOM and context overflows in long sessions
 - **Session limits** — configurable `LLM_MAX_SESSIONS` to cap concurrent sessions, and `LLM_SESSION_IDLE_TIMEOUT` to auto-evict idle sessions
 - **Stream buffer cap** — SSE stream buffer capped at 10MB to prevent unbounded memory growth from malicious or buggy backends
 - **HTTP connection pooling** — reuses a shared HTTP client across all requests, reducing TCP/TLS handshake overhead
