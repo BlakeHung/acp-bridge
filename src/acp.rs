@@ -132,16 +132,35 @@ pub fn kind_for_tool(name: &str) -> &'static str {
         // affordance) get a sensible default.
         "git_status" | "git_diff" | "git_log" | "git_commit" => "execute",
         // Xcode's MCP tools (`xcrun mcpbridge`)
-        "XcodeRead" | "XcodeLS" | "XcodeGlob" | "GetBuildLog" | "GetTestList"
-        | "GetConsoleOutput" | "XcodeRefreshCodeIssuesInFile" | "GetTargetBuildSettings"
-        | "XcodeListWorkspaces" | "XcodeListSchemes" | "XcodeListTargets" => "read",
-        "XcodeWrite" | "XcodeUpdate" | "XcodeMakeDir" | "AddInfoPlist" | "AddEntitlement"
-        | "UpdateTargetBuildSetting" | "UpdateFileCompilerFlags" => "edit",
+        "XcodeRead"
+        | "XcodeLS"
+        | "XcodeGlob"
+        | "GetBuildLog"
+        | "GetTestList"
+        | "GetConsoleOutput"
+        | "XcodeRefreshCodeIssuesInFile"
+        | "GetTargetBuildSettings"
+        | "XcodeListWorkspaces"
+        | "XcodeListSchemes"
+        | "XcodeListTargets" => "read",
+        "XcodeWrite"
+        | "XcodeUpdate"
+        | "XcodeMakeDir"
+        | "AddInfoPlist"
+        | "AddEntitlement"
+        | "UpdateTargetBuildSetting"
+        | "UpdateFileCompilerFlags" => "edit",
         "XcodeRM" => "delete",
         "XcodeMV" => "move",
         "XcodeGrep" | "DocumentationSearch" => "search",
-        "BuildProject" | "RunAllTests" | "RunSomeTests" | "RunProject" | "StopProject"
-        | "RenderPreview" | "RunCodeSnippet" | "InvokeDebuggerCommand" => "execute",
+        "BuildProject"
+        | "RunAllTests"
+        | "RunSomeTests"
+        | "RunProject"
+        | "StopProject"
+        | "RenderPreview"
+        | "RunCodeSnippet"
+        | "InvokeDebuggerCommand" => "execute",
         // Everything else (delete/move/think are not yet in the default
         // toolset but we list the enum values for completeness).
         _ => "other",
@@ -182,16 +201,16 @@ pub fn tool_title(name: &str, input: Option<&Value>) -> String {
         // Xcode's MCP tools
         "BuildProject" => Some("Build project".into()),
         "RunAllTests" => Some("Run all tests".into()),
-        "RunSomeTests" => Some(match input.and_then(|v| v.get("tests")).and_then(Value::as_array) {
-            Some(t) if !t.is_empty() => format!("Run tests ({})", t.len()),
-            _ => "Run tests".into(),
-        }),
+        "RunSomeTests" => Some(
+            match input.and_then(|v| v.get("tests")).and_then(Value::as_array) {
+                Some(t) if !t.is_empty() => format!("Run tests ({})", t.len()),
+                _ => "Run tests".into(),
+            },
+        ),
         "RunProject" => Some("Run app".into()),
         "StopProject" => Some("Stop app".into()),
         "GetBuildLog" => Some("Build log".into()),
-        "XcodeRefreshCodeIssuesInFile" => {
-            arg("filePath").map(|p| format!("Check issues in {p}"))
-        }
+        "XcodeRefreshCodeIssuesInFile" => arg("filePath").map(|p| format!("Check issues in {p}")),
         "XcodeRead" => arg("filePath").map(|p| format!("Read {p}")),
         "XcodeWrite" => arg("filePath").map(|p| format!("Write {p}")),
         "XcodeUpdate" => arg("filePath").map(|p| format!("Edit {p}")),
@@ -723,13 +742,22 @@ mod tests {
         );
         assert_eq!(tool_title("git_status", Some(&json!({}))), "git status");
         assert_eq!(tool_title("bash", None), "bash");
-        assert_eq!(tool_title("bash", Some(&json!({"command": "a\nb"}))), "a ⏎ b");
+        assert_eq!(
+            tool_title("bash", Some(&json!({"command": "a\nb"}))),
+            "a ⏎ b"
+        );
     }
 
     #[test]
     fn tool_start_payload_includes_raw_input_and_locations() {
         let input = json!({"path": "a.swift"});
-        let p = tool_start_payload("tool_call", "tc1", "read_file", Some(&input), Some("/x/a.swift"));
+        let p = tool_start_payload(
+            "tool_call",
+            "tc1",
+            "read_file",
+            Some(&input),
+            Some("/x/a.swift"),
+        );
         assert_eq!(p["title"], "Read a.swift");
         assert_eq!(p["kind"], "read");
         assert_eq!(p["rawInput"], input);

@@ -240,8 +240,7 @@ pub fn spawn_mock_tool_llm() -> String {
                     }
                 }
                 let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-                let body: Value =
-                    serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
+                let body: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
                 let response = if head.starts_with("POST") && head.contains("/chat/completions") {
                     let has_tool_result = body["messages"]
                         .as_array()

@@ -16,7 +16,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-
 /// Extract concatenated text from a slice of ACP/A2A content parts.
 ///
 /// Each part is expected to be an object with `"type": "text"` and `"text": "..."`.
@@ -513,8 +512,7 @@ pub fn session_new_with_mcp(
         PathBuf::from(&cwd),
         protocol_version,
     );
-    let specs =
-        crate::mcp::resolve_servers(&state.mcp, mcp_servers, state.client_name.as_deref());
+    let specs = crate::mcp::resolve_servers(&state.mcp, mcp_servers, state.client_name.as_deref());
     if !specs.is_empty() {
         let set = crate::mcp::McpSet::start(
             specs,
@@ -673,7 +671,10 @@ pub async fn session_prompt(
         {
             let removed = session.trim_history_to(
                 state.config.max_history_turns,
-                Some(history_token_budget(&state.config, &tools::tool_definitions())),
+                Some(history_token_budget(
+                    &state.config,
+                    &tools::tool_definitions(),
+                )),
             );
             if removed > 0 {
                 debug!(removed, "Trimmed conversation history");
@@ -738,27 +739,32 @@ pub async fn session_prompt(
         let mut streamed_text = false;
         let chat_result = if state.config.stream {
             let separate = emitted_any_text;
-            llm::chat_streaming(&state.config, &messages, Some(&tool_defs), |delta| match delta {
-                llm::StreamDelta::Content(t) => {
-                    if streamed_text {
-                        notify(Notification::TextChunk(t));
-                        return;
+            llm::chat_streaming(
+                &state.config,
+                &messages,
+                Some(&tool_defs),
+                |delta| match delta {
+                    llm::StreamDelta::Content(t) => {
+                        if streamed_text {
+                            notify(Notification::TextChunk(t));
+                            return;
+                        }
+                        // Drop leading whitespace of a round's text (models
+                        // often emit bare newlines around tool calls) and
+                        // separate it from the previous round's commentary.
+                        let t = t.trim_start();
+                        if t.is_empty() {
+                            return;
+                        }
+                        if separate {
+                            notify(Notification::TextChunk("\n\n".into()));
+                        }
+                        streamed_text = true;
+                        notify(Notification::TextChunk(t.to_string()));
                     }
-                    // Drop leading whitespace of a round's text (models
-                    // often emit bare newlines around tool calls) and
-                    // separate it from the previous round's commentary.
-                    let t = t.trim_start();
-                    if t.is_empty() {
-                        return;
-                    }
-                    if separate {
-                        notify(Notification::TextChunk("\n\n".into()));
-                    }
-                    streamed_text = true;
-                    notify(Notification::TextChunk(t.to_string()));
-                }
-                llm::StreamDelta::Reasoning(t) => notify(Notification::ThoughtChunk(t)),
-            })
+                    llm::StreamDelta::Reasoning(t) => notify(Notification::ThoughtChunk(t)),
+                },
+            )
             .await
         } else {
             llm::chat(&state.config, &messages, None, Some(&tool_defs)).await
@@ -852,13 +858,16 @@ pub async fn session_prompt(
                         .and_then(|p| p.as_str())
                         .filter(|_| crate::mcp::is_builtin_tool(name))
                         .map(|p| {
-                        let p = std::path::Path::new(p);
-                        if p.is_absolute() {
-                            p.display().to_string()
-                        } else {
-                            std::path::Path::new(&working_dir).join(p).display().to_string()
-                        }
-                    });
+                            let p = std::path::Path::new(p);
+                            if p.is_absolute() {
+                                p.display().to_string()
+                            } else {
+                                std::path::Path::new(&working_dir)
+                                    .join(p)
+                                    .display()
+                                    .to_string()
+                            }
+                        });
                     notify(Notification::ToolStart {
                         id: tool_call_id.to_string(),
                         name: name.into(),
@@ -951,7 +960,6 @@ pub async fn session_prompt(
         had_error = true;
     }
 
-
     // Estimate the current context utilization for `usage_update`. Local
     // backends rarely stream per-turn token counts in a stable shape, so
     // we estimate by summing the textual length of every message in the
@@ -987,7 +995,10 @@ pub async fn session_prompt(
 /// model's reply. Never below 1/4 of the context, so a large tool set
 /// cannot starve the conversation entirely.
 fn history_token_budget(config: &crate::llm::LlmConfig, tool_defs: &[Value]) -> u64 {
-    let tools: u64 = tool_defs.iter().map(|d| (d.to_string().len() / 4) as u64).sum();
+    let tools: u64 = tool_defs
+        .iter()
+        .map(|d| (d.to_string().len() / 4) as u64)
+        .sum();
     (config.context_size / 4 * 3)
         .saturating_sub(tools)
         .max(config.context_size / 4)
@@ -1005,8 +1016,14 @@ async fn prepare_mcp(
     // Servers connect in the background from `session/new`; Xcode's can
     // take a while the first time. Say so instead of stalling silently.
     if !mcp.is_ready() && !mcp.wait_ready(Duration::from_millis(1500)).await {
-        let what = if mcp.has_xcode() { "Xcode tools" } else { "MCP tools" };
-        notify(Notification::ThoughtChunk(format!("Connecting to {what}…\n")));
+        let what = if mcp.has_xcode() {
+            "Xcode tools"
+        } else {
+            "MCP tools"
+        };
+        notify(Notification::ThoughtChunk(format!(
+            "Connecting to {what}…\n"
+        )));
         // Bounded by the servers' connect timeout.
         mcp.wait_connected().await;
     }
@@ -1028,7 +1045,9 @@ async fn prepare_mcp(
     let mut sessions = state.sessions_write();
     if let Some(s) = sessions.get_mut(session_id) {
         s.mcp_prompt_applied = true;
-        if let Some(Value::String(content)) = s.messages.first_mut().and_then(|m| m.get_mut("content")) {
+        if let Some(Value::String(content)) =
+            s.messages.first_mut().and_then(|m| m.get_mut("content"))
+        {
             content.push_str(&addendum);
         }
     }
@@ -1151,7 +1170,10 @@ mod tests {
 
     #[test]
     fn normalize_cwd_strips_control_characters_only() {
-        assert_eq!(normalize_cwd("/tmp/a\nIGNORE PREVIOUS\0"), "/tmp/aIGNORE PREVIOUS");
+        assert_eq!(
+            normalize_cwd("/tmp/a\nIGNORE PREVIOUS\0"),
+            "/tmp/aIGNORE PREVIOUS"
+        );
         assert_eq!(normalize_cwd("   "), "/tmp");
         assert_eq!(normalize_cwd(""), "/tmp");
         assert_eq!(normalize_cwd("\n\t"), "/tmp");
@@ -1163,14 +1185,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let state = AppState::with_mcp(
             cfg_with_image(false),
-            crate::mcp::McpConfig { enabled: false, xcode: crate::mcp::XcodeMode::Off, ..Default::default() },
+            crate::mcp::McpConfig {
+                enabled: false,
+                xcode: crate::mcp::XcodeMode::Off,
+                ..Default::default()
+            },
         );
         let cwd = dir.to_str().unwrap();
         let sid = session_new(&state, cwd, crate::protocol::ProtocolVersion::V1).unwrap();
         let sessions = state.sessions_read();
         let s = &sessions[&sid];
         assert_eq!(s.working_dir, dir);
-        assert!(s.messages[0]["content"].as_str().unwrap().contains(&format!("{cwd:?}")));
+        assert!(s.messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{cwd:?}")));
         drop(sessions);
         let _ = std::fs::remove_dir(&dir);
     }
@@ -1192,8 +1221,12 @@ mod tests {
     fn derive_prompt_title_single_block_and_string() {
         let prompt = json!([{"type": "text", "text": "\n  Fix the bug\nmore"}]);
         assert_eq!(derive_prompt_title(&prompt).as_deref(), Some("Fix the bug"));
-        assert_eq!(derive_prompt_title(&json!("hello")).as_deref(), Some("hello"));
-        let only_reminder = json!([{"type": "text", "text": "<system-reminder>x</system-reminder>"}]);
+        assert_eq!(
+            derive_prompt_title(&json!("hello")).as_deref(),
+            Some("hello")
+        );
+        let only_reminder =
+            json!([{"type": "text", "text": "<system-reminder>x</system-reminder>"}]);
         assert_eq!(derive_prompt_title(&only_reminder), None);
     }
     use super::*;
@@ -1510,7 +1543,9 @@ mod tests {
             output: None,
         };
         match n {
-            Notification::ToolDone { id, name, status, .. } => {
+            Notification::ToolDone {
+                id, name, status, ..
+            } => {
                 assert_eq!(id, "tc_42");
                 assert_eq!(name, "read_file");
                 assert_eq!(status, "completed");

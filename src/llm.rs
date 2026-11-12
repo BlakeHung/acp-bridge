@@ -1297,7 +1297,10 @@ fn partial_suffix_len(buf: &str, tags: &[&str]) -> usize {
     let mut best = 0;
     for tag in tags {
         for len in (1..tag.len()).rev() {
-            if len <= buf.len() && buf.is_char_boundary(buf.len() - len) && tag.starts_with(&buf[buf.len() - len..]) {
+            if len <= buf.len()
+                && buf.is_char_boundary(buf.len() - len)
+                && tag.starts_with(&buf[buf.len() - len..])
+            {
                 best = best.max(len);
                 break;
             }
@@ -1339,7 +1342,10 @@ impl StreamAssembler {
 
     /// Merge an OpenAI `delta.tool_calls` fragment.
     fn on_openai_tool_delta(&mut self, frag: &Value) {
-        let index = frag.get("index").and_then(|i| i.as_u64()).unwrap_or(self.tool_calls.len() as u64) as usize;
+        let index = frag
+            .get("index")
+            .and_then(|i| i.as_u64())
+            .unwrap_or(self.tool_calls.len() as u64) as usize;
         while self.tool_calls.len() <= index {
             self.tool_calls.push(json!({
                 "id": "", "type": "function",
@@ -1359,7 +1365,10 @@ impl StreamAssembler {
             }
             match f.get("arguments") {
                 Some(Value::String(a)) => {
-                    let cur = call["function"]["arguments"].as_str().unwrap_or("").to_string();
+                    let cur = call["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     call["function"]["arguments"] = json!(cur + a);
                 }
                 Some(other @ Value::Object(_)) => call["function"]["arguments"] = other.clone(),
@@ -1445,7 +1454,10 @@ pub async fn chat_streaming<F: FnMut(StreamDelta) + Send>(
 
     if !is_stream {
         // Server ignored `stream: true` — parse the whole body.
-        let bytes = response.bytes().await.map_err(|e| LlmError::from_reqwest(&e, &url))?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| LlmError::from_reqwest(&e, &url))?;
         let parsed: Value = serde_json::from_slice(&bytes).map_err(|e| LlmError {
             kind: LlmErrorKind::ParseError,
             message: format!("Failed to parse response as JSON: {e}"),
@@ -1454,7 +1466,10 @@ pub async fn chat_streaming<F: FnMut(StreamDelta) + Send>(
         let msg = if native {
             parsed.get("message")
         } else {
-            parsed.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"))
+            parsed
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
         };
         if let Some(msg) = msg {
             for key in ["reasoning_content", "reasoning", "thinking"] {
@@ -1530,7 +1545,11 @@ fn handle_sse_line<F: FnMut(StreamDelta)>(
         return Ok(false);
     };
     if let Some(err) = parsed.get("error") {
-        let msg = err.get("message").and_then(|m| m.as_str()).map(str::to_string).unwrap_or_else(|| err.to_string());
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
         return Err(stream_error(format!("Backend error in stream: {msg}")));
     }
     let Some(choice) = parsed.get("choices").and_then(|c| c.get(0)) else {
@@ -1570,7 +1589,10 @@ fn handle_ollama_line<F: FnMut(StreamDelta)>(
         return Ok(false);
     };
     if let Some(err) = parsed.get("error") {
-        let msg = err.as_str().map(str::to_string).unwrap_or_else(|| err.to_string());
+        let msg = err
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
         return Err(stream_error(format!("Backend error in stream: {msg}")));
     }
     if let Some(msg) = parsed.get("message") {
@@ -1654,7 +1676,10 @@ mod tests {
         assert_eq!(msg["content"], "Let me look.");
         assert_eq!(msg["tool_calls"][0]["id"], "call_a");
         assert_eq!(msg["tool_calls"][0]["function"]["name"], "list_dir");
-        assert_eq!(msg["tool_calls"][0]["function"]["arguments"], "{\"path\": \".\"}");
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["arguments"],
+            "{\"path\": \".\"}"
+        );
         assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(
             seen,
@@ -1671,8 +1696,12 @@ mod tests {
     fn sse_error_event_becomes_llm_error() {
         let mut asm = StreamAssembler::default();
         let mut cb = |_d: StreamDelta| {};
-        let err = handle_sse_line(r#"data: {"error":{"message":"context length exceeded"}}"#, &mut asm, &mut cb)
-            .unwrap_err();
+        let err = handle_sse_line(
+            r#"data: {"error":{"message":"context length exceeded"}}"#,
+            &mut asm,
+            &mut cb,
+        )
+        .unwrap_err();
         assert!(err.message.contains("context length exceeded"));
     }
 
@@ -2063,13 +2092,22 @@ mod tests {
         cfg.timeout_secs = 1;
         cfg.client = build_http_client(1);
         let mut text = String::new();
-        let r = chat_streaming(&cfg, &[json!({"role": "user", "content": "hi"})], None, |d| {
-            if let StreamDelta::Content(t) = d {
-                text.push_str(&t);
-            }
-        })
+        let r = chat_streaming(
+            &cfg,
+            &[json!({"role": "user", "content": "hi"})],
+            None,
+            |d| {
+                if let StreamDelta::Content(t) = d {
+                    text.push_str(&t);
+                }
+            },
+        )
         .await;
-        assert!(r.is_ok(), "stream should not hit a total deadline: {:?}", r.err().map(|e| e.message));
+        assert!(
+            r.is_ok(),
+            "stream should not hit a total deadline: {:?}",
+            r.err().map(|e| e.message)
+        );
         assert_eq!(text, "aaaaaa");
     }
 
@@ -2080,7 +2118,13 @@ mod tests {
         cfg.timeout_secs = 1;
         cfg.client = build_http_client(1);
         let started = std::time::Instant::now();
-        let r = chat_streaming(&cfg, &[json!({"role": "user", "content": "hi"})], None, |_| {}).await;
+        let r = chat_streaming(
+            &cfg,
+            &[json!({"role": "user", "content": "hi"})],
+            None,
+            |_| {},
+        )
+        .await;
         assert!(r.is_err(), "a silent backend must time out");
         assert!(started.elapsed() < Duration::from_secs(9));
     }

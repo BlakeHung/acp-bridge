@@ -816,11 +816,17 @@ pub async fn execute_bash_async(
         })
     };
     let out_task = spawn_reader(
-        child.stdout.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
         Arc::clone(&out_buf),
     );
     let err_task = spawn_reader(
-        child.stderr.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
         Arc::clone(&err_buf),
     );
 
@@ -1332,12 +1338,19 @@ mod tests {
             Some(std::time::Duration::from_millis(500)),
         )
         .await;
-        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
         assert!(out.contains("started"), "{out}");
         assert!(out.contains("[timeout]"), "{out}");
         let pid = std::fs::read_to_string(dir.join("child.pid")).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!pid_alive(pid.trim()), "grandchild {pid} survived the timeout");
+        assert!(
+            !pid_alive(pid.trim()),
+            "grandchild {pid} survived the timeout"
+        );
     }
 
     #[tokio::test]

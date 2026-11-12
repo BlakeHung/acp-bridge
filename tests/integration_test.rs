@@ -467,7 +467,10 @@ async fn test_session_prompt_streaming() {
         k == "tool_call" || k == "tool_call_update"
     });
     assert!(has_thinking, "Should have thinking notification");
-    assert!(!has_tool, "Plain-text turn should not emit tool notifications");
+    assert!(
+        !has_tool,
+        "Plain-text turn should not emit tool notifications"
+    );
 
     assert_eq!(response["result"]["status"], "completed");
 
