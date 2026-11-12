@@ -546,14 +546,15 @@ pub fn session_new_with_mcp(
 /// filter silently turned `~/My App (2)` into a directory that does not
 /// exist. Only control characters are removed (a newline could otherwise
 /// break out of the system-prompt line the path appears on, where it is
-/// also quoted). An empty value falls back to `/tmp`.
+/// also quoted). Whitespace is kept: a directory name may legally start or
+/// end with a space. A value that is empty or only whitespace falls back
+/// to `/tmp`.
 fn normalize_cwd(raw: &str) -> String {
     let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-    let cleaned = cleaned.trim();
-    if cleaned.is_empty() {
+    if cleaned.trim().is_empty() {
         "/tmp".to_string()
     } else {
-        cleaned.to_string()
+        cleaned
     }
 }
 
@@ -1141,6 +1142,8 @@ mod tests {
             "/Users/erik/Foo+Bar/a,b@c",
             "/Users/erik/Développement/プロジェクト",
             "/tmp/test",
+            "/Users/erik/Project ",
+            "/Users/erik/ Leading",
         ] {
             assert_eq!(normalize_cwd(p), p);
         }
@@ -1149,7 +1152,7 @@ mod tests {
     #[test]
     fn normalize_cwd_strips_control_characters_only() {
         assert_eq!(normalize_cwd("/tmp/a\nIGNORE PREVIOUS\0"), "/tmp/aIGNORE PREVIOUS");
-        assert_eq!(normalize_cwd("  /tmp/x  "), "/tmp/x");
+        assert_eq!(normalize_cwd("   "), "/tmp");
         assert_eq!(normalize_cwd(""), "/tmp");
         assert_eq!(normalize_cwd("\n\t"), "/tmp");
     }
