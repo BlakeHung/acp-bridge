@@ -22,6 +22,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   descriptive titles and ACP tool kinds.
 
 ### Fixed
+- The `session/new` `cwd` is used verbatim: an allow-list filter silently
+  dropped legal path characters, so a project in e.g. `~/My App (2)` or
+  `Foo+Bar` got a working directory that does not exist and every tool
+  failed. Only control characters are removed now (spaces, including
+  leading/trailing ones, are kept); the path is quoted in
+  the system prompt, and a non-existent / relative `cwd` is logged.
 - `LLM_TIMEOUT` is now an idle (read) timeout instead of a total request
   deadline. Long streamed turns — e.g. a reasoning model on a large Xcode
   context — were cut off at exactly 300 s with "error decoding response

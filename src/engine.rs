@@ -490,11 +490,11 @@ pub fn session_new_with_mcp(
         }
     }
 
-    // Sanitize cwd
-    let cwd: String = cwd
-        .chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ' ' | '~'))
-        .collect();
+    let cwd = normalize_cwd(cwd);
+    let p = std::path::Path::new(&cwd);
+    if !p.is_absolute() || !p.is_dir() {
+        warn!(cwd = %cwd, "session/new cwd is not an existing absolute directory; tools may fail");
+    }
 
     let session_id = Uuid::new_v4().to_string();
 
@@ -502,7 +502,7 @@ pub fn session_new_with_mcp(
         std::env::var("LLM_SYSTEM_PROMPT").unwrap_or_else(|_| {
             format!(
                 "You are a helpful coding assistant running locally through acp-bridge. \
-                 The underlying model is `{}`. The user's working directory is: {cwd}",
+                 The underlying model is `{}`. The user's working directory is: {cwd:?}",
                 state.config.model
             )
         })
@@ -537,6 +537,25 @@ pub fn session_new_with_mcp(
     // learns the new sessionId first, then receives the post-session
     // notifications (commands, info update) bound to that id.
     Ok(session_id)
+}
+
+/// Clean a Client-supplied `cwd` without changing the path it names.
+///
+/// The path is used verbatim for tool execution, so legal path characters
+/// (`(`, `+`, `@`, `,`, non-ASCII, …) must survive; an earlier allow-list
+/// filter silently turned `~/My App (2)` into a directory that does not
+/// exist. Only control characters are removed (a newline could otherwise
+/// break out of the system-prompt line the path appears on, where it is
+/// also quoted). Whitespace is kept: a directory name may legally start or
+/// end with a space. A value that is empty or only whitespace falls back
+/// to `/tmp`.
+fn normalize_cwd(raw: &str) -> String {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.trim().is_empty() {
+        "/tmp".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Post-creation notifications to send after `session/new` returns.
@@ -1115,6 +1134,46 @@ pub struct UsageReport {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn normalize_cwd_keeps_legal_path_characters() {
+        for p in [
+            "/Users/erik/Developer/My App (2)",
+            "/Users/erik/Foo+Bar/a,b@c",
+            "/Users/erik/Développement/プロジェクト",
+            "/tmp/test",
+            "/Users/erik/Project ",
+            "/Users/erik/ Leading",
+        ] {
+            assert_eq!(normalize_cwd(p), p);
+        }
+    }
+
+    #[test]
+    fn normalize_cwd_strips_control_characters_only() {
+        assert_eq!(normalize_cwd("/tmp/a\nIGNORE PREVIOUS\0"), "/tmp/aIGNORE PREVIOUS");
+        assert_eq!(normalize_cwd("   "), "/tmp");
+        assert_eq!(normalize_cwd(""), "/tmp");
+        assert_eq!(normalize_cwd("\n\t"), "/tmp");
+    }
+
+    #[test]
+    fn session_working_dir_is_the_path_the_client_sent() {
+        let dir = std::env::temp_dir().join("acp bridge (cwd) +test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = AppState::with_mcp(
+            cfg_with_image(false),
+            crate::mcp::McpConfig { enabled: false, xcode: crate::mcp::XcodeMode::Off, ..Default::default() },
+        );
+        let cwd = dir.to_str().unwrap();
+        let sid = session_new(&state, cwd, crate::protocol::ProtocolVersion::V1).unwrap();
+        let sessions = state.sessions_read();
+        let s = &sessions[&sid];
+        assert_eq!(s.working_dir, dir);
+        assert!(s.messages[0]["content"].as_str().unwrap().contains(&format!("{cwd:?}")));
+        drop(sessions);
+        let _ = std::fs::remove_dir(&dir);
+    }
 
     #[test]
     fn derive_prompt_title_skips_xcode_system_reminder() {
