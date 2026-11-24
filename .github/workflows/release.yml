@@ -97,15 +97,25 @@ jobs:
         id: repo
         run: echo "name=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
 
+      - name: Compute image tags
+        id: tags
+        # `:latest` only moves on clean releases — an rc tag must not
+        # make `docker pull :latest` hand out a prerelease image.
+        run: |
+          base="ghcr.io/${{ steps.repo.outputs.name }}"
+          if echo "${GITHUB_REF_NAME}" | grep -q -- '-'; then
+            echo "tags=${base}:${{ steps.version.outputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${base}:${{ steps.version.outputs.version }},${base}:latest" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ steps.repo.outputs.name }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ steps.repo.outputs.name }}:latest
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
