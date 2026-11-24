@@ -137,8 +137,14 @@ async fn main() {
     // Probe backend
     probe_backend(&config).await;
 
-    // Build shared state
-    let state = AppState::with_policy(config, policy);
+    // Build shared state — session snapshots enabled only when the
+    // operator chose a directory (LLM_SESSION_DIR); without one
+    // `session/load` honestly reports `no_persistence`.
+    let session_store = acp_bridge::session_store::SessionStore::from_env();
+    if session_store.is_some() {
+        info!("Session snapshot store enabled (LLM_SESSION_DIR)");
+    }
+    let state = AppState::with_policy(config, policy, session_store);
 
     // Spawn idle session cleanup task
     let idle_timeout = state.config.session_idle_timeout_secs;
@@ -324,7 +330,11 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 // run_acp_loop the Arc has refcount 1, so
                                 // make_mut never actually clones.
                                 Arc::make_mut(&mut state).protocol_version = negotiated;
-                                let result = engine::initialize(&state.config, negotiated);
+                                let result = engine::initialize(
+                                    &state.config,
+                                    negotiated,
+                                    state.session_store.is_some(),
+                                );
                                 acp::send_response(&id, result);
                             }
                             "session/new" => {
@@ -414,17 +424,57 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 );
                             }
                             "session/load" | "session/resume" => {
-                                // acp-bridge has no persistence layer; it does not
-                                // advertise `loadSession` in `agentCapabilities`, so a
-                                // spec-compliant Client should not call this. We
-                                // return `-32001` (application error) with a stable
-                                // `data.reason` so Clients can branch on it.
-                                acp::send_error_with_data(
-                                    &id,
-                                    -32001,
-                                    "acp-bridge has no persistence layer; session/load and session/resume are unavailable",
-                                    json!({ "reason": "no_persistence" }),
-                                );
+                                // P1/E14: with `LLM_SESSION_DIR` set, sessions
+                                // snapshot to disk at turn boundaries and a
+                                // load restores them (plus any session still
+                                // live in memory). Without a store this is
+                                // still the honest `no_persistence` answer.
+                                let sid = params
+                                    .get("sessionId")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                match sid {
+                                    None => acp::send_error_with_data(
+                                        &id,
+                                        -32602,
+                                        "missing required parameter: sessionId",
+                                        json!({ "reason": "invalid_params" }),
+                                    ),
+                                    Some(sid) => {
+                                        match engine::session_load(&state, &sid) {
+                                            engine::SessionLoadOutcome::Loaded => {
+                                                acp::send_response(
+                                                    &id,
+                                                    json!({"sessionId": sid}),
+                                                );
+                                            }
+                                            engine::SessionLoadOutcome::NoStore => {
+                                                acp::send_error_with_data(
+                                                    &id,
+                                                    -32001,
+                                                    "acp-bridge has no persistence layer; set LLM_SESSION_DIR to enable session/load",
+                                                    json!({ "reason": "no_persistence" }),
+                                                );
+                                            }
+                                            engine::SessionLoadOutcome::NotFound => {
+                                                acp::send_error_with_data(
+                                                    &id,
+                                                    -32002,
+                                                    &format!("no session found for id {sid}"),
+                                                    json!({ "reason": "session_not_found" }),
+                                                );
+                                            }
+                                            engine::SessionLoadOutcome::Corrupt => {
+                                                acp::send_error_with_data(
+                                                    &id,
+                                                    -32001,
+                                                    &format!("session snapshot for {sid} could not be read"),
+                                                    json!({ "reason": "load_failed" }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             "session/delete" => {
                                 // v2 optional session method (advertised via

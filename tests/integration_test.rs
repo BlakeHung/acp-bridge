@@ -1561,6 +1561,127 @@ async fn test_policy_deny_reaches_model_as_tool_result() {
     h.shutdown();
 }
 
+/// E14 session snapshots: with `LLM_SESSION_DIR` set, a session that ran
+/// a turn on one bridge process must be loadable by a *fresh* bridge
+/// process pointed at the same directory — and the restored history
+/// must actually reach the model again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_load_restores_across_restart() {
+    let store_dir = std::env::temp_dir().join(format!(
+        "acp-session-store-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dir_str = store_dir.to_str().unwrap().to_string();
+
+    // Recorder mock: answers "first reply", captures every request body.
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let recorder = bodies.clone();
+    let app = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "first reply"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags));
+
+    // ── Bridge 1 → create session, run one turn, then die ──
+    let sid;
+    {
+        let port = free_port();
+        let mut h = TestHarness::start_with_router_and_env(
+            port,
+            app.clone(),
+            &[("LLM_SESSION_DIR", &dir_str)],
+        )
+        .await;
+        h.send(
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+        );
+        let resp = h.read_line();
+        // The capability is only honest with a store configured.
+        assert_eq!(resp["result"]["agentCapabilities"]["loadSession"], true);
+        h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}));
+        sid = h.read_line()["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        h.send(&json!({
+            "jsonrpc":"2.0","id":3,"method":"session/prompt",
+            "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hello persist"}]}
+        }));
+        let (_, resp) = h.read_until_response(3);
+        assert_eq!(resp["result"]["status"], "completed");
+        h.shutdown();
+    }
+
+    // ── Bridge 2 → same store dir, load the dead process's session ──
+    {
+        let port = free_port();
+        let mut h =
+            TestHarness::start_with_router_and_env(port, app, &[("LLM_SESSION_DIR", &dir_str)])
+                .await;
+        h.send(
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}),
+        );
+        h.read_line();
+        h.send(
+            &json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":&sid}}),
+        );
+        let resp = h.read_line();
+        assert!(
+            resp.get("error").is_none(),
+            "session/load failed after restart: {resp}"
+        );
+        assert_eq!(resp["result"]["sessionId"], sid);
+
+        // An unknown id gets a structured not-found, not a silent new session.
+        h.send(&json!({"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"no-such-id"}}));
+        let resp = h.read_line();
+        assert_eq!(resp["error"]["code"], -32002);
+        assert_eq!(resp["error"]["data"]["reason"], "session_not_found");
+
+        // Continue the restored session — the model must see the history.
+        h.send(&json!({
+            "jsonrpc":"2.0","id":4,"method":"session/prompt",
+            "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"again"}]}
+        }));
+        let (_, resp) = h.read_until_response(4);
+        assert_eq!(resp["result"]["status"], "completed");
+        h.shutdown();
+    }
+
+    let bodies = bodies.lock().unwrap();
+    let last = bodies.last().unwrap();
+    let all_text = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all_text.contains("hello persist"),
+        "restored session lost its history: {all_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// `LLM_TURN_TIMEOUT` is the whole-turn deadline: a turn whose model call
 /// outlasts it must come back `failed` fast, not hang on the backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

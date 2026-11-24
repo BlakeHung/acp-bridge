@@ -138,8 +138,9 @@ error.
 
 | Method | Reason | Error code |
 |---|---|---|
-| `session/load` | acp-bridge has no persistence layer | `-32001` (`data.reason: "no_persistence"`) |
-| `session/resume` | acp-bridge has no persistence layer | `-32001` (`data.reason: "no_persistence"`) |
+| `session/load` / `session/resume` (no `LLM_SESSION_DIR`) | acp-bridge has no persistence layer | `-32001` (`data.reason: "no_persistence"`) |
+| `session/load` / `session/resume` (store enabled, unknown id) | No snapshot for the id | `-32002` (`data.reason: "session_not_found"`) |
+| `session/load` (store enabled, unreadable snapshot) | Corrupt or unreadable snapshot file | `-32001` (`data.reason: "load_failed"`) |
 | `session/delete` (v2 optional) | No persistence to delete from; use `session/close` instead | `-32601` (`data.reason: "not_implemented"`) |
 | `session/set_mode` | `session/new` does not return a `modes` array | `-32602` (`data.reason: "no_modes"`) |
 | `auth/login` | `initialize` returns `authMethods: []` | `-32601` (`data.reason: "no_auth_methods"`) |
@@ -154,9 +155,11 @@ above are a safety net for Clients that don't.
 
 ## Things acp-bridge is not
 
-- **Not a session database.** Restart the agent and all sessions are gone.
-  If you need persistence, point acp-bridge at an external ACP-compatible
-  agent that does (e.g. Claude Code, Codex CLI, OpenCode).
+- **Not a session database.** Without `LLM_SESSION_DIR` there is no
+  persistence at all. With it set, sessions snapshot to flat JSON files
+  at turn boundaries and `session/load` can restore them across
+  restarts — that is a snapshot, not the durable store the plan's P3
+  work wants (no concurrent writers, no crash markers, no compaction).
 - **Not an auth provider.** No login flow, no token storage, no user
   identity. If you need per-user sessions, route through a Client that
   gates on its own identity.

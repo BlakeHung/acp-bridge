@@ -226,6 +226,9 @@ pub struct AppState {
     /// (P1/E12). `AppState::new` uses the default daily-driver profile;
     /// `main` builds the real one from `[policy]` + `LLM_POLICY_*`.
     pub policy: crate::policy::Policy,
+    /// Optional on-disk session snapshot store (P1/E14). `None` →
+    /// `session/load` answers `-32001 no_persistence`.
+    pub session_store: Option<std::sync::Arc<crate::session_store::SessionStore>>,
 }
 
 impl Clone for AppState {
@@ -236,6 +239,7 @@ impl Clone for AppState {
             config: self.config.clone(),
             protocol_version: self.protocol_version,
             policy: self.policy.clone(),
+            session_store: self.session_store.clone(),
         }
     }
 }
@@ -252,17 +256,33 @@ impl AppState {
             // AppState directly get v1 wire format without ceremony.
             protocol_version: crate::protocol::ProtocolVersion::V1,
             policy: crate::policy::Policy::default_policy(),
+            session_store: None,
         })
     }
 
-    /// Production constructor — same as `new` plus an explicit policy
-    /// resolved from the `[policy]` config section / `LLM_POLICY_*`.
-    pub fn with_policy(config: LlmConfig, policy: crate::policy::Policy) -> Arc<Self> {
+    /// Production constructor — `new` plus the real policy and an
+    /// optional session snapshot store resolved at startup.
+    pub fn with_policy(
+        config: LlmConfig,
+        policy: crate::policy::Policy,
+        session_store: Option<crate::session_store::SessionStore>,
+    ) -> Arc<Self> {
         let state = Self::new(config);
         Arc::new(Self {
             policy,
+            session_store: session_store.map(std::sync::Arc::new),
             ..(*state).clone()
         })
+    }
+
+    /// Write the session's current snapshot if a store is configured.
+    /// Snapshot failures are logged inside the store, never fatal.
+    pub fn persist_session(&self, session_id: &str) {
+        if let Some(store) = &self.session_store {
+            if let Some(session) = self.sessions_read().get(session_id) {
+                store.save(session_id, &session.working_dir, &session.messages);
+            }
+        }
     }
 
     fn sessions_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Session>> {
@@ -334,7 +354,11 @@ impl AppState {
 /// - `ProtocolVersion::V2` → unified `capabilities` + `info` shape, with
 ///   `promptCapabilities.image` expressed as `{}` (capability marker)
 ///   rather than `true`
-pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::ProtocolVersion) -> Value {
+pub fn initialize(
+    config: &LlmConfig,
+    protocol_version: crate::protocol::ProtocolVersion,
+    session_persistence: bool,
+) -> Value {
     info!(
         model = %config.model,
         base_url = %config.base_url,
@@ -354,21 +378,30 @@ pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::Protoco
         json!({})
     };
 
+    // `loadSession` is only honest when a snapshot store exists —
+    // with `LLM_SESSION_DIR` unset, `session/load` answers
+    // `no_persistence`, so we must not advertise the capability.
     match protocol_version {
-        crate::protocol::ProtocolVersion::V2 => json!({
-            "protocolVersion": 2,
-            "info": {
-                "name": format!("acp-bridge ({})", config.model),
-                "title": "acp-bridge",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "capabilities": {
-                "session": {
-                    "prompt": prompt_capabilities_v2
-                }
-            },
-            "authMethods": []
-        }),
+        crate::protocol::ProtocolVersion::V2 => {
+            let mut caps = json!({
+                "protocolVersion": 2,
+                "info": {
+                    "name": format!("acp-bridge ({})", config.model),
+                    "title": "acp-bridge",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "session": {
+                        "prompt": prompt_capabilities_v2
+                    }
+                },
+                "authMethods": []
+            });
+            if session_persistence {
+                caps["capabilities"]["session"]["load"] = json!({});
+            }
+            caps
+        }
         _ => {
             // v1 (default)
             let prompt_capabilities_v1 = if config.prompt_supports_image {
@@ -391,7 +424,8 @@ pub fn initialize(config: &LlmConfig, protocol_version: crate::protocol::Protoco
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "agentCapabilities": {
-                    "promptCapabilities": prompt_capabilities_v1
+                    "promptCapabilities": prompt_capabilities_v1,
+                    "loadSession": session_persistence
                 },
                 "authMethods": []
             })
@@ -456,6 +490,9 @@ pub fn session_new(
         protocol_version,
     );
     state.sessions_write().insert(session_id.clone(), session);
+
+    // Initial snapshot so a brand-new session also survives a restart.
+    state.persist_session(&session_id);
 
     info!(session_id = %session_id, max_history = state.config.max_history_turns, "New session");
 
@@ -997,6 +1034,10 @@ pub async fn session_prompt(
 
     evidence.wall_ms = turn_start.elapsed().as_millis();
 
+    // Turn-boundary snapshot (E14): persist the post-turn history so a
+    // later `session/load` can restore this state after a restart.
+    state.persist_session(session_id);
+
     PromptResult {
         status: status.into(),
         text: final_text,
@@ -1056,11 +1097,73 @@ fn session_aborted(state: &AppState, session_id: &str, marker: &str) {
                 .push(json!({"role": "assistant", "content": marker}));
         }
     }
+    state.persist_session(session_id);
+}
+
+/// Outcome of a `session/load` attempt — distinct enough that the wire
+/// layer can return the right error code and `data.reason`.
+pub enum SessionLoadOutcome {
+    /// Session is live in memory (already was, or just restored).
+    Loaded,
+    /// Store disabled → `-32001 no_persistence`.
+    NoStore,
+    /// Store enabled but no snapshot for this id (or its working dir
+    /// no longer exists) → `-32002 session_not_found`.
+    NotFound,
+    /// Snapshot exists but failed to parse → `-32001` with reason
+    /// `load_failed` — corrupt state must not silently become an
+    /// empty session.
+    Corrupt,
+}
+
+/// Handle `session/load` / `session/resume` (P1/E14).
+///
+/// - Session already live → return it as-is.
+/// - Store enabled → read the snapshot; a snapshot whose working
+///   directory no longer exists is treated as not-found rather than
+///   resurrected anchored at a stale path.
+/// - Store disabled → `NoStore` (the pre-E14 `no_persistence` path).
+pub fn session_load(state: &AppState, session_id: &str) -> SessionLoadOutcome {
+    if state.sessions_read().contains_key(session_id) {
+        return SessionLoadOutcome::Loaded;
+    }
+    let Some(store) = &state.session_store else {
+        return SessionLoadOutcome::NoStore;
+    };
+    match store.load(session_id) {
+        Ok(Some(loaded)) => {
+            let working_dir = match loaded.working_dir.canonicalize() {
+                Ok(p) if p.is_dir() => p,
+                _ => return SessionLoadOutcome::NotFound,
+            };
+            let session = Session {
+                messages: loaded.messages,
+                last_active: std::time::Instant::now(),
+                working_dir,
+                protocol_version: state.protocol_version,
+            };
+            state
+                .sessions_write()
+                .insert(session_id.to_string(), session);
+            info!(session_id = %session_id, "Session restored from snapshot");
+            SessionLoadOutcome::Loaded
+        }
+        Ok(None) => SessionLoadOutcome::NotFound,
+        Err(e) => {
+            warn!(session_id = %session_id, error = %e, "session snapshot load failed");
+            SessionLoadOutcome::Corrupt
+        }
+    }
 }
 
 /// Handle `session/end` — removes a session.
 pub fn session_end(state: &AppState, session_id: &str) -> Result<(), AcpError> {
     let removed = state.sessions_write().remove(session_id).is_some();
+    if removed {
+        if let Some(store) = &state.session_store {
+            store.delete(session_id);
+        }
+    }
     if removed {
         info!(session_id = %session_id, "Session ended");
         Ok(())
@@ -1377,7 +1480,7 @@ mod tests {
 
     #[test]
     fn initialize_does_not_advertise_image_by_default() {
-        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V1);
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V1, false);
         assert_eq!(caps["protocolVersion"], 1);
         assert_eq!(
             caps["agentCapabilities"]["promptCapabilities"]["image"], false,
@@ -1396,7 +1499,7 @@ mod tests {
 
     #[test]
     fn initialize_advertises_image_when_opted_in() {
-        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V1);
+        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V1, false);
         assert_eq!(
             caps["agentCapabilities"]["promptCapabilities"]["image"], true,
             "image must be true when prompt_supports_image is set"
@@ -1405,7 +1508,7 @@ mod tests {
 
     #[test]
     fn initialize_v2_uses_unified_capabilities_and_info_shape() {
-        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V2);
+        let caps = initialize(&cfg_with_image(true), ProtocolVersion::V2, false);
         assert_eq!(caps["protocolVersion"], 2);
         // v2 collapses agentCapabilities / clientCapabilities into a single
         // `capabilities`, and `agentInfo` / `clientInfo` into `info`.
@@ -1434,7 +1537,7 @@ mod tests {
 
     #[test]
     fn initialize_v2_omits_image_when_disabled() {
-        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V2);
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::V2, false);
         let prompt_caps = &caps["capabilities"]["session"]["prompt"];
         assert!(
             prompt_caps.get("image").is_none(),
@@ -1450,7 +1553,7 @@ mod tests {
         // should produce the v1 wire shape — Clients that omit
         // protocolVersion still get a working session on the most widely
         // deployed wire shape.
-        let caps = initialize(&cfg_with_image(false), ProtocolVersion::default());
+        let caps = initialize(&cfg_with_image(false), ProtocolVersion::default(), false);
         assert_eq!(caps["protocolVersion"], 1);
     }
 
