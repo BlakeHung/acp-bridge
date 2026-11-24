@@ -7,14 +7,37 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-24
+
+First slice of the agent-harness hardening plan (P0–P1): the bridge grows
+from a thin adapter into a bounded, observable, recoverable agent loop.
+ACP v1/v2 wire compatibility is unchanged — every addition is additive.
+
+### Added
+- **Bounded tool loop with honest `partial` status.** `LLM_MAX_TOOL_ROUNDS` (default 50, aligned with openab-agent's `OPENAB_AGENT_MAX_TOOL_LOOPS`) bounds model↔tool round-trips; on exhaustion a wrap-up call asks the model for a final answer, reported as `status: "partial"` + `stopReason: "max_turn_requests"` — never as `completed`. A second breaker, `LLM_TOOL_FAILURE_STREAK` (default 3), aborts the loop when the same tool+args fails identically N times and takes the same wrap-up path.
+- **Structured turn evidence.** The prompt response carries `evidence` — `rounds`, `toolCalls`, `toolsOk`, `toolsFailed`, `toolsDenied`, `toolsTimedOut`, `outputsTruncated`, `budgetHit` (`null` | `"rounds"` | `"failure_streak"`), `wallMs` — so automation can branch on data instead of prose. v1 puts it on the prompt result; v2 on the turn-ending `state_update`.
+- **Capability tool policy.** `[policy]` section / `LLM_POLICY_{READ,WRITE,SHELL,WEB}` with four actions: `allow` executes; `audit` emits a visible `[policy:audit]` notice then executes; `confirm` executes only with a deployment grant (`[policy] grants` / `LLM_POLICY_GRANTS`) and denies otherwise — it never executes unconfirmed; `deny` returns a structured `Denied` tool error the model can read. Defaults: read/write allow, shell/web audit.
+- **Workspace-relative path deny globs.** `deny_path_globs` / `LLM_POLICY_DENY_PATHS` (defaults cover `.env`, `*.pem`, `*.key`, `.ssh/**`, `.aws/**`, `.gnupg/**`) are enforced on file tools' `path` argument AND on every path `list_dir`/`search_code` enumerate — credential-shaped files cannot leak through search results either. `*` does not cross `/`, `**` does; a glob without `/` matches basenames at any depth.
+- **Async bounded tool execution.** bash/git_*/web_fetch run under `LLM_TOOL_TIMEOUT` (default 120 s) with process-group kills on Unix; `LLM_TURN_TIMEOUT` (default 0 = off) bounds the whole turn. Tool results carry `exit_code`, `error_kind`, and `truncated` flags.
+- **Opt-in session snapshots.** `LLM_SESSION_DIR` enables atomic per-session JSON snapshots; `session/load`/`session/resume` restore across restarts and `loadSession` is advertised only when a store is configured. Restored cwd is re-validated (missing dir → `-32602`); store errors split into `-32001 load_failed` (corrupt snapshot) vs `-32002 session_not_found` (no snapshot).
+- **Release channel split.** Tags containing `-` (e.g. `v0.10.0-rc.2`) produce binaries + GHCR image + a GitHub *prerelease* WITHOUT a crates.io publish; clean tags publish crates. `ghcr.io/.../acp-bridge:latest` only moves on clean tags.
+
 ### Fixed
+- **Review round-2 hardening.** Rejected `write_file` paths under symlinked parents no longer `create_dir_all` into the outside target (the deepest existing ancestor is canonical-verified first, and the new parent is re-verified after); process stdout/stderr are drained incrementally with a 1 MB retained bound per stream so `yes`-style output cannot exhaust memory; `search_code`/`list_dir` can no longer leak denied files (deny is checked before the hidden-file filter and counted as a policy skip); session snapshot ids reject any character outside `[A-Za-z0-9_-]` outright (no sanitize-collision) and snapshots carry a `message_count` completeness check plus `writer_pid` provenance.
 - `session/cancel` aborts an active ACP prompt and reports cancellation on both wire versions; concurrent prompts for one session are rejected; a cancelled turn is closed in history with a `[cancelled by user]` reply; an LLM response cut off mid-body is retried once.
 - Recovery path no longer pushes the raw assistant response into history twice, and recovered tool calls are recorded on the assistant message they belong to so `embedded_*` tool results are not orphaned.
 - `session/new` validates `cwd` by canonicalizing it and requiring an existing directory; invalid paths are rejected with `-32602` instead of being silently character-filtered (which mangled Windows paths like `C:\tools\proj`).
 - `session/prompt` drops image content blocks when image support is disabled (`LLM_SUPPORTS_IMAGE` unset/false) and emits a visible notice, instead of forwarding them and surfacing a provider HTTP 400.
+- Tool-timeout path kills the child before joining output readers — waiting on readers first would hang until the process exits on its own.
 
 ### Changed
 - **Configuration is now strict.** An unreadable or unparseable TOML config file, an unknown section/field, or a present-but-invalid `LLM_*` env var is a startup error (exit code 2) instead of a silent fallback to defaults. `LlmConfig::from_env` and `ConfigFile::into_llm_config` return `Result`. Old configs that only used documented fields are unaffected; configs written for future fields (e.g. `[permissions]`) must now be updated or the binary refuses to start.
+- `execute_tool` takes a `deny_globs` argument so policy applies to enumeration results and direct callers alike; shell tools cannot be path-filtered honestly (command strings are opaque) — `deny` shell if that matters, the limitation is documented in `docs/scope.md`.
+
+### Known limitations
+- Windows binaries build and run, but process-group kill on tool timeout is Unix-only — a timed-out bash on Windows kills the parent process only.
+- Streaming tool-call delivery (receiving tool_call deltas inside `stream_chat`) is not in this release.
+- Session cumulative quotas, artifact spill, and TerminalState race handling are deferred to later slices.
 
 ## [0.9.2] - 2026-10-06
 
