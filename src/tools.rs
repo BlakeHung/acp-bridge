@@ -7,6 +7,10 @@ use tracing::{debug, warn};
 
 /// Maximum file size to read (1 MB).
 const MAX_FILE_SIZE: u64 = 1024 * 1024;
+/// Read cap for files inside the session artifact root — matches
+/// `SessionStore::MAX_SNAPSHOT_BYTES` so every offloaded output stays
+/// re-readable through `read_file`.
+const ARTIFACT_MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 /// Maximum directory listing depth.
 const MAX_LIST_DEPTH: usize = 3;
 /// Maximum entries in directory listing.
@@ -345,7 +349,11 @@ fn resolve_sandboxed_path(
     // session artifact root (offloaded tool outputs the model may
     // re-read). Everything else stays workspace-relative — an absolute
     // path that escapes both roots is rejected, never clamped.
-    if relative_path.starts_with('/') {
+    // `Path::is_absolute` is platform-aware: on Windows it also covers
+    // `C:\…`, `\\server\share`, and `/…`; a bare `starts_with('/')`
+    // would misroute every Windows absolute path into the relative
+    // branch and reject it.
+    if std::path::Path::new(relative_path).is_absolute() {
         let canonical = std::path::PathBuf::from(relative_path)
             .canonicalize()
             .ok()?;
@@ -412,19 +420,22 @@ pub async fn execute_tool(
     match name {
         "read_file" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if !path.starts_with('/') {
+            if !std::path::Path::new(path).is_absolute() {
                 if let Some(e) = path_denied(path, deny_globs) {
                     return e;
                 }
             }
+            // u64→usize must saturate, not wrap: a hostile `offset` of
+            // u64::MAX would otherwise become a small number on 32-bit
+            // targets or wrap the page arithmetic below.
             let offset = arguments
                 .get("offset")
                 .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
             let limit = arguments
                 .get("limit")
                 .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
             execute_read_file(working_dir, path, artifact_root, offset, limit)
         }
         "list_dir" => {
@@ -598,15 +609,30 @@ fn execute_read_file(
         );
     }
 
+    // Artifact files are written up to the store's per-file quota
+    // (2 MB) — the generic 1 MB workspace cap would make the largest
+    // offloaded outputs unreadable through the very pointer that was
+    // meant to re-open them. Detect "resolved inside artifact_root"
+    // once; everything else keeps MAX_FILE_SIZE.
+    let is_artifact = artifact_root
+        .and_then(|r| r.canonicalize().ok())
+        .map(|root| path.starts_with(&root))
+        .unwrap_or(false);
+    let max_size = if is_artifact {
+        ARTIFACT_MAX_FILE_SIZE
+    } else {
+        MAX_FILE_SIZE
+    };
+
     // Check file size
     match std::fs::metadata(&path) {
-        Ok(meta) if meta.len() > MAX_FILE_SIZE => {
+        Ok(meta) if meta.len() > max_size => {
             return ToolResult::err(
                 ToolErrorKind::TooLarge,
                 format!(
                     "Error: file is too large ({} bytes, max {} bytes)",
                     meta.len(),
-                    MAX_FILE_SIZE
+                    max_size
                 ),
             );
         }
@@ -631,7 +657,12 @@ fn execute_read_file(
                 let lines: Vec<&str> = content.lines().collect();
                 let total = lines.len();
                 let start = offset.unwrap_or(1).max(1) - 1;
-                let end = limit.map(|l| (start + l).min(total)).unwrap_or(total);
+                // saturating_add: offset can be usize::MAX from a
+                // saturating u64 cast — plain `start + l` would panic
+                // in debug builds on overflow.
+                let end = limit
+                    .map(|l| start.saturating_add(l).min(total))
+                    .unwrap_or(total);
                 if start >= total {
                     format!("[lines {total}-{total} of {total}]")
                 } else {
@@ -2289,5 +2320,77 @@ mod tests {
         assert!(whole.text.contains("line1") && whole.text.contains("line10"));
         assert!(!whole.text.contains("[lines "));
         let _ = fs::remove_dir_all(&wd);
+    }
+
+    /// Hostile pagination values must saturate, never wrap or panic —
+    /// `offset`/`limit` arrive as model-controlled u64.
+    #[tokio::test]
+    async fn read_file_hostile_pagination_values_saturate() {
+        let wd = tmpwd();
+        std::fs::write(wd.join("p.txt"), "a\nb\nc\n").unwrap();
+        let huge = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": "p.txt", "offset": u64::MAX, "limit": u64::MAX}),
+            5,
+            &[],
+            None,
+        )
+        .await;
+        assert!(huge.error_kind.is_none(), "got: {}", huge.text);
+        assert!(huge.text.contains("of 3"), "got: {}", huge.text);
+        // offset 0 behaves as 1; limit 0 is an empty page, not a panic.
+        let zero = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": "p.txt", "offset": 0, "limit": 0}),
+            5,
+            &[],
+            None,
+        )
+        .await;
+        assert!(zero.error_kind.is_none(), "got: {}", zero.text);
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    /// Artifact files may reach the store's 2 MB per-file quota — the
+    /// generic 1 MB workspace cap would make the largest offloaded
+    /// outputs unreadable through their own pointer.
+    #[tokio::test]
+    async fn read_file_artifact_may_exceed_workspace_cap() {
+        let wd = tmpwd();
+        let art = tmpwd();
+        let big = "z".repeat(1536 * 1024); // 1.5 MiB: over 1 MB, under 2 MB
+        std::fs::write(art.join("big.txt"), &big).unwrap();
+        let ok = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": art.join("big.txt").to_string_lossy(), "limit": 1}),
+            5,
+            &[],
+            Some(&art),
+        )
+        .await;
+        assert!(
+            ok.error_kind.is_none(),
+            "artifact over 1 MB must stay readable: {:?} {}",
+            ok.error_kind,
+            ok.text.chars().take(120).collect::<String>()
+        );
+
+        // The same bytes outside the artifact root keep the 1 MB cap.
+        std::fs::write(wd.join("big.txt"), &big).unwrap();
+        let denied = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": "big.txt", "limit": 1}),
+            5,
+            &[],
+            Some(&art),
+        )
+        .await;
+        assert_eq!(denied.error_kind, Some(ToolErrorKind::TooLarge));
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&art);
     }
 }

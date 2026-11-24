@@ -113,6 +113,62 @@ Configuration that the project uses as a reference NVIDIA target:
 
 Run `acp-bridge --bench` to validate on your specific driver + model combination.
 
+## Remote access — Windows host + a second machine
+
+`acp-bridge` is a **stdio-only** ACP agent: it reads newline-delimited JSON-RPC on stdin and writes responses/notifications on stdout. It has no HTTP listener. That shapes every remote topology:
+
+```
+Machine A (Windows)                     Machine B (client)
+┌─────────────────────┐                ┌──────────────────────┐
+│ Strata  :8000/v1    │  ◄── HTTP ───  │ acp-bridge (stdio)   │
+│ acp-bridge (stdio)  │  ◄── spawn ──  │ OpenAB / Zed / etc.  │
+└─────────────────────┘                └──────────────────────┘
+```
+
+Three workable patterns:
+
+### 1. Same machine (default)
+
+Client harness (OpenAB, Zed) spawns `acp-bridge` as a child process; `LLM_BASE_URL=http://127.0.0.1:8000/v1` hits Strata on localhost. No auth needed on the loopback API.
+
+### 2. Second machine via SSH stdio tunnel (no API)
+
+ACP is just bytes on a pipe — anything that carries stdin/stdout works. On Machine B, point the agent command at SSH:
+
+```toml
+# OpenAB agent command (or equivalent harness config)
+command = "ssh"
+args = ["user@windows-host", "C:\\tools\\acp-bridge.exe"]
+env = { "LLM_BASE_URL" = "http://127.0.0.1:8000/v1" }
+```
+
+Every JSON-RPC frame flows through the SSH channel; run it inside your VPN/WireGuard/Tailscale and no port needs exposing. Windows needs the OpenSSH Server optional feature enabled. This is the honest answer to "不需要 API、直接透過 stdout 在內部 VPN 傳輸" — it works today, unmodified.
+
+Caveats:
+
+- SSH must be reachable over the VPN only; do not expose port 22 publicly.
+- `LLM_SESSION_DIR` paths inside snapshots are Windows paths — restore on the same machine class.
+- Long turns are fine; the 4 MiB inbound frame cap applies per line regardless of transport.
+
+### 3. Second machine via Strata's HTTP API (bypasses acp-bridge)
+
+If Machine B only needs raw model access — not the agent tool loop — call Strata directly:
+
+```bash
+# Windows host
+strata launch --access lan --api-key-env STRATA_API_KEY --port 8000
+strata launch --show-key   # give this to Machine B
+```
+
+Machine B uses any OpenAI-compatible client against `http://<windows-vpn-ip>:8000/v1` with the key. **This skips acp-bridge entirely** — no tools, no policy, no session management. Use it for evals or simple chat, not as the agent path.
+
+### What does NOT work
+
+- Pointing an ACP Client at `http://windows-host:8000` — Strata speaks OpenAI chat completions, not ACP JSON-RPC. There is no ACP-over-HTTP endpoint.
+- Exposing acp-bridge's stdin/stdout over a plain TCP socket without a relay — the protocol is line-delimited JSON-RPC and *could* be proxied (e.g. `socat`/`websocat`), but nothing in the binary does it; SSH is the supported tunnel.
+
+For a real ACP-over-HTTP surface a separate relay would be needed; `docs/scope.md` records stdio-only as the current scope.
+
 ## Common pain points
 
 - **VRAM full, but only on card 0** — you forgot `OLLAMA_SCHED_SPREAD=1` (Ollama) or `--tensor-parallel-size N` (vLLM).

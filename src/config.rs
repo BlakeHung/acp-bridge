@@ -218,8 +218,13 @@ impl ConfigFile {
 mod tests {
     use super::{ConfigFile, LlmSection};
 
+    /// Tests in this module mutate process env (`LLM_*`); env is
+    /// process-global, so parallel tests race. Serialize them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn llm_config_uses_system_prompt_from_file_when_env_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("LLM_SYSTEM_PROMPT");
 
         let cfg = ConfigFile {
@@ -236,6 +241,7 @@ mod tests {
 
     #[test]
     fn llm_config_env_system_prompt_overrides_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("LLM_SYSTEM_PROMPT", "from env");
 
         let cfg = ConfigFile {
@@ -254,6 +260,7 @@ mod tests {
 
     #[test]
     fn invalid_numeric_env_var_is_an_error_not_a_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("LLM_TIMEOUT", "abc");
 
         let cfg = ConfigFile::default();
@@ -268,6 +275,7 @@ mod tests {
 
     #[test]
     fn invalid_bool_env_var_is_an_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("LLM_SUPPORTS_IMAGE", "2");
 
         let cfg = ConfigFile::default();
@@ -286,6 +294,7 @@ mod tests {
     }
     #[test]
     fn summary_config_supports_toml_and_rejects_nonfinite_threshold() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var("LLM_SUMMARIZE_AT").ok();
         std::env::remove_var("LLM_SUMMARIZE_AT");
         let cfg: ConfigFile =

@@ -18,6 +18,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Emit classified context diagnostics with estimated/actual sizes and attempt numbers without logging request content.
 
 ### Added
+- Inbound transport bound: ACP stdio frames are capped at 4 MiB (`frame::read_frame`) — an oversized frame is dropped whole and the stream resyncs on the next newline instead of growing memory without limit.
+- User-input pre-trim: a single user message estimated above half the usable window is offloaded to `{LLM_SESSION_DIR}/artifacts/<session>/user-input.txt` and history keeps a bounded head plus a `read_file` pointer — the turn survives instead of dying on a protected-input context rejection. Requires `LLM_SESSION_DIR`; without a store the existing rejection remains the boundary.
+- Backend-reported window learning: an overflow error that names its real context (`context (N tokens)` — Strata's `fit_max_tokens` budget, a swapped-in smaller model) shrinks the session's effective window for the in-flight retry AND all later calls, down to but never above `LLM_MODEL_CONTEXT`.
 - Tool-output artifacts: results past `LLM_ARTIFACT_CHARS` (default 8192) are written to `{LLM_SESSION_DIR}/artifacts/<session>/<call>.txt` (tmp+rename+fsync, inside the recursive store quota) and history keeps a head excerpt plus a re-readable `read_file` pointer. `read_file` accepts absolute paths only inside the session artifact root — every other absolute path stays denied. Without `LLM_SESSION_DIR` outputs truncate at the same budget.
 - `read_file` line pagination: optional `offset` (1-based) and `limit` parameters return a `[lines X-Y of N]` header plus the slice — the supported way to page through artifact files and large sources instead of pulling whole files into history.
 - Turn-boundary quotas (G1a-Q2): `LLM_MAX_INFLIGHT` (default 8) bounds concurrent turns globally — the excess prompt is refused `server_busy`; `LLM_MAX_PROMPT_CHARS` (default 200K) refuses oversized payloads as `prompt_too_large`. Both statuses are identifiable; cancel/completion frees the slot.
@@ -26,6 +29,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 - Terminal-state race (G1a-C1): a cancel arriving after the engine's result already committed now reports the completion — the turn no longer masquerades as `cancelled` while dropping a finished result.
 - Dangling tool calls (G1a-C2): an aborted turn closes any tool_call ids left without results with an explicit aborted marker — the next turn can't send a malformed tool_calls group.
+- Backend error classification: HTTP 413 → `payload_too_large`, context-shaped 400/422 → `context_overflow` (typed `LlmErrorKind`s; both feed the bounded fit-and-retry). Error bodies are capped at 64 KiB and success bodies at 32 MiB; backend error text is no longer echoed — only the status line and numeric `prompt (N)` / `context (N)` figures survive into diagnostics.
+- `read_file` pagination arithmetic saturates on hostile u64 `offset`/`limit` (was a potential overflow panic); artifact files up to the store's 2 MB quota stay readable through their pointer (the 1 MB workspace cap is unchanged); Windows absolute paths (`C:\…`, UNC) are recognized via `Path::is_absolute` instead of a `/` prefix check.
 
 ## [0.10.0] - 2026-11-24
 

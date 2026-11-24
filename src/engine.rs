@@ -748,12 +748,28 @@ pub async fn session_prompt(
             }
         };
         session.touch();
-        session.messages.push(
-            state
-                .config
-                .backend()
-                .format_user_message(user_text, user_images),
-        );
+        let user_msg = state
+            .config
+            .backend()
+            .format_user_message(user_text, user_images);
+        // Pre-trim at the door: a single user message larger than half
+        // the usable window can never be compacted (it is a protected
+        // anchor) — file it as an artifact and keep a bounded head +
+        // re-readable pointer instead of guaranteeing a context_error.
+        // Images are left untouched: the offload path is text-only.
+        // NB: `window` comes from the session we already hold — this
+        // runs inside the sessions write lock, so it must NOT re-acquire
+        // a read lock (that deadlocked every prompt).
+        let window = session
+            .effective_context
+            .map(|w| w.min(state.config.context_size))
+            .unwrap_or(state.config.context_size);
+        let user_msg = if user_images.is_empty() {
+            maybe_offload_user_input(state, session_id, user_msg, user_text, window)
+        } else {
+            user_msg
+        };
+        session.messages.push(user_msg);
     }
 
     let mut dropped_image_note: Option<String> = None;
@@ -1248,12 +1264,22 @@ const MIN_OUTPUT_TOKENS: u64 = 512;
 const DEFAULT_OUTPUT_TOKENS: u64 = 4096;
 
 pub use crate::context::estimate_tokens;
-use crate::context::{compact_for_context, estimate_request, summary_parts};
+use crate::context::{compact_for_context, estimate_request, estimate_value, summary_parts};
 
-/// True when a backend error is the deterministic "prompt + max_tokens
-/// exceeds the context" shape local backends emit (llama.cpp, LM
-/// Studio, vLLM all phrase it around `context`/`length`).
+/// True when a backend error means "this request is too big" — the
+/// deterministic prompt+max_tokens overflow (llama.cpp, LM Studio, vLLM,
+/// Strata, OpenAI all phrase it around `context`/`length`), or an HTTP
+/// 413 content-length rejection. Both are fixed the same way: send a
+/// smaller request. `PayloadTooLarge` is classified at the transport
+/// layer; phrase matching remains as a fallback for backends that
+/// report the overflow outside a 400/413 status.
 fn is_context_overflow(e: &crate::llm::LlmError) -> bool {
+    if matches!(
+        e.kind,
+        crate::llm::LlmErrorKind::ContextOverflow | crate::llm::LlmErrorKind::PayloadTooLarge
+    ) {
+        return true;
+    }
     if e.kind != crate::llm::LlmErrorKind::BadRequest {
         return false;
     }
@@ -1269,12 +1295,31 @@ fn is_context_overflow(e: &crate::llm::LlmError) -> bool {
 }
 
 /// Extract the real prompt-token count from a context-overflow error —
-/// llama.cpp / LM Studio phrase it as `prompt (30314 tokens) + ...`.
-/// Knowing the REAL count lets the retry scale the char/4 estimate by
-/// the measured ratio instead of guessing again.
+/// backends phrase it as `prompt (30314 tokens)`; the sanitized
+/// diagnostic keeps that figure verbatim. Knowing the REAL count lets
+/// the retry scale the estimate by the measured ratio.
 fn reported_prompt_tokens(message: &str) -> Option<u64> {
     let m = message.to_ascii_lowercase();
     let start = m.find("prompt (")? + "prompt (".len();
+    let digits: String = m[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() || !m[start..].starts_with(&format!("{digits} tokens")) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The window the backend actually enforced, when it reported one —
+/// `context (N tokens)` in the sanitized diagnostic. Lets a session
+/// that overflowed against a smaller-than-configured window (e.g. the
+/// operator switched to a smaller model, or Strata answered with its
+/// real `fit_max_tokens` budget) shrink its own budget instead of
+/// repeating the same rejection.
+fn reported_context_tokens(message: &str) -> Option<u64> {
+    let m = message.to_ascii_lowercase();
+    let start = m.find("context (")? + "context (".len();
     let digits: String = m[start..]
         .chars()
         .take_while(|c| c.is_ascii_digit())
@@ -1352,20 +1397,23 @@ async fn fit_and_call(
     tools: Option<&[Value]>,
     notify: &impl Fn(Notification),
 ) -> Result<Value, crate::llm::LlmError> {
-    let budget = state
-        .config
-        .context_size
-        .saturating_sub(CONTEXT_MARGIN_TOKENS);
+    let (scale, learned_window) = {
+        let sessions = state.sessions_read();
+        sessions
+            .get(session_id)
+            .map_or((1.0, None), |s| (s.token_scale, s.effective_context))
+    };
+    let mut scale = scale.clamp(0.1, 1.0);
+    // The window this session actually has: config default, shrunk by
+    // any backend-reported real context. Never grows past config.
+    let window = learned_window
+        .map(|w| w.min(state.config.context_size))
+        .unwrap_or(state.config.context_size);
+    let mut budget = window.saturating_sub(CONTEXT_MARGIN_TOKENS);
     if budget <= MIN_OUTPUT_TOKENS {
         return Err(context_error("window too small for output reserve"));
     }
-    let mut scale = state
-        .sessions_read()
-        .get(session_id)
-        .map(|s| s.token_scale)
-        .unwrap_or(1.0)
-        .clamp(0.1, 1.0);
-    let out_want = config_output_budget(&state.config)
+    let mut out_want = config_output_budget(&state.config)
         .min(budget / 4)
         .max(MIN_OUTPUT_TOKENS);
     let overhead = estimate_request(&[], tools).saturating_sub(estimate_tokens(&[]));
@@ -1472,6 +1520,29 @@ async fn fit_and_call(
                 if !overflow || attempt == 1 {
                     return Err(error);
                 }
+                // Learn the real window when the backend names it — the
+                // retry AND every later call in this session budget
+                // against it instead of repeating the same rejection.
+                if let Some(ctx) = reported_context_tokens(&error.message) {
+                    let learned = ctx.min(state.config.context_size);
+                    if let Some(session) = state.sessions_write().get_mut(session_id) {
+                        session.effective_context = Some(
+                            session
+                                .effective_context
+                                .map_or(learned, |old| old.min(learned)),
+                        );
+                    }
+                    let new_budget = learned.saturating_sub(CONTEXT_MARGIN_TOKENS);
+                    if new_budget < budget {
+                        budget = new_budget;
+                        out_want = config_output_budget(&state.config)
+                            .min(budget / 4)
+                            .max(MIN_OUTPUT_TOKENS);
+                        if budget <= MIN_OUTPUT_TOKENS {
+                            return Err(error);
+                        }
+                    }
+                }
                 rejected = Some((msgs.clone(), error));
                 scale = actual
                     .filter(|n| *n > 0)
@@ -1486,6 +1557,44 @@ async fn fit_and_call(
         }
     }
     unreachable!("bounded retry returns on the second attempt")
+}
+
+/// Pre-trim for a single oversized user message (Devin-style "file the
+/// evidence, keep the pointer"): when one message alone would eat more
+/// than half the usable prompt budget it is written to the session
+/// artifact dir and history keeps a bounded head plus the re-readable
+/// path. Without a store the message passes through unchanged — the
+/// context fitter's protected-input rejection remains the boundary.
+fn maybe_offload_user_input(
+    state: &AppState,
+    session_id: &str,
+    user_msg: Value,
+    user_text: &str,
+    window: u64,
+) -> Value {
+    let usable = window
+        .saturating_sub(CONTEXT_MARGIN_TOKENS)
+        .saturating_sub(config_output_budget(&state.config));
+    if user_text.is_empty() || estimate_value(&user_msg) * 2 <= usable.max(1) {
+        return user_msg;
+    }
+    let Some(store) = &state.session_store else {
+        return user_msg;
+    };
+    let Some(path) = store.write_artifact(session_id, "user-input", user_text) else {
+        return user_msg;
+    };
+    let head_budget = (state.config.artifact_inline_chars / 2).max(1024);
+    let mut head = user_text.to_string();
+    crate::tools::truncate_utf8(&mut head, head_budget);
+    json!({
+        "role": "user",
+        "content": format!(
+            "{head}\n\n[user input offloaded: {} bytes total saved to {} — call read_file with this absolute path plus offset/limit to page through the rest]",
+            user_text.len(),
+            path.display()
+        )
+    })
 }
 
 /// Boundary optimization (Kiro/OpenCode "file the evidence, keep the
@@ -1643,6 +1752,7 @@ pub fn session_load(state: &AppState, session_id: &str) -> SessionLoadOutcome {
                 protocol_version: state.protocol_version,
                 token_scale: 1.0,
                 summary_cooldown: 0,
+                effective_context: None,
             };
             state
                 .sessions_write()
@@ -2426,5 +2536,123 @@ mod tests {
         assert_eq!(error.status, Some(400));
         assert_eq!(calls.lock().unwrap().len(), 1);
         server.abort();
+    }
+
+    #[test]
+    fn overflow_diagnostics_classify_typed_kinds_and_parse_sizes() {
+        use crate::llm::{LlmError, LlmErrorKind};
+        let strata = LlmError {
+            kind: LlmErrorKind::ContextOverflow,
+            message:
+                "HTTP 400 Bad Request context overflow prompt (32848 tokens) context (32768 tokens)"
+                    .into(),
+            status: Some(400),
+        };
+        assert!(is_context_overflow(&strata));
+        assert_eq!(reported_prompt_tokens(&strata.message), Some(32848));
+        assert_eq!(reported_context_tokens(&strata.message), Some(32768));
+
+        let big = LlmError {
+            kind: LlmErrorKind::PayloadTooLarge,
+            message: "HTTP 413 Payload Too Large".into(),
+            status: Some(413),
+        };
+        assert!(
+            is_context_overflow(&big),
+            "413 content-length is resizable like a token overflow"
+        );
+
+        let bad = LlmError {
+            kind: LlmErrorKind::BadRequest,
+            message: "HTTP 400 Bad Request".into(),
+            status: Some(400),
+        };
+        assert!(!is_context_overflow(&bad));
+        assert_eq!(reported_context_tokens(&bad.message), None);
+    }
+
+    /// When the backend names its real window and it is smaller than
+    /// `LLM_MODEL_CONTEXT`, the session learns it — the retry in the
+    /// SAME call already budgets against it, and later calls start
+    /// there instead of paying for the same rejection twice.
+    #[tokio::test]
+    async fn overflow_teaches_session_the_real_window() {
+        let (url, server, calls) = context_backend(false, true).await;
+        let mut cfg = cfg_with_image(false);
+        cfg.base_url = url;
+        cfg.auto_summarize = false;
+        cfg.context_size = 65536; // config claims double the backend's window
+        let state = AppState::new(cfg);
+        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let messages = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"task"}),
+            json!({"role":"assistant","content":"x".repeat(75000)}),
+            json!({"role":"user","content":"latest"}),
+        ];
+        fit_and_call(&state, &sid, messages, None, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "one overflow + one fitted retry"
+        );
+        assert_eq!(
+            state.sessions_read()[&sid].effective_context,
+            Some(32768),
+            "session must learn the backend-reported window"
+        );
+        server.abort();
+    }
+
+    /// Devin-style pre-trim: a single user message larger than half the
+    /// usable window is filed as an artifact and history keeps a head +
+    /// pointer — the turn survives instead of dying on a protected-
+    /// input context_error.
+    #[test]
+    fn oversized_user_input_is_offloaded_with_pointer() {
+        let mut cfg = cfg_with_image(false);
+        cfg.context_size = 32768;
+        cfg.artifact_inline_chars = 4096;
+        let dir = std::env::temp_dir().join(format!(
+            "acp-useroffload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = crate::session_store::SessionStore::new(dir.clone()).unwrap();
+        let base = AppState::new(cfg);
+        let state = AppState {
+            session_store: Some(std::sync::Arc::new(store)),
+            ..(*base).clone()
+        };
+        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+
+        // ~60 KB ASCII ≈ 20K estimated tokens > half the usable window.
+        let big_text = "使用者貼上的大量內容 ".repeat(4000);
+        let formatted = state.config.backend().format_user_message(&big_text, &[]);
+        let out = maybe_offload_user_input(&state, &sid, formatted, &big_text, 32768);
+        let content = out["content"].as_str().unwrap();
+        assert!(content.contains("[user input offloaded"), "{content:.200}");
+        assert!(content.contains("read_file"));
+        assert!(content.len() < big_text.len() / 2);
+        let artifact = dir.join("artifacts").join(&sid).join("user-input.txt");
+        assert_eq!(
+            std::fs::read_to_string(&artifact).unwrap(),
+            big_text,
+            "artifact must hold the FULL original text"
+        );
+
+        // A normal-sized message passes through untouched.
+        let small = state
+            .config
+            .backend()
+            .format_user_message("short question", &[]);
+        let out2 = maybe_offload_user_input(&state, &sid, small, "short question", 32768);
+        assert_eq!(out2["content"], "short question");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

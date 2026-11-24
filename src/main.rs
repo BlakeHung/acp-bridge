@@ -7,13 +7,14 @@ use acp_bridge::acp;
 use acp_bridge::bench;
 use acp_bridge::config::ConfigFile;
 use acp_bridge::engine::{self, AppState, Notification};
+use acp_bridge::frame::{read_frame, Frame};
 use acp_bridge::hardware;
 use acp_bridge::llm;
 use acp_bridge::protocol::{AcpError, JsonRpcRequest, ProtocolVersion, RequestId};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -265,21 +266,30 @@ fn negotiate_protocol_version(params: Option<Value>) -> ProtocolVersion {
 
 async fn run_acp_loop(mut state: Arc<AppState>) {
     let stdin = tokio::io::stdin();
-    let reader = BufReader::new(stdin);
-    let mut lines = reader.lines();
+    let mut reader = BufReader::new(stdin);
+    let mut frame_buf = Vec::new();
     let mut prompts = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
-            line_result = lines.next_line() => {
-                match line_result {
-                    Ok(Some(line)) => {
-                        let trimmed = line.trim().to_string();
-                        if trimmed.is_empty() {
+            frame_result = read_frame(&mut reader, &mut frame_buf) => {
+                match frame_result {
+                    Ok(Frame::Line(raw)) => {
+                        // Strict UTF-8: JSON-RPC is UTF-8 by spec; a frame
+                        // with invalid bytes is a protocol violation — skip
+                        // it rather than silently repairing with U+FFFD.
+                        let line = match String::from_utf8(raw) {
+                            Ok(s) => s.trim().to_string(),
+                            Err(_) => {
+                                debug!("Skipping non-UTF-8 stdin frame");
+                                continue;
+                            }
+                        };
+                        if line.is_empty() {
                             continue;
                         }
 
-                        let msg: JsonRpcRequest = match serde_json::from_str(&trimmed) {
+                        let msg: JsonRpcRequest = match serde_json::from_str(&line) {
                             Ok(m) => m,
                             Err(e) => {
                                 debug!(error = %e, "Skipping invalid JSON-RPC line");
@@ -613,7 +623,14 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                             }
                         }
                     }
-                    Ok(None) => {
+                    Ok(Frame::Oversized) => {
+                        // A frame past MAX_FRAME_BYTES was dropped whole —
+                        // its JSON-RPC id is unrecoverable, so there is no
+                        // response to send. The reader already resynced on
+                        // the next newline; warn loudly and continue.
+                        warn!("Dropped oversized stdin frame (>4 MiB); transport resynced");
+                    }
+                    Ok(Frame::Eof) => {
                         info!("stdin closed, shutting down gracefully");
                         break;
                     }

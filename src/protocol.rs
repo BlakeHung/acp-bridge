@@ -101,6 +101,11 @@ pub struct Session {
     pub token_scale: f64,
     /// Skip a few model steps after a failed summary instead of repeatedly charging for it.
     pub summary_cooldown: u8,
+    /// Backend-reported window smaller than `LLM_MODEL_CONTEXT` — set
+    /// when an overflow error names the real context size (model swap,
+    /// Strata fit_max_tokens). Only ever shrinks the budget, never
+    /// grows it; runtime-only, not persisted in snapshots.
+    pub effective_context: Option<u64>,
 }
 
 impl Session {
@@ -116,6 +121,7 @@ impl Session {
             protocol_version,
             token_scale: 1.0,
             summary_cooldown: 0,
+            effective_context: None,
         }
     }
 

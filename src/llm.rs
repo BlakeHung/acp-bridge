@@ -778,6 +778,15 @@ pub enum LlmErrorKind {
     BadRequest,
     /// HTTP 404. Model not found / wrong base URL. Do not retry.
     NotFound,
+    /// HTTP 413 — the request body itself exceeded the server's
+    /// transport limit (distinct from a token-window overflow, which
+    /// arrives as 400/422). Do not retry unchanged.
+    PayloadTooLarge,
+    /// HTTP 400/422 whose body matches a context-window overflow —
+    /// prompt + max_tokens does not fit. Classified separately from a
+    /// generic BadRequest so the engine can fit-and-retry instead of
+    /// surfacing a dead-end 400.
+    ContextOverflow,
     /// Client-side request timeout. Retryable.
     Timeout,
     /// Response was not parseable as JSON. Do not retry — repeating
@@ -798,6 +807,8 @@ impl LlmErrorKind {
             Self::Auth => "auth_error",
             Self::BadRequest => "bad_request",
             Self::NotFound => "not_found",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::ContextOverflow => "context_overflow",
             Self::Timeout => "timeout",
             Self::ParseError => "parse_error",
             Self::Unknown => "unknown",
@@ -858,27 +869,36 @@ impl LlmError {
 
     /// Build a classified error from an HTTP response status. Used
     /// inside `send_with_retry` once a non-retryable response is seen.
+    ///
+    /// The error `message` is sanitized: it keeps the status line and
+    /// any numeric `prompt (N tokens)` / `context (N)` figures the
+    /// backend reported — enough for the context fitter to calibrate —
+    /// but never echoes the raw body, which can contain request data.
     pub fn from_status(status: reqwest::StatusCode, body_snippet: &str) -> Self {
         let code = status.as_u16();
         let kind = match code {
             401 | 403 => LlmErrorKind::Auth,
             404 => LlmErrorKind::NotFound,
-            400 | 422 => LlmErrorKind::BadRequest,
+            413 => LlmErrorKind::PayloadTooLarge,
+            400 | 422 => {
+                if is_context_overflow_body(body_snippet) {
+                    LlmErrorKind::ContextOverflow
+                } else {
+                    LlmErrorKind::BadRequest
+                }
+            }
             408 | 429 => LlmErrorKind::RateLimited,
             500..=599 => LlmErrorKind::ServerBusy,
             _ => LlmErrorKind::Unknown,
         };
-        let snippet = if body_snippet.len() > 200 {
-            format!("{}…", &body_snippet[..200])
-        } else {
-            body_snippet.to_string()
+        let reason = status.canonical_reason().unwrap_or("");
+        let nums = overflow_numbers(body_snippet);
+        let message = match kind {
+            LlmErrorKind::ContextOverflow => {
+                format!("HTTP {code} {reason} context overflow{nums}")
+            }
+            _ => format!("HTTP {code} {reason}"),
         };
-        let message = format!(
-            "HTTP {} {}: {}",
-            code,
-            status.canonical_reason().unwrap_or(""),
-            snippet
-        );
         Self {
             kind,
             message,
@@ -887,7 +907,87 @@ impl LlmError {
     }
 }
 
+/// Backend bodies that mean "prompt + output does not fit the window" —
+/// llama.cpp, LM Studio, vLLM, Strata and OpenAI all phrase it around
+/// `context`/`length`; Strata also emits `context_length_exceeded`.
+fn is_context_overflow_body(body: &str) -> bool {
+    let m = body.to_ascii_lowercase();
+    m.contains("exceeds the context")
+        || m.contains("context length")
+        || m.contains("context window")
+        || m.contains("context_length_exceeded")
+        || m.contains("leaves no room")
+        || m.contains("no room to answer")
+        || m.contains("input is too long")
+        || m.contains("maximum context length")
+        || (m.contains("context")
+            && (m.contains("exceed") || m.contains("too long") || m.contains("too many tokens")))
+}
+
+/// Pull the two numbers the context fitter needs out of an overflow
+/// body, rendered canonically: ` prompt (N tokens)` when the backend
+/// reported the real prompt size, ` context (N tokens)` for the window
+/// it was measured against. Returns "" when neither is present.
+fn overflow_numbers(body: &str) -> String {
+    let lower = body.to_ascii_lowercase();
+    let mut out = String::new();
+    if let Some(n) = find_paren_number(&lower, "prompt (") {
+        out.push_str(&format!(" prompt ({n} tokens)"));
+    }
+    if let Some(n) = ["context (", "context window (", "in the context ("]
+        .iter()
+        .find_map(|p| find_paren_number(&lower, p))
+    {
+        out.push_str(&format!(" context ({n} tokens)"));
+    }
+    out
+}
+
+/// `needle` is lowercase; returns the first run of digits right after it.
+fn find_paren_number(lower: &str, needle: &str) -> Option<u64> {
+    let start = lower.find(needle)? + needle.len();
+    let digits: String = lower[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 const MAX_STREAM_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+/// Error bodies only feed classification + numeric extraction — a few
+/// KB is plenty; reading unbounded text() let a hostile/buggy backend
+/// balloon memory on every 4xx/5xx.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Successful chat responses carry the whole completion — bounded so a
+/// runaway backend can't exhaust memory. Generous for local models.
+const MAX_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Read a response body with a hard byte cap. The bool is true when the
+/// cap was hit with more data still pending — callers must treat that
+/// as truncation, never as a complete body. `Err` on transport failure.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut buf = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = response.chunk().await? {
+        let remaining = cap.saturating_sub(buf.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if buf.len() >= cap {
+            truncated = true;
+            break;
+        }
+    }
+    Ok((buf, truncated))
+}
 
 #[derive(Default)]
 struct LineBuffer {
@@ -946,7 +1046,10 @@ async fn send_with_retry(
                 if status.is_success() {
                     return Ok(response);
                 }
-                let snippet = response.text().await.unwrap_or_default();
+                let (snippet, _) = read_body_capped(response, MAX_ERROR_BODY_BYTES)
+                    .await
+                    .unwrap_or_default();
+                let snippet = String::from_utf8_lossy(&snippet);
                 let err = LlmError::from_status(status, &snippet);
                 if err.kind.is_retryable() {
                     warn!(
@@ -1060,22 +1163,32 @@ pub async fn chat(
     let body = build_body(config, messages, model, false, tools);
     let response = send_with_retry(config, &url, &body, "chat").await?;
     // A body cut off after a 2xx (connection dropped mid-read) is retried
-    // once; nothing from this round has reached the Client yet. Read errors
-    // come from `bytes()`; JSON errors are not retried.
-    let bytes = match response.bytes().await {
+    // once; nothing from this round has reached the Client yet. The read
+    // is byte-capped: an oversized or endlessly-chunked response fails
+    // closed instead of growing memory without bound.
+    let (bytes, body_truncated) = match read_body_capped(response, MAX_RESPONSE_BODY_BYTES).await {
         Err(e) => {
             warn!(error = %e, "LLM response body truncated; retrying once");
-            send_with_retry(config, &url, &body, "chat")
-                .await?
-                .bytes()
-                .await
+            match read_body_capped(
+                send_with_retry(config, &url, &body, "chat").await?,
+                MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => return Err(LlmError::from_reqwest(&e, &url)),
+            }
         }
-        bytes => bytes,
+        Ok(b) => b,
     };
-    let parsed = bytes
-        .map_err(|e| e.to_string())
-        .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()));
-    parsed.map_err(|e| LlmError {
+    if body_truncated {
+        return Err(LlmError {
+            kind: LlmErrorKind::ParseError,
+            message: format!("LLM response body exceeded {MAX_RESPONSE_BODY_BYTES} bytes"),
+            status: None,
+        });
+    }
+    serde_json::from_slice::<Value>(&bytes).map_err(|e| LlmError {
         kind: LlmErrorKind::ParseError,
         message: format!("Failed to parse response as JSON: {e}"),
         status: None,
@@ -1286,6 +1399,50 @@ mod tests {
             );
             assert_eq!(err.status, Some(*code));
         }
+    }
+
+    #[test]
+    fn llm_error_413_is_payload_too_large_not_context() {
+        let status = reqwest::StatusCode::from_u16(413).unwrap();
+        let err = LlmError::from_status(status, "body too large");
+        assert_eq!(err.kind, LlmErrorKind::PayloadTooLarge);
+        assert!(!err.kind.is_retryable());
+    }
+
+    /// Strata's real overflow body must classify as ContextOverflow and
+    /// keep ONLY the two numbers the fitter needs — the raw body is
+    /// never echoed into logs or client-facing messages.
+    #[test]
+    fn llm_error_strata_overflow_sanitizes_to_numbers() {
+        let body = r#"{"error":{"message":"prompt (32848 tokens) leaves no room to answer in the context (32768); requests are never truncated","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let status = reqwest::StatusCode::from_u16(400).unwrap();
+        let err = LlmError::from_status(status, body);
+        assert_eq!(err.kind, LlmErrorKind::ContextOverflow);
+        assert!(
+            err.message.contains("prompt (32848 tokens)"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("context (32768 tokens)"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("never truncated"), "{}", err.message);
+        assert!(
+            !err.message.contains("invalid_request_error"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// A generic 400 keeps BadRequest and drops the body entirely.
+    #[test]
+    fn llm_error_generic_400_drops_body() {
+        let status = reqwest::StatusCode::from_u16(400).unwrap();
+        let err = LlmError::from_status(status, "sensitive prompt fragment here");
+        assert_eq!(err.kind, LlmErrorKind::BadRequest);
+        assert!(!err.message.contains("sensitive"), "{}", err.message);
     }
 
     use axum::{Json, Router};
