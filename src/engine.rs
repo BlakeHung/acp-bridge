@@ -1368,7 +1368,11 @@ fn is_context_overflow(e: &crate::llm::LlmError) -> bool {
     m.contains("exceeds the context")
         || m.contains("context length")
         || m.contains("context window")
-        || (m.contains("context") && (m.contains("exceed") || m.contains("too long")))
+        || m.contains("leaves no room")
+        || m.contains("no room to answer")
+        || m.contains("input is too long")
+        || (m.contains("context")
+            && (m.contains("exceed") || m.contains("too long") || m.contains("too many tokens")))
 }
 
 /// Extract the real prompt-token count from a context-overflow error —
@@ -1413,14 +1417,26 @@ async fn fit_and_call(
         .config
         .context_size
         .saturating_sub(CONTEXT_MARGIN_TOKENS);
+    // Learned est→real correction for this session. When a previous
+    // call overflowed and the backend reported the REAL prompt tokens,
+    // `token_scale` shrinks the proactive budget so the same content
+    // doesn't trip the same wall (CJK/dense code can run 1.5-4x the
+    // char/4 estimate).
+    let token_scale = state
+        .sessions_read()
+        .get(session_id)
+        .map(|s| s.token_scale)
+        .unwrap_or(1.0)
+        .clamp(0.1, 1.0);
+    let est_budget = (budget as f64 * token_scale) as u64;
     // Clamp the OUTPUT budget into the window first — otherwise a big
     // desired max_tokens would leave zero prompt room and we'd drop
     // every history message even though a smaller response fits fine.
     let out_want = config_output_budget(&state.config)
-        .min(budget.saturating_sub(MIN_OUTPUT_TOKENS))
-        .max(MIN_OUTPUT_TOKENS.min(budget));
+        .min(est_budget.saturating_sub(MIN_OUTPUT_TOKENS))
+        .max(MIN_OUTPUT_TOKENS.min(est_budget));
     let (mut msgs, dropped, mut elided_total) =
-        compact_for_context(messages, budget.saturating_sub(out_want));
+        compact_for_context(messages, est_budget.saturating_sub(out_want));
     let mut dropped_total = dropped;
 
     let send = |cfg_max: Option<u64>, msgs: &[Value]| {
@@ -1433,7 +1449,7 @@ async fn fit_and_call(
 
     let est = estimate_tokens(&msgs);
     let eff_max = out_want
-        .min(budget.saturating_sub(est))
+        .min(est_budget.saturating_sub(est))
         .max(MIN_OUTPUT_TOKENS);
     match send(Some(eff_max), &msgs).await {
         Err(e) if is_context_overflow(&e) => {
@@ -1445,12 +1461,15 @@ async fn fit_and_call(
             let est_now = estimate_tokens(&msgs);
             let target = match reported_prompt_tokens(&e.message) {
                 Some(real) if real > 0 => {
-                    // est = real * (est_now/real) → to land the real
-                    // prompt at ~3/4 of the window.
-                    let scale = est_now as f64 / real as f64;
-                    ((budget * 3 / 4) as f64 * scale) as u64
+                    // Persist the correction for LATER calls on this
+                    // session — same content should not trip the wall
+                    // twice.
+                    if let Some(s) = state.sessions_write().get_mut(session_id) {
+                        s.token_scale = (est_now as f64 / real as f64).clamp(0.1, 1.0);
+                    }
+                    ((est_budget * 3 / 4) as f64 * (est_now as f64 / real as f64)) as u64
                 }
-                _ => budget / 2,
+                _ => est_budget / 2,
             };
             let (m2, d2, e2) = compact_for_context(msgs.clone(), target.max(1));
             msgs = m2;
@@ -1467,7 +1486,7 @@ async fn fit_and_call(
             }
             let est2 = estimate_tokens(&msgs);
             let eff2 = out_want
-                .min(budget.saturating_sub(est2))
+                .min(est_budget.saturating_sub(est2))
                 .clamp(MIN_OUTPUT_TOKENS, 2048);
             send(Some(eff2), &msgs).await
         }
@@ -1579,6 +1598,7 @@ pub fn session_load(state: &AppState, session_id: &str) -> SessionLoadOutcome {
                 last_active: std::time::Instant::now(),
                 working_dir,
                 protocol_version: state.protocol_version,
+                token_scale: 1.0,
             };
             state
                 .sessions_write()

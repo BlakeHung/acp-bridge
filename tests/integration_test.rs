@@ -1593,7 +1593,10 @@ async fn test_context_overflow_compacts_and_retries() {
                             axum::Json(json!({
                                 "error": {
                                     "type": "invalid_request_error",
-                                    "message": "prompt (31000 tokens) + max tokens (4096) exceeds the context (32768); requests are never truncated."
+                                    // "leaves no room" phrasing — the
+                                    // live variant llama.cpp emits when
+                                    // the prompt alone overflows.
+                                    "message": "prompt (31000 tokens) leaves no room to answer in the context (32768); requests are never truncated."
                                 }
                             })),
                         )

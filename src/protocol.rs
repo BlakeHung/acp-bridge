@@ -93,6 +93,12 @@ pub struct Session {
     /// on it so a v2 Client gets v2-shaped notifications even if a v1
     /// Client later connects to the same process.
     pub protocol_version: ProtocolVersion,
+    /// Learned est→real token correction for this session. The char/4
+    /// heuristic undercounts CJK and dense code; when a backend rejects
+    /// with the REAL prompt size (`prompt (N tokens)`), the measured
+    /// ratio lands here and shrinks later calls' prompt budgets so the
+    /// same content doesn't overflow twice. 1.0 = trust the estimate.
+    pub token_scale: f64,
 }
 
 impl Session {
@@ -106,6 +112,7 @@ impl Session {
             last_active: Instant::now(),
             working_dir,
             protocol_version,
+            token_scale: 1.0,
         }
     }
 
