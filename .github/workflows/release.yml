@@ -110,8 +110,13 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ── Publish to crates.io ────────────────────────────────────
+  # Skipped on prerelease tags (any tag containing `-`, e.g.
+  # `v0.10.0-rc.1`): rc builds get binaries + GHCR image + a GitHub
+  # prerelease for local/soak testing WITHOUT a crates publish —
+  # crates releases are irreversible, so they only go on clean tags.
   crates:
     name: Publish to crates.io
+    if: "!contains(github.ref_name, '-')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +132,10 @@ jobs:
   # ── Create GitHub Release ──────────────────────────────────
   release:
     name: GitHub Release
-    needs: [build, docker, crates]
+    # crates is intentionally NOT in needs: a GitHub release ships
+    # binaries + image refs regardless of whether crates.io was
+    # skipped (prerelease) or happened (clean tag).
+    needs: [build, docker]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -155,6 +163,7 @@ jobs:
         with:
           name: v${{ steps.version.outputs.version }}
           body_path: /tmp/release-notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/acp-bridge-*
           generate_release_notes: ${{ steps.changelog.outputs.has_notes == 'false' }}
