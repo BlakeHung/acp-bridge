@@ -157,7 +157,7 @@ impl ConfigFile {
 
         let max_tool_rounds = env_parse("LLM_MAX_TOOL_ROUNDS")?
             .or(file.max_tool_rounds)
-            .unwrap_or(5);
+            .unwrap_or(50);
 
         let tool_timeout_secs = env_parse("LLM_TOOL_TIMEOUT")?
             .or(file.tool_timeout_secs)

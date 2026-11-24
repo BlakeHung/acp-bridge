@@ -693,7 +693,7 @@ impl LlmConfig {
             session_idle_timeout_secs: env_parse("LLM_SESSION_IDLE_TIMEOUT")?.unwrap_or(0),
             prompt_supports_image: env_parse_bool("LLM_SUPPORTS_IMAGE")?.unwrap_or(false),
             context_size: env_parse("LLM_MODEL_CONTEXT")?.unwrap_or(32768),
-            max_tool_rounds: env_parse("LLM_MAX_TOOL_ROUNDS")?.unwrap_or(5),
+            max_tool_rounds: env_parse("LLM_MAX_TOOL_ROUNDS")?.unwrap_or(50),
             tool_timeout_secs: env_parse("LLM_TOOL_TIMEOUT")?.unwrap_or(120),
             turn_timeout_secs: env_parse("LLM_TURN_TIMEOUT")?.unwrap_or(0),
             tool_failure_streak: env_parse("LLM_TOOL_FAILURE_STREAK")?.unwrap_or(3),

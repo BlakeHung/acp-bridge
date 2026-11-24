@@ -1353,7 +1353,12 @@ async fn test_tool_round_limit_wraps_up_with_partial_answer() {
     let mut h = TestHarness::start_with_router_and_env(
         port,
         mock_llm_tool_until_wrapup_router(),
-        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+        &[
+            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            // Pin a small budget — the production default is 50 and this
+            // test asserts the wrap-up fires at the configured limit.
+            ("LLM_MAX_TOOL_ROUNDS", "5"),
+        ],
     )
     .await;
 

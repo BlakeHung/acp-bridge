@@ -85,7 +85,7 @@ spec-shaped v2 payloads.
 
 | Budget | Env var | Default | Behavior |
 |---|---|---|---|
-| Tool rounds per turn | `LLM_MAX_TOOL_ROUNDS` | 5 | Exhausted → one wrap-up call (no tools) → `partial` status with `stopReason: max_turn_requests`, or `failed` if no usable answer |
+| Tool rounds per turn | `LLM_MAX_TOOL_ROUNDS` | 50 | Exhausted → one wrap-up call (no tools) → `partial` status with `stopReason: max_turn_requests`, or `failed` if no usable answer |
 | Per-tool wall time | `LLM_TOOL_TIMEOUT` | 120 s | bash/git/web_fetch killed (process group) on expiry; file tools are bounded and synchronous |
 | Whole-turn deadline | `LLM_TURN_TIMEOUT` | 0 (off) | Turn aborted as `failed`; async tools killed via the same process-group path |
 | Identical-failure streak | `LLM_TOOL_FAILURE_STREAK` | 3 | Same tool+args erroring N times consecutively aborts the loop into the same bounded wrap-up |
