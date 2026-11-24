@@ -222,6 +222,10 @@ pub struct AppState {
     /// emit helpers (`acp::notify_*`) branch on it so v1 Clients see
     /// v1 notifications and v2 Clients see v2.
     pub protocol_version: crate::protocol::ProtocolVersion,
+    /// Tool-permission policy consulted before every tool dispatch
+    /// (P1/E12). `AppState::new` uses the default daily-driver profile;
+    /// `main` builds the real one from `[policy]` + `LLM_POLICY_*`.
+    pub policy: crate::policy::Policy,
 }
 
 impl Clone for AppState {
@@ -231,6 +235,7 @@ impl Clone for AppState {
             turn_registry: Arc::clone(&self.turn_registry),
             config: self.config.clone(),
             protocol_version: self.protocol_version,
+            policy: self.policy.clone(),
         }
     }
 }
@@ -246,6 +251,17 @@ impl AppState {
             // `initialize`. We pick V1 here so unit tests that build an
             // AppState directly get v1 wire format without ceremony.
             protocol_version: crate::protocol::ProtocolVersion::V1,
+            policy: crate::policy::Policy::default_policy(),
+        })
+    }
+
+    /// Production constructor — same as `new` plus an explicit policy
+    /// resolved from the `[policy]` config section / `LLM_POLICY_*`.
+    pub fn with_policy(config: LlmConfig, policy: crate::policy::Policy) -> Arc<Self> {
+        let state = Self::new(config);
+        Arc::new(Self {
+            policy,
+            ..(*state).clone()
         })
     }
 
@@ -736,8 +752,24 @@ pub async fn session_prompt(
                         id: tool_call_id.to_string(),
                         name: name.into(),
                     });
-                    let result =
-                        tools::execute_tool(&working_dir, name, &args, tool_timeout_secs).await;
+                    // P1/E12 policy gate: deny → structured error, no
+                    // execution; confirm → visible in-session notice,
+                    // then execute (the documented no-permission-UI
+                    // fallback); allow → execute.
+                    let result = match state.policy.decide(name, &args) {
+                        crate::policy::Decision::Deny(reason) => tools::ToolResult::err(
+                            tools::ToolErrorKind::Denied,
+                            format!("Error: {reason}"),
+                        ),
+                        decision => {
+                            if let crate::policy::Decision::Confirm(reason) = &decision {
+                                notify(Notification::TextChunk(format!(
+                                    "\n\n*[policy:confirm] {reason} — proceeding (no interactive permission channel configured)*"
+                                )));
+                            }
+                            tools::execute_tool(&working_dir, name, &args, tool_timeout_secs).await
+                        }
+                    };
                     notify(Notification::ToolDone {
                         id: tool_call_id.to_string(),
                         name: name.into(),

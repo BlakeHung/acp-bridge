@@ -1465,6 +1465,90 @@ async fn test_tool_failure_streak_aborts_loop() {
     h.shutdown();
 }
 
+/// Policy denial must reach the model as a tool result (so it can pick a
+/// different approach) and must not execute the tool — verified by
+/// inspecting what the backend sees on its second call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_policy_deny_reaches_model_as_tool_result() {
+    let port = free_port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let recorded = seen.clone();
+    let app = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push(body.clone());
+                    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                    let already_denied = msgs.iter().any(|m| {
+                        m["content"]
+                            .as_str()
+                            .map(|s| s.contains("denied by policy"))
+                            .unwrap_or(false)
+                    });
+                    if already_denied {
+                        axum::Json(json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "Understood, the file is off-limits."},
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                    } else {
+                        axum::Json(json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "c1",
+                                        "type": "function",
+                                        "function": {"name": "read_file", "arguments": "{\"path\": \".env\"}"}
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        }))
+                    }
+                }
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags));
+
+    let mut h = TestHarness::start_with_router_and_env(port, app, &[]).await;
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"read .env"}]}
+    }));
+    let (_, response) = h.read_until_response(2);
+    assert_eq!(response["result"]["status"], "completed");
+
+    // The model's second request must carry the denial as a tool result —
+    // the default deny_path_globs blocks `.env` for read tools.
+    let bodies = seen.lock().unwrap();
+    assert!(bodies.len() >= 2, "expected a second backend call");
+    let second = &bodies[1];
+    let tool_msgs: Vec<&Value> = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    assert!(
+        tool_msgs.iter().any(|m| m["content"]
+            .as_str()
+            .map(|s| s.contains("denied by policy"))
+            .unwrap_or(false)),
+        "denial did not reach the model: {second}"
+    );
+
+    h.shutdown();
+}
+
 /// `LLM_TURN_TIMEOUT` is the whole-turn deadline: a turn whose model call
 /// outlasts it must come back `failed` fast, not hang on the backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

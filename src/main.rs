@@ -87,15 +87,18 @@ async fn main() {
 
     let config_result = match &config_path {
         Some(path) => {
-            ConfigFile::load(std::path::Path::new(path)).and_then(|file| file.into_llm_config())
+            ConfigFile::load(std::path::Path::new(path)).and_then(|file| file.into_parts())
         }
-        None => llm::LlmConfig::from_env(),
+        None => llm::LlmConfig::from_env().and_then(|llm| {
+            acp_bridge::policy::Policy::from_section_and_env(&Default::default())
+                .map(|policy| (llm, policy))
+        }),
     };
 
     // A bad config is a startup error, never a silent fallback (B7):
     // exiting non-zero keeps a broken deployment visible to the spawner.
-    let config = match config_result {
-        Ok(config) => config,
+    let (config, policy) = match config_result {
+        Ok(parts) => parts,
         Err(e) => {
             eprintln!("acp-bridge: {e}");
             std::process::exit(2);
@@ -135,7 +138,7 @@ async fn main() {
     probe_backend(&config).await;
 
     // Build shared state
-    let state = AppState::new(config);
+    let state = AppState::with_policy(config, policy);
 
     // Spawn idle session cleanup task
     let idle_timeout = state.config.session_idle_timeout_secs;

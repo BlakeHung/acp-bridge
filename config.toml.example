@@ -44,5 +44,25 @@ max_history_turns = 50
 # failing call (env LLM_TOOL_FAILURE_STREAK)
 # tool_failure_streak = 3
 
+# ── Tool policy (P1/E12) ──────────────────────────────────────────────
+# Per-capability actions: allow | confirm | deny.
+#   allow   → run the tool
+#   confirm → emit a visible "[policy:confirm]" notice, then run
+#             (the documented fallback — OpenAB has no interactive
+#             permission channel, so confirm can never block forever)
+#   deny    → return a structured error to the model, do not execute
+# Env overrides: LLM_POLICY_READ / _WRITE / _SHELL / _WEB
+#
+# [policy]
+# read = "allow"          # read_file, list_dir, search_code
+# write = "allow"         # write_file, edit
+# shell = "confirm"       # bash, git_*
+# web = "confirm"         # web_fetch
+#
+# Workspace-relative glob denies — applied to file tools' `path` before
+# the capability action is even consulted. `*` does not cross `/`,
+# `**` does; a pattern with no `/` matches basenames at any depth.
+# deny_path_globs = [".env", ".env.*", "*.pem", "*.key", ".ssh/**", ".aws/**", ".gnupg/**"]
+
 # NOTE: unknown sections/fields are rejected at startup — a config written
 # for a newer build must fail visibly instead of being silently ignored.

@@ -90,6 +90,19 @@ spec-shaped v2 payloads.
 | Identical-failure streak | `LLM_TOOL_FAILURE_STREAK` | 3 | Same tool+args erroring N times consecutively aborts the loop into the same bounded wrap-up |
 | Tool output cap | — | 50 KB | UTF-8-safe truncation with a `[note]` marker; the result carries a `truncated` flag |
 
+### Tool policy (`[policy]` + `LLM_POLICY_*`)
+
+Every tool call is gated by a capability rule before dispatch:
+
+| Capability | Tools | Env var | Default |
+|---|---|---|---|
+| read | `read_file`, `list_dir`, `search_code` | `LLM_POLICY_READ` | `allow` |
+| write | `write_file`, `edit` | `LLM_POLICY_WRITE` | `allow` |
+| shell | `bash`, `git_*` | `LLM_POLICY_SHELL` | `confirm` |
+| web | `web_fetch` | `LLM_POLICY_WEB` | `confirm` |
+
+Actions: `allow` executes; `confirm` emits a visible `[policy:confirm]` notice then executes (the documented fallback — OpenAB exposes no interactive permission channel, so confirm can never block on an answer that cannot arrive); `deny` returns a structured `Denied` tool error to the model without executing. `LLM_POLICY_DENY_PATHS` / `deny_path_globs` is a workspace-relative glob deny list applied to file tools' `path` argument before the capability action is consulted — defaults cover credential-shaped files (`.env`, `*.pem`, `*.key`, `.ssh/**`, `.aws/**`, `.gnupg/**`). `*` does not cross `/`, `**` does; a glob without `/` matches basenames at any depth.
+
 ## Supported with caveats
 
 | ACP surface | Caveat | How to enable |

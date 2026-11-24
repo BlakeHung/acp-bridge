@@ -9,6 +9,7 @@ use std::path::Path;
 use tracing::info;
 
 use crate::llm::{env_parse, env_parse_bool, ConfigError, LlmConfig};
+use crate::policy::{Policy, PolicySection};
 use reqwest::Client;
 use std::time::Duration;
 
@@ -23,6 +24,9 @@ use std::time::Duration;
 pub struct ConfigFile {
     #[serde(default)]
     pub llm: LlmSection,
+    /// `[policy]` tool-permission rules; mirrors `LLM_POLICY_*` env vars.
+    #[serde(default)]
+    pub policy: PolicySection,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -81,6 +85,14 @@ impl ConfigFile {
     /// Merge config file values into LlmConfig. Env vars always take precedence.
     /// A present-but-invalid env var is a startup error, not a fallback.
     pub fn into_llm_config(self) -> Result<LlmConfig, ConfigError> {
+        self.into_parts().map(|(llm, _)| llm)
+    }
+
+    /// Same merge, but also resolves the `[policy]` section into the
+    /// tool-permission [`Policy`]. Both parts fail closed on a bad
+    /// value — a policy rule that does not parse is a startup error.
+    pub fn into_parts(self) -> Result<(LlmConfig, Policy), ConfigError> {
+        let policy = Policy::from_section_and_env(&self.policy)?;
         let file = self.llm;
 
         // Helper: env var wins, then config file, then default
@@ -165,7 +177,7 @@ impl ConfigFile {
             .build()
             .expect("Failed to create HTTP client");
 
-        Ok(LlmConfig {
+        let llm = LlmConfig {
             base_url,
             model,
             api_key,
@@ -183,7 +195,8 @@ impl ConfigFile {
             turn_timeout_secs,
             tool_failure_streak,
             client,
-        })
+        };
+        Ok((llm, policy))
     }
 }
 
@@ -200,6 +213,7 @@ mod tests {
                 system_prompt: Some("from file".into()),
                 ..LlmSection::default()
             },
+            policy: Default::default(),
         };
 
         let llm = cfg.into_llm_config().expect("config should merge");
@@ -215,6 +229,7 @@ mod tests {
                 system_prompt: Some("from file".into()),
                 ..LlmSection::default()
             },
+            policy: Default::default(),
         };
 
         let llm = cfg.into_llm_config().expect("config should merge");

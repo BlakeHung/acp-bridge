@@ -14,5 +14,6 @@ pub mod config;
 pub mod engine;
 pub mod hardware;
 pub mod llm;
+pub mod policy;
 pub mod protocol;
 pub mod tools;
