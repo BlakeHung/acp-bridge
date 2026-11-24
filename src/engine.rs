@@ -795,9 +795,11 @@ pub async fn session_prompt(
                         name: name.into(),
                     });
                     // P1/E12 policy gate: deny → structured error, no
-                    // execution; confirm → visible in-session notice,
-                    // then execute (the documented no-permission-UI
-                    // fallback); allow → execute.
+                    // execution; audit → visible in-session notice then
+                    // execute (a logged proceed — there is no
+                    // interactive permission channel); confirm →
+                    // execute only with a deployment grant, else deny;
+                    // allow → execute.
                     evidence.tool_calls += 1;
                     let decision = state.policy.decide(name, &args);
                     let policy_denied = matches!(decision, crate::policy::Decision::Deny(_));
@@ -807,12 +809,19 @@ pub async fn session_prompt(
                             format!("Error: {reason}"),
                         ),
                         decision => {
-                            if let crate::policy::Decision::Confirm(reason) = &decision {
+                            if let crate::policy::Decision::Audit(reason) = &decision {
                                 notify(Notification::TextChunk(format!(
-                                    "\n\n*[policy:confirm] {reason} — proceeding (no interactive permission channel configured)*"
+                                    "\n\n*[policy:audit] {reason} — proceeding (logged; no interactive permission channel configured)*"
                                 )));
                             }
-                            tools::execute_tool(&working_dir, name, &args, tool_timeout_secs).await
+                            tools::execute_tool(
+                                &working_dir,
+                                name,
+                                &args,
+                                tool_timeout_secs,
+                                &state.policy.deny_path_globs,
+                            )
+                            .await
                         }
                     };
                     notify(Notification::ToolDone {

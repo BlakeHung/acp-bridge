@@ -1,21 +1,28 @@
-//! Tool policy — capability-based allow / confirm / deny (P1/E12 first slice).
+//! Tool policy — capability-based allow / audit / confirm / deny
+//! (P1/E12 + G1a round-2 semantics fix).
 //!
 //! Every tool call passes through [`Policy::decide`] before executing:
 //!
 //! - `allow` — run it.
-//! - `confirm` — run it, but emit a visible in-session notice first.
-//!   This is the documented fallback while OpenAB exposes no
-//!   interactive `session/request_permission` channel: confirm can
-//!   never mean "silently proceed" nor can it block forever on an
-//!   approval nobody can give.
+//! - `audit` — emit a visible in-session notice, then run. Honest name
+//!   for "we want eyes on it but nothing can approve it interactively":
+//!   OpenAB exposes no `session/request_permission` channel, so a
+//!   blocking confirm would hang forever on an answer that cannot
+//!   arrive. This is a *logged* proceed, not a granted one.
+//! - `confirm` — run ONLY when the capability was granted ahead of
+//!   time (`[policy] grants` / `LLM_POLICY_GRANTS`, deployment-scope).
+//!   Without a grant this is a structured `Denied` result telling the
+//!   model how the grant would be obtained. "confirm" means *verify a
+//!   grant exists* — it never executes unconfirmed.
 //! - `deny` — do not run; return a structured `Denied` tool error the
 //!   model can read (so it can pick a different approach rather than
 //!   retry blindly).
 //!
 //! On top of the per-capability rules there is a path-level deny list
-//! (`deny_path_globs`) that applies to file tools' `path` argument —
-//! credential-shaped files (`.env`, `*.pem`, `.ssh/**`) are refused even
-//! inside an otherwise-writable workspace.
+//! (`deny_path_globs`) that applies to file tools' `path` argument AND
+//! to every path `list_dir`/`search_code` enumerate — credential-shaped
+//! files (`.env`, `*.pem`, `.ssh/**`) are refused even inside an
+//! otherwise-writable workspace, including via search result content.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,7 +31,7 @@ use crate::llm::ConfigError;
 
 /// A tool's privilege class. Mapped from the tool name — the model
 /// cannot name a capability directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
     /// Inspect workspace files (read_file, list_dir, search_code).
     Read,
@@ -40,10 +47,13 @@ pub enum Capability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Allow,
-    /// Execute after emitting a visible notice naming what will run.
-    /// With no interactive permission channel this is the honest
-    /// middle ground — it never silently proceeds and never waits
-    /// forever on an answer that cannot arrive.
+    /// Emit a visible notice, then execute. A *logged* proceed — there
+    /// is nobody to approve anything interactively, so this never means
+    /// "permission granted".
+    Audit,
+    /// Execute only when the capability holds a deployment grant
+    /// (`[policy] grants` / `LLM_POLICY_GRANTS`). Ungranted → denied.
+    /// This action NEVER executes unconfirmed.
     Confirm,
     /// Refuse to execute; the model gets a Denied tool error.
     Deny,
@@ -53,12 +63,13 @@ impl Action {
     fn parse(s: &str, source: &'static str) -> Result<Self, ConfigError> {
         match s.trim().to_ascii_lowercase().as_str() {
             "allow" => Ok(Self::Allow),
+            "audit" => Ok(Self::Audit),
             "confirm" => Ok(Self::Confirm),
             "deny" => Ok(Self::Deny),
             other => Err(ConfigError::InvalidEnv {
                 var: source,
                 value: other.into(),
-                reason: "expected allow | confirm | deny".into(),
+                reason: "expected allow | audit | confirm | deny".into(),
             }),
         }
     }
@@ -68,8 +79,9 @@ impl Action {
 #[derive(Debug)]
 pub enum Decision {
     Allow,
-    /// Proceed, but surface this notice to the Client first.
-    Confirm(String),
+    /// Proceed, but surface this notice to the Client first — a logged
+    /// proceed, not a granted one.
+    Audit(String),
     /// Do not execute; return this reason as the tool error.
     Deny(String),
 }
@@ -84,10 +96,10 @@ pub struct PolicySection {
     /// Action for write tools (default allow — file writes are the
     /// coding agent's bread and butter; path denies still apply).
     pub write: Option<String>,
-    /// Action for shell tools (default confirm — arbitrary commands
+    /// Action for shell tools (default audit — arbitrary commands
     /// get a visible notice).
     pub shell: Option<String>,
-    /// Action for network tools (default confirm — outbound traffic
+    /// Action for network tools (default audit — outbound traffic
     /// is an exfiltration surface even with the allowlist).
     pub web: Option<String>,
     /// Glob patterns for workspace-relative paths the file tools must
@@ -95,6 +107,12 @@ pub struct PolicySection {
     /// `**` crosses directories, `?` is one char.
     #[serde(default)]
     pub deny_path_globs: Option<Vec<String>>,
+    /// Deployment-scope capability grants for `confirm` actions —
+    /// e.g. `grants = ["shell"]` lets a `shell = "confirm"` policy
+    /// actually run shell tools. Values: read, write, shell, web.
+    /// Deployment-scope because no interactive grant channel exists.
+    #[serde(default)]
+    pub grants: Option<Vec<String>>,
 }
 
 /// Resolved policy, checked on every tool dispatch.
@@ -105,6 +123,8 @@ pub struct Policy {
     pub shell: Action,
     pub web: Action,
     pub deny_path_globs: Vec<String>,
+    /// Capabilities pre-granted for `confirm` actions.
+    pub grants: std::collections::HashSet<Capability>,
 }
 
 /// Default deny list — credential-shaped files refuse inside the
@@ -121,17 +141,18 @@ pub const DEFAULT_DENY_PATH_GLOBS: &[&str] = &[
 
 impl Policy {
     /// Default for tests and for `AppState::new` — read/write allow,
-    /// shell/web confirm, the default credential deny list.
+    /// shell/web audit, the default credential deny list, no grants.
     pub fn default_policy() -> Self {
         Self {
             read: Action::Allow,
             write: Action::Allow,
-            shell: Action::Confirm,
-            web: Action::Confirm,
+            shell: Action::Audit,
+            web: Action::Audit,
             deny_path_globs: DEFAULT_DENY_PATH_GLOBS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            grants: std::collections::HashSet::new(),
         }
     }
 
@@ -164,12 +185,37 @@ impl Policy {
             .or_else(|| file.deny_path_globs.clone())
             .unwrap_or(defaults.deny_path_globs);
 
+        let parse_capability = |s: &str, source: &'static str| -> Result<Capability, ConfigError> {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "read" => Ok(Capability::Read),
+                "write" => Ok(Capability::Write),
+                "shell" => Ok(Capability::Shell),
+                "web" => Ok(Capability::Web),
+                other => Err(ConfigError::InvalidEnv {
+                    var: source,
+                    value: other.into(),
+                    reason: "expected one of read | write | shell | web".into(),
+                }),
+            }
+        };
+        let mut grants = std::collections::HashSet::new();
+        let grant_source: Option<Vec<String>> = std::env::var("LLM_POLICY_GRANTS")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+            .or_else(|| file.grants.clone());
+        for g in grant_source.unwrap_or_default() {
+            if !g.is_empty() {
+                grants.insert(parse_capability(&g, "LLM_POLICY_GRANTS/[policy].grants")?);
+            }
+        }
+
         Ok(Self {
             read: pick("LLM_POLICY_READ", &file.read, defaults.read)?,
             write: pick("LLM_POLICY_WRITE", &file.write, defaults.write)?,
             shell: pick("LLM_POLICY_SHELL", &file.shell, defaults.shell)?,
             web: pick("LLM_POLICY_WEB", &file.web, defaults.web)?,
             deny_path_globs,
+            grants,
         })
     }
 
@@ -208,35 +254,29 @@ impl Policy {
             }
         }
 
-        match cap {
-            Capability::Read => match self.read {
-                Action::Allow => Decision::Allow,
-                Action::Confirm => Decision::Confirm(format!(
-                    "policy requires confirmation for read tool '{name}'"
-                )),
-                Action::Deny => Decision::Deny(format!("policy denies read tool '{name}'")),
-            },
-            Capability::Write => match self.write {
-                Action::Allow => Decision::Allow,
-                Action::Confirm => Decision::Confirm(format!(
-                    "policy requires confirmation for write tool '{name}'"
-                )),
-                Action::Deny => Decision::Deny(format!("policy denies write tool '{name}'")),
-            },
-            Capability::Shell => match self.shell {
-                Action::Allow => Decision::Allow,
-                Action::Confirm => Decision::Confirm(format!(
-                    "policy requires confirmation for shell tool '{name}'"
-                )),
-                Action::Deny => Decision::Deny(format!("policy denies shell tool '{name}'")),
-            },
-            Capability::Web => match self.web {
-                Action::Allow => Decision::Allow,
-                Action::Confirm => Decision::Confirm(format!(
-                    "policy requires confirmation for network tool '{name}'"
-                )),
-                Action::Deny => Decision::Deny(format!("policy denies network tool '{name}'")),
-            },
+        let action = match cap {
+            Capability::Read => self.read,
+            Capability::Write => self.write,
+            Capability::Shell => self.shell,
+            Capability::Web => self.web,
+        };
+        match action {
+            Action::Allow => Decision::Allow,
+            Action::Audit => Decision::Audit(format!(
+                "policy requires an audit notice for {cap:?} tool '{name}'"
+            )),
+            Action::Confirm => {
+                if self.grants.contains(&cap) {
+                    Decision::Allow
+                } else {
+                    Decision::Deny(format!(
+                        "policy requires confirmation for {cap:?} tool '{name}' and no \
+                         {cap:?} grant exists — grant it via [policy] grants or \
+                         LLM_POLICY_GRANTS={cap:?}, or relax the action to 'audit'"
+                    ))
+                }
+            }
+            Action::Deny => Decision::Deny(format!("policy denies {cap:?} tool '{name}'")),
         }
     }
 }
@@ -246,7 +286,7 @@ impl Policy {
 /// A pattern with no `/` matches the path's basename at any depth —
 /// gitignore semantics, so `*.pem` covers `secrets/a.pem` too.
 /// Enough for the deny list without pulling in a glob crate.
-fn glob_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let pth: Vec<char> = path.chars().collect();
     if glob_match(&pat, &pth) {
@@ -308,8 +348,9 @@ mod tests {
         let p = Policy::default_policy();
         assert_eq!(p.read, Action::Allow);
         assert_eq!(p.write, Action::Allow);
-        assert_eq!(p.shell, Action::Confirm);
-        assert_eq!(p.web, Action::Confirm);
+        assert_eq!(p.shell, Action::Audit);
+        assert_eq!(p.web, Action::Audit);
+        assert!(p.grants.is_empty());
     }
 
     #[test]
@@ -341,8 +382,25 @@ mod tests {
         // bash isn't path-checked (its `command` arg isn't a path arg)
         let d = p.decide("bash", &serde_json::json!({"command": "cat .env"}));
         assert!(
-            matches!(d, Decision::Confirm(_)),
-            "bash should hit shell confirm, got {d:?}"
+            matches!(d, Decision::Audit(_)),
+            "bash should hit shell audit, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn confirm_denies_without_grant_and_allows_with_it() {
+        let mut p = Policy::default_policy();
+        p.shell = Action::Confirm;
+        let d = p.decide("bash", &serde_json::json!({"command": "ls"}));
+        assert!(
+            matches!(d, Decision::Deny(_)),
+            "confirm without grant must deny, got {d:?}"
+        );
+        p.grants.insert(Capability::Shell);
+        let d = p.decide("bash", &serde_json::json!({"command": "ls"}));
+        assert!(
+            matches!(d, Decision::Allow),
+            "confirm with grant must allow, got {d:?}"
         );
     }
 

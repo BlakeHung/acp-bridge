@@ -46,18 +46,20 @@ impl SessionStore {
         Some(Self { dir })
     }
 
-    /// Session ids are UUIDs in practice, but we sanitize anyway —
-    /// a hostile or corrupt id must never escape the store dir.
+    /// Session ids are UUIDs in practice, but we validate strictly —
+    /// ANY character outside `[A-Za-z0-9_-]` rejects the id outright.
+    /// Silently stripping characters would let two different hostile
+    /// ids collide onto the same file (`a/b` → `ab`, `ab` → `ab`).
     fn safe_name(session_id: &str) -> Option<String> {
-        let clean: String = session_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        if clean.is_empty() {
-            None
-        } else {
-            Some(clean)
+        if session_id.is_empty()
+            || session_id.len() > 128
+            || !session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return None;
         }
+        Some(session_id.to_string())
     }
 
     fn path(&self, session_id: &str) -> Option<PathBuf> {
@@ -76,6 +78,14 @@ impl SessionStore {
             "session_id": session_id,
             "working_dir": working_dir.display().to_string(),
             "messages": messages,
+            // Completeness + provenance markers: `message_count` lets a
+            // reader detect a truncated-but-parseable write; `writer_pid`
+            // records which process wrote last (diagnostic — this store
+            // assumes a single writer per session and does not enforce
+            // it; two live bridges sharing a dir WILL race on the same
+            // session id, documented limitation).
+            "message_count": messages.len(),
+            "writer_pid": std::process::id(),
         });
         let tmp = path.with_extension("json.tmp");
         match std::fs::write(&tmp, doc.to_string()) {
@@ -115,6 +125,20 @@ impl SessionStore {
                 io::ErrorKind::InvalidData,
                 "snapshot has no messages",
             ));
+        }
+        // Completeness check: a snapshot whose recorded count doesn't
+        // match its message array is partially-written or tampered —
+        // corrupt, not a session.
+        if let Some(recorded) = doc["message_count"].as_u64() {
+            if recorded as usize != messages.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "snapshot message_count {recorded} != actual {}",
+                        messages.len()
+                    ),
+                ));
+            }
         }
         Ok(Some(LoadedSession {
             working_dir,
@@ -172,9 +196,47 @@ mod tests {
         let dir = std::env::temp_dir().join("acp-store-traversal");
         let store = SessionStore { dir: dir.clone() };
         assert!(store.load("../../etc/passwd").unwrap().is_none());
-        // save with a hostile id writes a sanitized name, not a traversal
+        // save with a hostile id is REJECTED entirely — no sanitized
+        // fallback name that could collide with a legitimate id.
         store.save("../../outside", Path::new("/tmp"), &[json!({"role":"x"})]);
         assert!(!dir.join("../../outside.json").exists());
+        assert!(std::fs::read_dir(&dir)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_snapshot_count_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "acp-store-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A parseable snapshot whose recorded count lies about its
+        // contents — truncated-but-valid-JSON write, or tampering.
+        std::fs::write(
+            dir.join("sess-9.json"),
+            json!({
+                "format_version": 1,
+                "session_id": "sess-9",
+                "working_dir": "/tmp",
+                "messages": [{"role": "system", "content": "sys"}],
+                "message_count": 7,
+                "writer_pid": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore { dir: dir.clone() };
+        assert!(
+            store.load("sess-9").is_err(),
+            "count-mismatched snapshot must load as corrupt"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -65,7 +65,7 @@ impl ToolResult {
         }
     }
 
-    fn err(kind: ToolErrorKind, text: String) -> Self {
+    pub(crate) fn err(kind: ToolErrorKind, text: String) -> Self {
         Self {
             text,
             exit_code: None,
@@ -362,15 +362,31 @@ fn resolve_sandboxed_path(working_dir: &Path, relative_path: &str) -> Option<Pat
 /// file tools stay synchronous because they are bounded and fast.
 /// `timeout_secs` applies per tool invocation and comes from the
 /// `LLM_TOOL_TIMEOUT` config.
+/// `deny_globs` is the policy's deny-path set (gitignore-like
+/// workspace-relative globs). Engine passes `policy.deny_path_globs`;
+/// the file tools apply it two ways:
+/// - path-argument tools (`read_file`, `write_file`, `edit`) refuse a
+///   denied path — same check the engine makes, repeated here so a
+///   direct `execute_tool` caller can't bypass it;
+/// - enumeration tools (`list_dir`, `search_code`) filter every visited
+///   entry — otherwise `.env` contents would reach the model through a
+///   search even though `read_file .env` is denied (G1a round-2).
+///
+/// An empty slice means "no path denies" — shell tools ignore it
+/// entirely: a command string can't be path-filtered honestly.
 pub async fn execute_tool(
     working_dir: &Path,
     name: &str,
     arguments: &Value,
     timeout_secs: u64,
+    deny_globs: &[String],
 ) -> ToolResult {
     match name {
         "read_file" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(e) = path_denied(path, deny_globs) {
+                return e;
+            }
             execute_read_file(working_dir, path)
         }
         "list_dir" => {
@@ -378,7 +394,7 @@ pub async fn execute_tool(
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or(".");
-            execute_list_dir(working_dir, path)
+            execute_list_dir(working_dir, path, deny_globs)
         }
         "search_code" => {
             let pattern = arguments
@@ -386,7 +402,7 @@ pub async fn execute_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let file_glob = arguments.get("file_glob").and_then(|v| v.as_str());
-            execute_search_code(working_dir, pattern, file_glob)
+            execute_search_code(working_dir, pattern, file_glob, deny_globs)
         }
         "bash" => {
             let command = arguments
@@ -397,6 +413,9 @@ pub async fn execute_tool(
         }
         "write_file" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(e) = path_denied(path, deny_globs) {
+                return e;
+            }
             let content = arguments
                 .get("content")
                 .and_then(|v| v.as_str())
@@ -405,6 +424,9 @@ pub async fn execute_tool(
         }
         "edit" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(e) = path_denied(path, deny_globs) {
+                return e;
+            }
             let old_text = arguments
                 .get("old_text")
                 .and_then(|v| v.as_str())
@@ -568,7 +590,30 @@ fn execute_read_file(working_dir: &Path, relative_path: &str) -> ToolResult {
     }
 }
 
-fn execute_list_dir(working_dir: &Path, relative_path: &str) -> ToolResult {
+/// Deny check for path-argument tools: `path` is matched against the
+/// policy globs the same way `policy::decide` does it — repeated here
+/// so the rule holds even when a caller bypasses the engine.
+fn path_denied(relative_path: &str, deny_globs: &[String]) -> Option<ToolResult> {
+    let rel = relative_path.trim_start_matches('/');
+    for pattern in deny_globs {
+        if crate::policy::glob_matches(pattern, rel) {
+            return Some(ToolResult::err(
+                ToolErrorKind::Denied,
+                format!("Error: path '{relative_path}' is denied by policy ('{pattern}')"),
+            ));
+        }
+    }
+    None
+}
+
+/// True when the working-dir-relative path matches a deny glob.
+fn is_denied(rel_path: &str, deny_globs: &[String]) -> bool {
+    deny_globs
+        .iter()
+        .any(|p| crate::policy::glob_matches(p, rel_path))
+}
+
+fn execute_list_dir(working_dir: &Path, relative_path: &str, deny_globs: &[String]) -> ToolResult {
     let Some(path) = resolve_sandboxed_path(working_dir, relative_path) else {
         return ToolResult::err(
             ToolErrorKind::OutOfSandbox,
@@ -588,7 +633,20 @@ fn execute_list_dir(working_dir: &Path, relative_path: &str) -> ToolResult {
 
     let mut output = String::new();
     let mut count = 0;
-    list_dir_recursive(&path, "", 0, &mut output, &mut count);
+    let mut denied = 0usize;
+    list_dir_recursive(
+        working_dir,
+        &path,
+        "",
+        0,
+        &mut output,
+        &mut count,
+        deny_globs,
+        &mut denied,
+    );
+    if denied > 0 {
+        output.push_str(&format!("\n[{denied} path(s) hidden by policy]\n"));
+    }
 
     if count >= MAX_LIST_ENTRIES {
         output.push_str(&format!(
@@ -602,12 +660,16 @@ fn execute_list_dir(working_dir: &Path, relative_path: &str) -> ToolResult {
     r
 }
 
+#[allow(clippy::too_many_arguments)]
 fn list_dir_recursive(
+    working_dir: &Path,
     dir: &Path,
     prefix: &str,
     depth: usize,
     output: &mut String,
     count: &mut usize,
+    deny_globs: &[String],
+    denied: &mut usize,
 ) {
     if depth > MAX_LIST_DEPTH || *count >= MAX_LIST_ENTRIES {
         return;
@@ -625,6 +687,22 @@ fn list_dir_recursive(
         }
 
         let name = entry.file_name().to_string_lossy().to_string();
+
+        // Policy deny globs apply to every enumerated path BEFORE the
+        // hidden-file filter — a denied `.env` would otherwise be
+        // silently skipped by is_ignored_entry and never counted as a
+        // policy skip.
+        let rel = entry
+            .path()
+            .strip_prefix(working_dir)
+            .unwrap_or(&entry.path())
+            .to_string_lossy()
+            .to_string();
+        if is_denied(&rel, deny_globs) {
+            *denied += 1;
+            continue;
+        }
+
         // Skip hidden files and common noise
         if is_ignored_entry(&name) {
             continue;
@@ -647,11 +725,14 @@ fn list_dir_recursive(
             output.push_str(&format!("{prefix}{name}/\n"));
             *count += 1;
             list_dir_recursive(
+                working_dir,
                 &entry.path(),
                 &format!("{prefix}  "),
                 depth + 1,
                 output,
                 count,
+                deny_globs,
+                denied,
             );
         } else {
             output.push_str(&format!("{prefix}{name}\n"));
@@ -660,7 +741,12 @@ fn list_dir_recursive(
     }
 }
 
-fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str>) -> ToolResult {
+fn execute_search_code(
+    working_dir: &Path,
+    pattern: &str,
+    file_glob: Option<&str>,
+    deny_globs: &[String],
+) -> ToolResult {
     if pattern.is_empty() {
         return ToolResult::err(
             ToolErrorKind::InvalidArgs,
@@ -670,6 +756,7 @@ fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str
 
     let mut results = String::new();
     let mut match_count = 0;
+    let mut denied = 0usize;
     const MAX_MATCHES: usize = 50;
 
     search_dir(
@@ -681,7 +768,12 @@ fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str
         &mut match_count,
         MAX_MATCHES,
         0,
+        deny_globs,
+        &mut denied,
     );
+    if denied > 0 {
+        results.push_str(&format!("\n[{denied} path(s) hidden by policy]\n"));
+    }
 
     if match_count == 0 {
         return ToolResult::ok(format!("No matches found for '{pattern}'"));
@@ -707,6 +799,8 @@ fn search_dir(
     match_count: &mut usize,
     max_matches: usize,
     depth: usize,
+    deny_globs: &[String],
+    denied: &mut usize,
 ) {
     if *match_count >= max_matches || depth > MAX_LIST_DEPTH * 4 {
         return;
@@ -724,6 +818,19 @@ fn search_dir(
 
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
+
+        // Policy deny globs apply BEFORE the hidden-file filter — a
+        // denied `.env` would otherwise be silently skipped by
+        // is_ignored_entry and never counted as a policy skip.
+        let rel = path
+            .strip_prefix(working_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        if is_denied(&rel, deny_globs) {
+            *denied += 1;
+            continue;
+        }
 
         // Skip hidden/noise directories
         if is_ignored_entry(&name) {
@@ -744,6 +851,19 @@ fn search_dir(
             .unwrap_or(false)
         {
             warn!(path = %path.display(), "Skipping symlink in search_code");
+            continue;
+        }
+
+        // Policy deny globs apply to every enumerated path — searching
+        // must never return matches inside `.env`, `*.key`, etc. just
+        // because the caller didn't name the file directly.
+        let rel = path
+            .strip_prefix(working_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        if is_denied(&rel, deny_globs) {
+            *denied += 1;
             continue;
         }
 
@@ -774,6 +894,8 @@ fn search_dir(
                 match_count,
                 max_matches,
                 depth + 1,
+                deny_globs,
+                denied,
             );
         } else if path.is_file() {
             // Check glob filter
@@ -836,12 +958,44 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
+/// Bytes of process output kept in memory per stream. `wait_with_output`
+/// collects the child's full stdout+stderr unboundedly — a `yes` or a
+/// verbose `find /` would fill RAM before the timeout could fire. We
+/// keep the first N bytes and keep draining (discarding) so the child
+/// never blocks on a full pipe; the retained prefix carries a
+/// truncation note.
+const MAX_PROC_OUTPUT_BYTES: usize = 1_000_000;
+
+/// Read a stream to end, retaining only the first
+/// `MAX_PROC_OUTPUT_BYTES`. Draining matters: stopping early leaves
+/// the child blocked on a full pipe until the timeout kills it.
+/// Returns (retained_bytes, total_bytes_seen).
+async fn drain_bounded(mut stream: impl tokio::io::AsyncRead + Unpin) -> (Vec<u8>, usize) {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut total = 0usize;
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                total += n;
+                let remaining = MAX_PROC_OUTPUT_BYTES.saturating_sub(kept.len());
+                if remaining > 0 {
+                    kept.extend_from_slice(&buf[..n.min(remaining)]);
+                }
+            }
+        }
+    }
+    (kept, total)
+}
+
 /// Spawn a subprocess, capture stdout/stderr with a timeout, and kill the
 /// process group when the future completes, times out, or is dropped
 /// (session cancel). Nothing spawned by a tool call survives the call —
 /// a `sleep &` background job would otherwise hold the output pipes open
-/// and hang `wait_with_output` until timeout. Returns
-/// (exit_code, combined_output, timed_out).
+/// and hang the reader until timeout. Output per stream is memory-bounded
+/// via [`drain_bounded`]. Returns (exit_code, combined_output, timed_out).
 async fn run_process(
     program: &str,
     args: &[&str],
@@ -857,7 +1011,7 @@ async fn run_process(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let _guard = ProcessGroupGuard {
         #[cfg(unix)]
         pgid: child.id(),
@@ -865,40 +1019,77 @@ async fn run_process(
         pgid: None,
     };
 
+    // Drain both pipes concurrently so a stderr-heavy command can't
+    // deadlock on a full stdout buffer (and vice versa).
+    let stdout_reader = child.stdout.take().map(|s| tokio::spawn(drain_bounded(s)));
+    let stderr_reader = child.stderr.take().map(|s| tokio::spawn(drain_bounded(s)));
+
     // Clamp to a 1s floor: timeout(0s) would expire before the child
     // could run at all, which reads as a spawn failure rather than a
     // configured zero-second budget.
     let wait = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs.max(1)),
-        child.wait_with_output(),
+        child.wait(),
     )
     .await;
 
-    match wait {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let mut result = String::new();
-            if !stdout.is_empty() {
-                result.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str("[stderr] ");
-                result.push_str(&stderr);
-            }
-            Ok((output.status.code(), result, false))
-        }
-        Ok(Err(e)) => Err(e),
+    let (status, timed_out) = match wait {
+        Ok(r) => (Some(r), false),
         Err(_) => {
-            // Dropping wait_with_output drops the Child → kill_on_drop
-            // SIGKILLs the leader; the guard then SIGKILLs the group for
-            // grandchildren. Both already happened by the time we return.
-            Ok((None, String::new(), true))
+            // Kill immediately: the reader tasks only finish once the
+            // child's pipes close, and pipes only close when it dies.
+            // Waiting on the readers before killing would hang until
+            // the process exits on its own (a `sleep 30` bug).
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            (None, true)
         }
+    };
+
+    // The child is dead — pipes are closed; collect what the readers kept.
+    let collect = |h: Option<tokio::task::JoinHandle<(Vec<u8>, usize)>>| async move {
+        match h {
+            Some(h) => match h.await {
+                Ok((kept, total)) => (kept, total),
+                Err(_) => (Vec::new(), 0),
+            },
+            None => (Vec::new(), 0),
+        }
+    };
+    let (out_bytes, out_total) = collect(stdout_reader).await;
+    let (err_bytes, err_total) = collect(stderr_reader).await;
+
+    // Truncation note goes FIRST: the downstream 50KB `cap_output`
+    // cuts the tail, so a note appended at the end would be invisible.
+    let stream_note = |total: usize, kept: usize| -> String {
+        if total > kept {
+            format!("[note: stream truncated — kept first {kept}/{total} bytes]\n")
+        } else {
+            String::new()
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out_bytes);
+    let stderr = String::from_utf8_lossy(&err_bytes);
+    let mut result = String::new();
+    result.push_str(&stream_note(out_total, out_bytes.len()));
+    if !stdout.is_empty() {
+        result.push_str(&stdout);
     }
+    if !stderr.is_empty() || err_total > err_bytes.len() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str("[stderr] ");
+        result.push_str(&stream_note(err_total, err_bytes.len()));
+        result.push_str(&stderr);
+    }
+
+    let exit_code = match status {
+        Some(Ok(s)) => s.code(),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+    Ok((exit_code, result, timed_out))
 }
 
 /// Execute a bash command in the working directory with a real timeout
@@ -997,17 +1188,49 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
     };
 
     if let Some(parent) = target.parent() {
+        // Validate the deepest EXISTING ancestor before creating
+        // anything. A blind `create_dir_all` first would happily make
+        // real directories outside the sandbox through a symlinked
+        // component — the side effect must not happen even when the
+        // write is ultimately rejected (G1a-FS1).
+        let mut ancestor = parent;
+        let existing = loop {
+            match ancestor.symlink_metadata() {
+                Ok(_) => break Some(ancestor),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => match ancestor.parent() {
+                    Some(up) => ancestor = up,
+                    None => break None,
+                },
+                Err(e) => {
+                    return ToolResult::err(
+                        ToolErrorKind::ExecFailed,
+                        format!("Error inspecting '{}': {e}", ancestor.display()),
+                    );
+                }
+            }
+        };
+        match existing.and_then(|a| a.canonicalize().ok()) {
+            Some(canon_anc) if canon_anc.starts_with(&canonical_wd) => {}
+            _ => {
+                return ToolResult::err(
+                    ToolErrorKind::OutOfSandbox,
+                    format!(
+                        "Error: path '{}' escapes the working directory via a symlinked ancestor",
+                        relative_path
+                    ),
+                );
+            }
+        }
+
         if let Err(e) = std::fs::create_dir_all(parent) {
             return ToolResult::err(
                 ToolErrorKind::ExecFailed,
                 format!("Error creating parent directory: {e}"),
             );
         }
-        // The `..` component check cannot see through symlinks: a
-        // parent component that is itself a symlink to an outside
-        // directory would let write_file escape the sandbox (G1a-FS1).
-        // Canonicalize the now-existing parent and verify it stays
-        // inside the working directory before writing.
+        // Re-verify after creation (TOCTOU-lite): a directory swapped
+        // in for a symlink between the checks above and now would
+        // still land the write outside the sandbox.
         match parent.canonicalize() {
             Ok(canon_parent) if canon_parent.starts_with(&canonical_wd) => {}
             _ => {
@@ -1559,6 +1782,94 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&wd);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// G1a round-2: a write under a symlinked parent that needs NEW
+    /// directories must be rejected BEFORE `create_dir_all` runs —
+    /// the reject must not itself create directories outside the
+    /// sandbox (the side effect was the bug).
+    #[test]
+    fn write_file_reject_creates_nothing_outside() {
+        let wd = tmpwd();
+        let outside = tmpwd();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, wd.join("linkdir")).unwrap();
+            let result = execute_write_file(&wd, "linkdir/newsub/evil.txt", "x");
+            assert_eq!(result.error_kind, Some(ToolErrorKind::OutOfSandbox));
+            assert!(
+                !outside.join("newsub").exists(),
+                "rejected write still created directories outside the sandbox"
+            );
+        }
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// G1a round-2: process output is memory-bounded — a command
+    /// printing megabytes keeps ~1MB and says so, rather than the
+    /// backend buffering the whole stream.
+    #[tokio::test]
+    async fn bash_output_is_bounded() {
+        let wd = tmpwd();
+        // ~2MB of 'a' — well past the 1MB stream cap.
+        let result = execute_bash(&wd, "head -c 2000000 /dev/zero | tr '\\0' 'a'", 30).await;
+        assert!(
+            result.text.len() < 1_100_000,
+            "output not bounded: {} bytes",
+            result.text.len()
+        );
+        assert!(
+            result.text.contains("stream truncated"),
+            "missing truncation note: {}",
+            &result.text[..result.text.len().min(200)]
+        );
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    /// G1a round-2: denied files must not leak through search results —
+    /// `read_file .env` is denied, so `search_code` finding `.env`
+    /// contents anyway would be a trivial bypass.
+    #[test]
+    fn search_code_hides_denied_files() {
+        let wd = tmpwd();
+        fs::write(wd.join(".env"), "SECRET=hunter2\n").unwrap();
+        fs::write(
+            wd.join("allowed.rs"),
+            "fn main() { println!(\"hunter2\"); }",
+        )
+        .unwrap();
+        let denies: Vec<String> = vec![".env".into()];
+        let result = execute_search_code(&wd, "hunter2", None, &denies);
+        assert!(result.text.contains("allowed.rs"), "got: {}", result.text);
+        assert!(
+            !result.text.contains("SECRET"),
+            ".env leaked through search_code: {}",
+            result.text
+        );
+        assert!(
+            result.text.contains("hidden by policy"),
+            "missing skip note: {}",
+            result.text
+        );
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    /// list_dir hides denied entries the same way.
+    #[test]
+    fn list_dir_hides_denied_files() {
+        let wd = tmpwd();
+        fs::write(wd.join(".env"), "SECRET=x").unwrap();
+        fs::write(wd.join("visible.txt"), "x").unwrap();
+        let denies: Vec<String> = vec![".env".into()];
+        let result = execute_list_dir(&wd, ".", &denies);
+        assert!(result.text.contains("visible.txt"), "got: {}", result.text);
+        assert!(
+            !result.text.contains(".env\n") && !result.text.contains("SECRET"),
+            ".env listed: {}",
+            result.text
+        );
+        let _ = fs::remove_dir_all(&wd);
     }
 
     /// An existing file that is itself a symlink to an outside target

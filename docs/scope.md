@@ -99,10 +99,10 @@ Every tool call is gated by a capability rule before dispatch:
 |---|---|---|---|
 | read | `read_file`, `list_dir`, `search_code` | `LLM_POLICY_READ` | `allow` |
 | write | `write_file`, `edit` | `LLM_POLICY_WRITE` | `allow` |
-| shell | `bash`, `git_*` | `LLM_POLICY_SHELL` | `confirm` |
-| web | `web_fetch` | `LLM_POLICY_WEB` | `confirm` |
+| shell | `bash`, `git_*` | `LLM_POLICY_SHELL` | `audit` |
+| web | `web_fetch` | `LLM_POLICY_WEB` | `audit` |
 
-Actions: `allow` executes; `confirm` emits a visible `[policy:confirm]` notice then executes (the documented fallback — OpenAB exposes no interactive permission channel, so confirm can never block on an answer that cannot arrive); `deny` returns a structured `Denied` tool error to the model without executing. `LLM_POLICY_DENY_PATHS` / `deny_path_globs` is a workspace-relative glob deny list applied to file tools' `path` argument before the capability action is consulted — defaults cover credential-shaped files (`.env`, `*.pem`, `*.key`, `.ssh/**`, `.aws/**`, `.gnupg/**`). `*` does not cross `/`, `**` does; a glob without `/` matches basenames at any depth.
+Actions: `allow` executes; `audit` emits a visible `[policy:audit]` notice then executes (a logged proceed — OpenAB exposes no interactive permission channel, so nothing can be approved mid-turn); `confirm` executes only when the capability holds a deployment grant (`[policy] grants` / `LLM_POLICY_GRANTS`) — ungranted, it returns a structured `Denied` result naming how to grant; `deny` returns a structured `Denied` tool error without executing. `LLM_POLICY_DENY_PATHS` / `deny_path_globs` is a workspace-relative glob deny list applied to file tools' `path` argument AND to every path `list_dir`/`search_code` enumerate — `.env` contents cannot leak through a search either. Defaults cover credential-shaped files (`.env`, `*.pem`, `*.key`, `.ssh/**`, `.aws/**`, `.gnupg/**`). `*` does not cross `/`, `**` does; a glob without `/` matches basenames at any depth.
 
 ## Supported with caveats
 
