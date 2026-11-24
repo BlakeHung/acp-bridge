@@ -196,3 +196,23 @@ fn acp_error_codes() {
     assert_eq!(limit.code(), -32004);
     assert!(limit.to_string().contains("10"));
 }
+
+#[test]
+fn trim_history_counts_user_turns_without_splitting_tools() {
+    let mut session = make_session(vec![
+        json!({"role":"system","content":"s"}),
+        json!({"role":"user","content":"old"}),
+        json!({"role":"assistant","content":"done"}),
+        json!({"role":"user","content":"current"}),
+        json!({"role":"assistant","tool_calls":[{"id":"a"},{"id":"b"}]}),
+        json!({"role":"tool","tool_call_id":"a","content":"a"}),
+        json!({"role":"tool","tool_call_id":"b","content":"b"}),
+    ]);
+    session.trim_history(1);
+    assert_eq!(session.messages.len(), 5);
+    assert_eq!(session.messages[1]["content"], "current");
+    assert_eq!(
+        session.messages[2]["tool_calls"][1]["id"],
+        session.messages[4]["tool_call_id"]
+    );
+}

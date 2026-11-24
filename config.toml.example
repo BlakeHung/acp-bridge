@@ -24,9 +24,13 @@ model = "gemma4:26b"
 # HTTP timeout in seconds
 timeout_secs = 300
 
-# Max conversation turns to keep (0 = unlimited)
-# Prevents memory growth in long sessions
+# User-turn count that requests a summary (0 disables only the count trigger)
 max_history_turns = 50
+
+# Semantic summaries use the same model without tools; budget checks remain active if off.
+# Environment overrides: LLM_AUTO_SUMMARIZE and LLM_SUMMARIZE_AT
+auto_summarize = true
+summarize_at = 0.6
 
 # Maximum model↔tool round-trips in one prompt turn before the bounded
 # wrap-up path runs (env LLM_MAX_TOOL_ROUNDS, default 50)

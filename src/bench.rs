@@ -335,6 +335,8 @@ mod tests {
             tool_timeout_secs: 30,
             turn_timeout_secs: 0,
             tool_failure_streak: 3,
+            auto_summarize: true,
+            auto_summarize_at: 0.6,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()

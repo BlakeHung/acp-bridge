@@ -1566,9 +1566,8 @@ async fn test_policy_deny_reaches_model_as_tool_result() {
     h.shutdown();
 }
 
-/// Context overflow: a backend that rejects prompt+max_tokens>context
-/// gets a compacted retry — oldest history drops, a `[context]` notice
-/// announces the loss, and the turn still completes.
+/// Exercise the real request body (including tools), with a mock tokenizer that
+/// counts bytes/2 instead of the bridge heuristic. The third turn must recover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_context_overflow_compacts_and_retries() {
     let port = free_port();
@@ -1576,86 +1575,49 @@ async fn test_context_overflow_compacts_and_retries() {
     let recorded = seen.clone();
     let app = Router::new()
         .route("/v1/models", get(mock_models))
-        .route(
-            "/v1/chat/completions",
-            post(move |axum::Json(body): axum::Json<Value>| {
-                let recorded = recorded.clone();
-                async move {
-                    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
-                    recorded.lock().unwrap().push(msgs.len());
-                    // Deterministic trigger: a 5+ message prompt is
-                    // "too long"; the compacted retry has fewer.
-                    if msgs.len() >= 5 {
-                        // Real-world llama.cpp rejection shape — the
-                        // 400 status is what classifies it BadRequest.
-                        return (
-                            axum::http::StatusCode::BAD_REQUEST,
-                            axum::Json(json!({
-                                "error": {
-                                    "type": "invalid_request_error",
-                                    // "leaves no room" phrasing — the
-                                    // live variant llama.cpp emits when
-                                    // the prompt alone overflows.
-                                    "message": "prompt (31000 tokens) leaves no room to answer in the context (32768); requests are never truncated."
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-                    axum::Json(json!({
-                        "choices": [{"message":{"role":"assistant","content":"understood."},"finish_reason":"stop"}]
-                    }))
-                    .into_response()
+        .route("/v1/chat/completions", post(move |axum::Json(body): axum::Json<Value>| {
+            let recorded=recorded.clone();
+            async move {
+                let prompt=serde_json::to_string(&json!({"messages":body["messages"],"tools":body["tools"]})).unwrap().len().div_ceil(2);
+                recorded.lock().unwrap().push(prompt);
+                let output=body["max_tokens"].as_u64().unwrap() as usize;
+                if prompt+output>32768 {
+                    return (axum::http::StatusCode::BAD_REQUEST,axum::Json(json!({"error":{"type":"invalid_request_error","message":format!("prompt ({prompt} tokens) + max tokens ({output}) exceeds the context (32768)")}}))).into_response();
                 }
-            }),
-        )
+                // Reply size tuned so the bridge's own estimate stays
+                // under its proactive budget (no early compaction) while
+                // the mock's byte/2 count overflows on the third call —
+                // the real-world divergence the retry path exists for.
+                axum::Json(json!({"choices":[{"message":{"role":"assistant","content":"x".repeat(36000)},"finish_reason":"stop"}]})).into_response()
+            }
+        }))
         .route("/api/tags", get(mock_ollama_tags));
-
-    let mut h = TestHarness::start_with_router_and_env(port, app, &[]).await;
+    let mut h =
+        TestHarness::start_with_router_and_env(port, app, &[("LLM_AUTO_SUMMARIZE", "false")]).await;
     h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
-    let resp = h.read_line();
-    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
-
-    // Two normal prompts build history; the first user message is the
-    // task anchor — compaction must NEVER drop it.
+    let response = h.read_line();
+    let sid = response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
     for (id, text) in [(2u64, "first task"), (3, "second")] {
-        h.send(&json!({
-            "jsonrpc":"2.0","id":id,"method":"session/prompt",
-            "params":{"sessionId":&sid,"prompt":[{"type":"text","text":text}]}
-        }));
+        h.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":text}]}}));
         let (_, r) = h.read_until_response(id);
         assert_eq!(r["result"]["status"], "completed");
     }
-
-    // Prompt 3: history is now 6 messages (sys + u1/a1 + u2/a2 + u3)
-    // → backend rejects it; the retry must arrive compacted (<5 msgs)
-    // and succeed.
-    h.send(&json!({
-        "jsonrpc":"2.0","id":4,"method":"session/prompt",
-        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"more"}]}
-    }));
-    let (notif, r2) = h.read_until_response(4);
-    assert_eq!(
-        r2["result"]["status"],
-        "completed",
-        "compacted retry should still complete: {r2} sizes={:?}",
-        seen.lock().unwrap()
-    );
-    let joined = serde_json::to_string(&notif).unwrap();
-    assert!(
-        joined.contains("[context] compacted"),
-        "compaction must be announced: {joined}"
-    );
+    h.send(&json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"more"}]}}));
+    let (notifications, response) = h.read_until_response(4);
+    assert_eq!(response["result"]["status"], "completed", "{response}");
+    assert!(serde_json::to_string(&notifications)
+        .unwrap()
+        .contains("[context] compacted"));
     let sizes = seen.lock().unwrap();
-    assert!(
-        sizes.len() >= 3,
-        "expected the retry to hit the backend: {sizes:?}"
+    assert_eq!(
+        sizes.len(),
+        4,
+        "two initial calls, one overflow and one retry: {sizes:?}"
     );
-    let last = sizes[sizes.len() - 1];
-    assert!(
-        last < 5,
-        "retry should carry a compacted prompt, got {last} messages (all: {sizes:?})"
-    );
+    assert!(sizes[3] < sizes[2]);
     h.shutdown();
 }
 

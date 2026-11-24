@@ -99,6 +99,8 @@ pub struct Session {
     /// ratio lands here and shrinks later calls' prompt budgets so the
     /// same content doesn't overflow twice. 1.0 = trust the estimate.
     pub token_scale: f64,
+    /// Skip a few model steps after a failed summary instead of repeatedly charging for it.
+    pub summary_cooldown: u8,
 }
 
 impl Session {
@@ -113,6 +115,7 @@ impl Session {
             working_dir,
             protocol_version,
             token_scale: 1.0,
+            summary_cooldown: 0,
         }
     }
 
@@ -122,17 +125,28 @@ impl Session {
 }
 
 impl Session {
-    /// Trim conversation history to keep the system prompt + last `max_turns` pairs.
-    /// Each "turn" = one user message + one assistant message.
+    /// Explicit trimming keeps system + the last `max_turns` user turns, including tools.
+    /// The engine uses budgeted summarization instead of invoking this before each prompt.
     /// The system prompt (first message) is always preserved.
     pub fn trim_history(&mut self, max_turns: usize) {
-        // messages[0] = system prompt, then alternating user/assistant
-        let keep = max_turns * 2; // user + assistant per turn
-        if self.messages.len() > keep + 1 {
-            let system = self.messages[0].clone();
-            let tail = self.messages.split_off(self.messages.len() - keep);
-            self.messages = vec![system];
-            self.messages.extend(tail);
+        if max_turns == 0 {
+            return;
+        }
+        let starts: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| (m["role"] == "user").then_some(i))
+            .collect();
+        if starts.len() > max_turns {
+            let cut = starts[starts.len() - max_turns];
+            let system = self
+                .messages
+                .first()
+                .filter(|m| m["role"] == "system")
+                .cloned();
+            let tail = self.messages.split_off(cut);
+            self.messages = system.into_iter().chain(tail).collect();
         }
     }
 }

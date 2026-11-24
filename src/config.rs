@@ -64,6 +64,8 @@ pub struct LlmSection {
     /// `LLM_TOOL_FAILURE_STREAK`.
     #[serde(default)]
     pub tool_failure_streak: Option<usize>,
+    pub auto_summarize: Option<bool>,
+    pub summarize_at: Option<f64>,
 }
 
 impl ConfigFile {
@@ -194,6 +196,10 @@ impl ConfigFile {
             tool_timeout_secs,
             turn_timeout_secs,
             tool_failure_streak,
+            auto_summarize: env_parse_bool("LLM_AUTO_SUMMARIZE")?
+                .or(file.auto_summarize)
+                .unwrap_or(true),
+            auto_summarize_at: crate::llm::summarize_threshold(file.summarize_at)?,
             client,
         };
         Ok((llm, policy))
@@ -269,5 +275,27 @@ mod tests {
 
         let bad_field = "[llm]\npermisssions = \"all\"\n";
         assert!(toml::from_str::<ConfigFile>(bad_field).is_err());
+    }
+    #[test]
+    fn summary_config_supports_toml_and_rejects_nonfinite_threshold() {
+        let saved = std::env::var("LLM_SUMMARIZE_AT").ok();
+        std::env::remove_var("LLM_SUMMARIZE_AT");
+        let cfg: ConfigFile =
+            toml::from_str("[llm]\nauto_summarize = false\nsummarize_at = 0.7\n").unwrap();
+        let llm = cfg.into_llm_config().unwrap();
+        assert_eq!(llm.auto_summarize_at, 0.7);
+        for value in [f64::NAN, f64::INFINITY, 0.0, 1.0] {
+            let cfg = ConfigFile {
+                llm: LlmSection {
+                    summarize_at: Some(value),
+                    ..Default::default()
+                },
+                policy: Default::default(),
+            };
+            assert!(cfg.into_llm_config().is_err());
+        }
+        if let Some(saved) = saved {
+            std::env::set_var("LLM_SUMMARIZE_AT", saved);
+        }
     }
 }

@@ -11,6 +11,7 @@
 pub mod acp;
 pub mod bench;
 pub mod config;
+pub mod context;
 pub mod engine;
 pub mod hardware;
 pub mod llm;

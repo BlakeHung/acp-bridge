@@ -575,6 +575,20 @@ pub(crate) fn env_parse_bool(var: &'static str) -> Result<Option<bool>, ConfigEr
     }
 }
 
+pub(crate) fn summarize_threshold(fallback: Option<f64>) -> Result<f64, ConfigError> {
+    let value = env_parse::<f64>("LLM_SUMMARIZE_AT")?
+        .or(fallback)
+        .unwrap_or(0.6);
+    if !value.is_finite() || !(0.1..=0.95).contains(&value) {
+        return Err(ConfigError::InvalidEnv {
+            var: "LLM_SUMMARIZE_AT",
+            value: value.to_string(),
+            reason: "expected a finite fraction from 0.1 to 0.95".into(),
+        });
+    }
+    Ok(value)
+}
+
 #[derive(Clone)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -584,7 +598,7 @@ pub struct LlmConfig {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
     pub timeout_secs: u64,
-    /// Maximum conversation turns to keep (0 = unlimited).
+    /// User-turn count that requests a summary (0 disables the count trigger).
     pub max_history_turns: usize,
     /// Maximum number of concurrent sessions (0 = unlimited).
     pub max_sessions: usize,
@@ -623,6 +637,17 @@ pub struct LlmConfig {
     /// bail early instead of burning the round budget. Override via
     /// `LLM_TOOL_FAILURE_STREAK` (default 3).
     pub tool_failure_streak: usize,
+    /// Mid-turn semantic summarization. When session history estimate
+    /// crosses `auto_summarize_at` of the prompt budget, the oldest
+    /// non-anchor span is compressed into an LLM-generated task summary
+    /// instead of being elided/dropped wholesale — Kiro/OpenCode-style
+    /// "summarize then continue" for long investigations. A failed
+    /// summary falls back to the elide+drop budget path — budget
+    /// management stays independent of it. `LLM_AUTO_SUMMARIZE`
+    /// (default on) / `LLM_SUMMARIZE_AT` (default 0.6).
+    pub auto_summarize: bool,
+    /// Fraction of the prompt budget that triggers summarization (0.1-0.95).
+    pub auto_summarize_at: f64,
     /// Shared HTTP client for connection pooling.
     pub client: Client,
 }
@@ -697,6 +722,8 @@ impl LlmConfig {
             tool_timeout_secs: env_parse("LLM_TOOL_TIMEOUT")?.unwrap_or(120),
             turn_timeout_secs: env_parse("LLM_TURN_TIMEOUT")?.unwrap_or(0),
             tool_failure_streak: env_parse("LLM_TOOL_FAILURE_STREAK")?.unwrap_or(3),
+            auto_summarize: env_parse_bool("LLM_AUTO_SUMMARIZE")?.unwrap_or(true),
+            auto_summarize_at: summarize_threshold(None)?,
             client,
         })
     }
@@ -1265,6 +1292,8 @@ mod tests {
             tool_timeout_secs: 30,
             turn_timeout_secs: 0,
             tool_failure_streak: 3,
+            auto_summarize: true,
+            auto_summarize_at: 0.6,
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()

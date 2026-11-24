@@ -7,6 +7,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+- Budget context using serialized messages, tool definitions and arguments, with calibration from successful provider usage and overflow counts. Reserve output separately and refuse protected inputs that still exceed the estimated budget.
+- Summarize older history through a bounded no-tools model call before fallback pruning. Preserve task/latest user anchors and recent complete tool groups; failed summaries keep the original working history until deterministic fitting and pause further summary attempts for four calls. Configure with `LLM_AUTO_SUMMARIZE` and `LLM_SUMMARIZE_AT`.
+- Replace pre-prompt message-count trimming with a user-turn summary trigger. Explicit history trimming uses user-turn boundaries.
+
+### Fixed
+- Tool-output elision is idempotent, including the newest tool result; user instructions and tool arguments are not text-truncated.
+- Drop tool calls with their results, account for loss markers, and avoid retrying an unchanged overflowing request.
+- Emit classified context diagnostics with estimated/actual sizes and attempt numbers without logging request content.
+
 ## [0.10.0] - 2026-11-24
 
 First slice of the agent-harness hardening plan (P0–P1): the bridge grows

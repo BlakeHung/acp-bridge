@@ -129,7 +129,7 @@ ACP Harness          │  ┌───────────────┐  �
 2. acp-bridge translates to OpenAI chat completion API call
 3. The backend response arrives; tool calls execute (up to 5 rounds per prompt), then the final text is emitted as `agent_message_chunk` notifications via **stdout**
 4. Per-round progress (`thinking`, tool call start/update) is also reported as `session/update` notifications
-5. Conversation history is kept per session, auto-trimmed to prevent memory growth
+5. Conversation history is kept per session, summarized near the prompt budget, and pruned in complete tool groups when necessary
 
 ### Key design decisions
 
@@ -255,11 +255,13 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_TEMPERATURE` | (model default) | Sampling temperature (0.0-2.0) |
 | `LLM_MAX_TOKENS` | (model default) | Maximum tokens to generate |
 | `LLM_TIMEOUT` | `300` | HTTP request timeout in seconds |
-| `LLM_MAX_HISTORY_TURNS` | `50` | Max conversation turns to keep (0 = unlimited) |
+| `LLM_MAX_HISTORY_TURNS` | `50` | User-turn count that requests a summary (0 disables this trigger; token budgets still apply) |
 | `LLM_MAX_SESSIONS` | `256` | Max concurrent sessions; `0` restores the old unlimited behavior |
 | `LLM_SESSION_IDLE_TIMEOUT` | `0` | Evict idle sessions after N seconds (0 = disabled) |
 | `LLM_SUPPORTS_IMAGE` | `false` | Opt-in: advertise `promptCapabilities.image: true` at `initialize`. Set to `true` only if the configured backend can actually accept image content blocks (e.g. a vision-capable model). |
-| `LLM_MODEL_CONTEXT` | `32768` | Model context window in tokens. Reported as `size` in `usage_update` notifications AND used to fit every call into the window: when history grows past it the oldest messages are compacted away (announced via a `[context]` chunk) and `max_tokens` is clamped — local backends reject `prompt + max_tokens > context` rather than truncating |
+| `LLM_MODEL_CONTEXT` | `32768` | Actual server context window. Request estimates include message metadata, tool arguments and schemas; successful provider usage calibrates the estimate. Output and a 512-token safety margin are reserved before dispatch. |
+| `LLM_AUTO_SUMMARIZE` | `true` | Summarize older history using the same backend without tools. Failure falls back to deterministic tool-output elision and group pruning; four calls elapse before another summary attempt. |
+| `LLM_SUMMARIZE_AT` | `0.6` | Summary trigger as a fraction of the available prompt budget (finite value from 0.1 to 0.95). TOML: `llm.summarize_at`. |
 | `LLM_MAX_TOOL_ROUNDS` | `50` | Max model↔tool round-trips per turn before the bounded wrap-up path runs (aligned with openab-agent's default) |
 | `LLM_TOOL_TIMEOUT` | `120` | Per-tool wall-clock timeout in seconds; bash/git/web_fetch processes are killed (with their process group) on expiry |
 | `LLM_TURN_TIMEOUT` | `0` | Whole-turn deadline in seconds (0 = no limit) |
@@ -273,6 +275,10 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `RUST_LOG` | `acp_bridge=info` | Log level (`debug`, `info`, `warn`, `error`) |
 
 Also supports `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_API_KEY` as aliases.
+
+Context counts are estimates, not exact tokenizer counts. A backend overflow triggers at most one context retry with a smaller budget; an unchanged request is not replayed. Summary requests have their own input/output budget and a timeout bounded by `LLM_TIMEOUT` (at most 300 seconds). Empty, truncated, tool-calling or insufficiently smaller summaries are discarded. The original task, latest user instruction, system rules and two recent message groups remain verbatim after a successful summary. Deterministic fallback preserves all user messages and keeps tool calls with their results.
+
+Summaries are lossy and a small local model may omit evidence. The session snapshot contains the current working context, not an archive of removed messages; this change does not create a transcript archive or a retrieval index. Re-read source files before relying on elided details. Images are conservatively estimated from their serialized representation, which can reject inputs that a vision tokenizer could fit. Diagnostics report numeric sizes, error class, overflow classification and retry attempt without adding raw prompts or backend error bodies to the context log.
 
 ### Config file
 
@@ -470,7 +476,7 @@ When spawned by openab, logs go to the child process's stderr. To capture them, 
 
 - **Retry with exponential backoff** — transient errors (408, 429, 500, 502, 503, 504) and connection timeouts are retried up to 3 times with exponential backoff (500ms, 1s, 2s)
 - **Graceful shutdown** — handles SIGINT/SIGTERM and stdin EOF cleanly, drains in-flight requests
-- **Memory-bounded sessions** — conversation history auto-trims to `LLM_MAX_HISTORY_TURNS` (default 50 turns), preventing OOM in long sessions
+- **Budgeted working context** — history is summarized near the configured prompt budget; oversized tool results are elided and older complete tool groups may be removed. Protected inputs that cannot fit are rejected before dispatch.
 - **Session limits** — configurable `LLM_MAX_SESSIONS` to cap concurrent sessions, and `LLM_SESSION_IDLE_TIMEOUT` to auto-evict idle sessions
 - **Stream buffer cap** — SSE stream buffer capped at 10MB to prevent unbounded memory growth from malicious or buggy backends
 - **HTTP connection pooling** — reuses a shared HTTP client across all requests, reducing TCP/TLS handshake overhead
