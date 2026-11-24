@@ -19,6 +19,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 - Tool-output artifacts: results past `LLM_ARTIFACT_CHARS` (default 8192) are written to `{LLM_SESSION_DIR}/artifacts/<session>/<call>.txt` (tmp+rename+fsync, inside the recursive store quota) and history keeps a head excerpt plus a re-readable `read_file` pointer. `read_file` accepts absolute paths only inside the session artifact root — every other absolute path stays denied. Without `LLM_SESSION_DIR` outputs truncate at the same budget.
+- `read_file` line pagination: optional `offset` (1-based) and `limit` parameters return a `[lines X-Y of N]` header plus the slice — the supported way to page through artifact files and large sources instead of pulling whole files into history.
 
 ## [0.10.0] - 2026-11-24
 

@@ -1513,7 +1513,7 @@ fn offload_tool_output(
     let total = t.len();
     crate::tools::truncate_utf8(&mut t, head);
     t.push_str(&format!(
-        "\n\n[artifact: full output ({total} bytes) saved to {} — call read_file with this absolute path for the rest]",
+        "\n\n[artifact: full output ({total} bytes) saved to {} — call read_file with this absolute path plus offset/limit to page through the rest]",
         path.display()
     ));
     t

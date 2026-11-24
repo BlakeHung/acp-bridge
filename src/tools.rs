@@ -116,13 +116,21 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file. Returns the file content as text. Use this to examine source code, configuration files, or any text file in the project.",
+                "description": "Read the contents of a file. Returns the file content as text. For large files, pass offset (1-based start line) and limit (lines) to read a slice — this is also how to page through an [artifact:] pointer file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative path to the file from the working directory (e.g. 'src/main.rs', 'package.json')"
+                            "description": "Relative path to the file from the working directory (e.g. 'src/main.rs', 'package.json'). Absolute paths are accepted only for session artifact files."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "1-based line number to start reading from (default 1)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to return (default: whole file up to the output cap)"
                         }
                     },
                     "required": ["path"]
@@ -409,7 +417,15 @@ pub async fn execute_tool(
                     return e;
                 }
             }
-            execute_read_file(working_dir, path, artifact_root)
+            let offset = arguments
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            execute_read_file(working_dir, path, artifact_root, offset, limit)
         }
         "list_dir" => {
             let path = arguments
@@ -562,6 +578,8 @@ fn execute_read_file(
     working_dir: &Path,
     relative_path: &str,
     artifact_root: Option<&Path>,
+    offset: Option<usize>,
+    limit: Option<usize>,
 ) -> ToolResult {
     let Some(path) = resolve_sandboxed_path(working_dir, relative_path, artifact_root) else {
         return ToolResult::err(
@@ -602,9 +620,30 @@ fn execute_read_file(
     }
 
     match std::fs::read_to_string(&path) {
-        Ok(mut content) => {
+        Ok(content) => {
             debug!(path = %relative_path, bytes = content.len(), "read_file");
-            let truncated = cap_output(&mut content);
+            // Line pagination (Devin-style): offset is 1-based, limit
+            // caps the slice. The header reports the total so the model
+            // knows whether more pages exist — same contract as the
+            // [artifact:] pointers that send it here.
+            let mut truncated = false;
+            let mut content = if offset.is_some() || limit.is_some() {
+                let lines: Vec<&str> = content.lines().collect();
+                let total = lines.len();
+                let start = offset.unwrap_or(1).max(1) - 1;
+                let end = limit.map(|l| (start + l).min(total)).unwrap_or(total);
+                if start >= total {
+                    format!("[lines {total}-{total} of {total}]")
+                } else {
+                    truncated = end < total;
+                    let mut out = format!("[lines {}-{} of {total}]\n", start + 1, end);
+                    out.push_str(&lines[start..end].join("\n"));
+                    out
+                }
+            } else {
+                content
+            };
+            truncated = cap_output(&mut content) || truncated;
             let mut r = ToolResult::ok(content);
             r.truncated = truncated;
             r
@@ -2209,5 +2248,46 @@ mod tests {
         let _ = fs::remove_dir_all(&wd);
         let _ = fs::remove_dir_all(&art);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_offset_limit_pages_and_reports_total() {
+        let wd = tmpwd();
+        let body: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(wd.join("p.txt"), body).unwrap();
+
+        let page = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": "p.txt", "offset": 4, "limit": 3}),
+            5,
+            &[],
+            None,
+        )
+        .await;
+        assert!(page.error_kind.is_none());
+        assert!(page.text.starts_with("[lines 4-6 of 10]"));
+        assert!(page.text.contains("line4") && page.text.contains("line6"));
+        assert!(!page.text.contains("line7"));
+        assert!(page.truncated, "more pages exist — flag must say so");
+
+        // Past the end: empty page, not an error.
+        let past = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": "p.txt", "offset": 99, "limit": 3}),
+            5,
+            &[],
+            None,
+        )
+        .await;
+        assert!(past.error_kind.is_none());
+        assert!(past.text.contains("of 10"));
+
+        // No pagination args → legacy whole-file behavior, no header.
+        let whole = execute_tool(&wd, "read_file", &json!({"path": "p.txt"}), 5, &[], None).await;
+        assert!(whole.text.contains("line1") && whole.text.contains("line10"));
+        assert!(!whole.text.contains("[lines "));
+        let _ = fs::remove_dir_all(&wd);
     }
 }
