@@ -636,7 +636,16 @@ async fn handle_acp_prompt(
         .await
     });
 
+    // Whole-turn deadline (LLM_TURN_TIMEOUT). A pinned sleep so the
+    // deadline is absolute across select iterations, not reset each
+    // poll. 0 disables the arm entirely.
+    let turn_deadline = tokio::time::sleep(std::time::Duration::from_secs(
+        state.config.turn_timeout_secs.max(1),
+    ));
+    tokio::pin!(turn_deadline);
+
     let mut cancelled = false;
+    let mut timed_out = false;
     loop {
         tokio::select! {
             // `changed` also fires for a cancel sent before this task first polls.
@@ -651,6 +660,19 @@ async fn handle_acp_prompt(
                 cancelled = true;
                 break;
             }
+            _ = &mut turn_deadline, if state.config.turn_timeout_secs > 0 => {
+                // Same abort path as a cancel — async tools (bash/git/
+                // web_fetch) are killed via the process-group guard when
+                // the engine future is dropped.
+                handle.abort();
+                let _ = (&mut handle).await;
+                engine::session_timed_out(state, &session_id);
+                while let Ok(notif) = notify_rx.try_recv() {
+                    emit_prompt_notification(state.protocol_version, &session_id, notif);
+                }
+                timed_out = true;
+                break;
+            }
             notif = notify_rx.recv() => {
                 match notif {
                     Some(notif) => emit_prompt_notification(state.protocol_version, &session_id, notif),
@@ -658,6 +680,27 @@ async fn handle_acp_prompt(
                 }
             }
         }
+    }
+    if timed_out {
+        drop(guard);
+        let text = format!(
+            "**Error:** turn timed out after {}s and was terminated",
+            state.config.turn_timeout_secs
+        );
+        if state.protocol_version == ProtocolVersion::V2 {
+            acp::notify_state_idle_for(
+                state.protocol_version,
+                &session_id,
+                Some("max_turn_requests"),
+            );
+            acp::send_response(&id, json!({"messageId": message_id}));
+        } else {
+            acp::send_response(
+                &id,
+                json!({"stopReason": "max_turn_requests", "status": "failed", "text": text}),
+            );
+        }
+        return;
     }
     if cancelled {
         drop(guard);

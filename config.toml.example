@@ -28,5 +28,21 @@ timeout_secs = 300
 # Prevents memory growth in long sessions
 max_history_turns = 50
 
+# Maximum model↔tool round-trips in one prompt turn before the bounded
+# wrap-up path runs (env LLM_MAX_TOOL_ROUNDS)
+# max_tool_rounds = 5
+
+# Per-tool wall-clock timeout in seconds; bash/git/web_fetch processes
+# exceeding it are killed with their process group (env LLM_TOOL_TIMEOUT)
+# tool_timeout_secs = 120
+
+# Whole-turn deadline in seconds; 0 = no limit (env LLM_TURN_TIMEOUT)
+# turn_timeout_secs = 0
+
+# Abort the tool loop after this many consecutive identical tool failures
+# (same tool, same args, error) — catches models stuck re-issuing a
+# failing call (env LLM_TOOL_FAILURE_STREAK)
+# tool_failure_streak = 3
+
 # NOTE: unknown sections/fields are rejected at startup — a config written
 # for a newer build must fail visibly instead of being silently ignored.

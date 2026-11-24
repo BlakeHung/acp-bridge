@@ -15,9 +15,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Maximum number of tool call rounds to prevent infinite loops.
-const MAX_TOOL_ROUNDS: usize = 5;
-
 /// Extract concatenated text from a slice of ACP/A2A content parts.
 ///
 /// Each part is expected to be an object with `"type": "text"` and `"text": "..."`.
@@ -625,9 +622,17 @@ pub async fn session_prompt(
     let mut final_text = String::new();
     let mut last_error_class: Option<crate::llm::LlmErrorKind> = None;
     let tool_defs = tools::tool_definitions();
+    let max_tool_rounds = state.config.max_tool_rounds;
+    let tool_timeout_secs = state.config.tool_timeout_secs;
+    let tool_failure_streak = state.config.tool_failure_streak;
+    // Consecutive identical failures (same tool + args + error). A model
+    // re-issuing a failing call verbatim is looping, not working.
+    let mut fail_key: Option<String> = None;
+    let mut fail_count = 0usize;
+    let mut streak_aborted = false;
 
     // Tool call loop
-    for round in 0..MAX_TOOL_ROUNDS {
+    for round in 0..max_tool_rounds {
         let (messages, working_dir) = {
             let sessions = state.sessions_read();
             match sessions.get(session_id) {
@@ -731,23 +736,70 @@ pub async fn session_prompt(
                         id: tool_call_id.to_string(),
                         name: name.into(),
                     });
-                    let result = tools::execute_tool(&working_dir, name, &args);
+                    let result =
+                        tools::execute_tool(&working_dir, name, &args, tool_timeout_secs).await;
                     notify(Notification::ToolDone {
                         id: tool_call_id.to_string(),
                         name: name.into(),
-                        status: "completed".into(),
+                        status: if result.error_kind.is_none() {
+                            "completed"
+                        } else {
+                            "failed"
+                        }
+                        .into(),
                     });
 
-                    debug!(tool = name, result_len = result.len(), "Tool executed");
+                    debug!(tool = name, result_len = result.text.len(), error_kind = ?result.error_kind, "Tool executed");
+
+                    // Identical-failure streak: a model re-issuing the
+                    // exact same call after an error is in a loop. Stop
+                    // the tool loop early and let the wrap-up produce a
+                    // bounded partial answer instead of burning rounds.
+                    if let Some(kind) = result.error_kind {
+                        let key = format!("{name}|{args}|{kind:?}");
+                        if fail_key.as_deref() == Some(key.as_str()) {
+                            fail_count += 1;
+                        } else {
+                            fail_key = Some(key);
+                            fail_count = 1;
+                        }
+                    } else {
+                        fail_key = None;
+                        fail_count = 0;
+                    }
 
                     {
                         let mut sessions = state.sessions_write();
                         if let Some(session) = sessions.get_mut(session_id) {
                             session
                                 .messages
-                                .push(backend.format_tool_result(tool_call_id, &result));
+                                .push(backend.format_tool_result(tool_call_id, &result.text));
                         }
                     }
+
+                    if fail_count >= tool_failure_streak && tool_failure_streak > 0 {
+                        warn!(
+                            tool = name,
+                            streak = fail_count,
+                            "identical tool failure streak, aborting loop"
+                        );
+                        {
+                            let mut sessions = state.sessions_write();
+                            if let Some(session) = sessions.get_mut(session_id) {
+                                session.messages.push(json!({
+                                    "role": "system",
+                                    "content": format!(
+                                        "[harness] stopped the tool loop: `{name}` failed identically {fail_count} times in a row. Summarize partial progress instead of retrying the same call."
+                                    )
+                                }));
+                            }
+                        }
+                        streak_aborted = true;
+                        break;
+                    }
+                }
+                if streak_aborted {
+                    break;
                 }
             }
             Err(e) => {
@@ -782,15 +834,21 @@ pub async fn session_prompt(
         }
     }
 
-    // The loop can also exit by exhausting MAX_TOOL_ROUNDS while the model
-    // keeps requesting tools. Before reporting failure, give the model one
-    // final call with no tool definitions: it must answer with what it
-    // has. This converts a hard error into a bounded partial answer — the
-    // turn is reported as `partial` (not `completed`) so downstream
-    // automation can distinguish "answered within budget" from "answered
-    // because the budget forced a stop". The wrap-up is not a tool round —
-    // no tools are offered or executed.
+    // The loop can also exit by exhausting the round budget or hitting
+    // the repeated-failure abort while the model keeps requesting tools.
+    // Before reporting failure, give the model one final call with no
+    // tool definitions: it must answer with what it has. This converts a
+    // hard error into a bounded partial answer — the turn is reported as
+    // `partial` (not `completed`) so downstream automation can
+    // distinguish "answered within budget" from "answered because the
+    // budget forced a stop". The wrap-up is not a tool round — no tools
+    // are offered or executed.
     if !had_error && !got_final_response {
+        let limit_note = if streak_aborted {
+            format!("the same tool call failed {tool_failure_streak} times in a row")
+        } else {
+            format!("the {max_tool_rounds}-round tool-call limit was reached")
+        };
         let messages = {
             let sessions = state.sessions_read();
             sessions.get(session_id).map(|s| s.messages.clone())
@@ -802,7 +860,7 @@ pub async fn session_prompt(
                     let (clean_text, _) = llm::recover_tool_calls_from_content(&raw_text);
                     if !clean_text.trim().is_empty() {
                         let text = format!(
-                            "{clean_text}\n\n[note: reached the {MAX_TOOL_ROUNDS}-round tool-call limit — this answer may be incomplete]"
+                            "{clean_text}\n\n[note: {limit_note} — this answer may be incomplete]"
                         );
                         {
                             let mut sessions = state.sessions_write();
@@ -827,11 +885,11 @@ pub async fn session_prompt(
 
     if !had_error && !got_final_response {
         warn!(
-            max_rounds = MAX_TOOL_ROUNDS,
-            "Tool-call loop hit round limit without a final response"
+            max_rounds = max_tool_rounds,
+            streak_aborted, "Tool-call loop hit its budget without a final response"
         );
         let msg = format!(
-            "\n\n**Error:** reached the tool-call limit ({MAX_TOOL_ROUNDS} rounds) without a final answer\n"
+            "\n\n**Error:** reached the tool-call limit ({max_tool_rounds} rounds) without a final answer\n"
         );
         notify(Notification::TextChunk(msg.clone()));
         final_text = msg;
@@ -917,11 +975,20 @@ pub fn estimate_tokens(messages: &[Value]) -> u64 {
 /// no reply would put two user messages in a row on the next prompt,
 /// which chat templates that require alternating roles reject.
 pub fn session_cancelled(state: &AppState, session_id: &str) {
+    session_aborted(state, session_id, "[cancelled by user]");
+}
+
+/// Same history repair for a turn killed by the whole-turn deadline.
+pub fn session_timed_out(state: &AppState, session_id: &str) {
+    session_aborted(state, session_id, "[turn timed out]");
+}
+
+fn session_aborted(state: &AppState, session_id: &str, marker: &str) {
     if let Some(session) = state.sessions_write().get_mut(session_id) {
         if session.messages.last().is_some_and(|m| m["role"] == "user") {
             session
                 .messages
-                .push(json!({"role": "assistant", "content": "[cancelled by user]"}));
+                .push(json!({"role": "assistant", "content": marker}));
         }
     }
 }
@@ -1200,6 +1267,10 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: supports_image,
             context_size: 32768,
+            max_tool_rounds: 5,
+            tool_timeout_secs: 30,
+            turn_timeout_secs: 0,
+            tool_failure_streak: 3,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()

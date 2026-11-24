@@ -1208,6 +1208,72 @@ fn mock_llm_image_inspector_router(inspect: Arc<ImageInspect>) -> Router {
         .route("/api/tags", get(mock_ollama_tags))
 }
 
+/// Mock that always returns a failing `bash` tool call — drives the
+/// identical-failure streak path (G1a: the engine must abort the loop
+/// instead of burning rounds on a repeated failing call).
+fn mock_llm_failing_bash_router() -> Router {
+    Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(|req: Request<Body>| async move {
+                let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                if body["tools"].is_null() {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "Partial: the failing command could not be run."},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                } else {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_fail",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": "{\"command\": \"exit 3\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags))
+}
+
+/// Mock that sleeps before answering — drives the whole-turn deadline
+/// (LLM_TURN_TIMEOUT) path.
+fn mock_llm_slow_router() -> Router {
+    Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                axum::Json(json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "slow reply"},
+                        "finish_reason": "stop"
+                    }]
+                }))
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags))
+}
+
 /// Mock that always returns a `list_dir` tool call and never a final answer,
 /// forcing the engine's tool loop to exhaust MAX_TOOL_ROUNDS.
 fn mock_llm_always_tool_router() -> Router {
@@ -1316,6 +1382,127 @@ async fn test_tool_round_limit_wraps_up_with_partial_answer() {
     assert!(
         text.contains("tool-call limit") && text.contains("incomplete"),
         "expected truncation disclosure, got: {text}"
+    );
+
+    h.shutdown();
+}
+
+/// `LLM_MAX_TOOL_ROUNDS` is the configurable turn budget — a smaller
+/// budget must produce the same bounded wrap-up, just earlier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_max_tool_rounds_env_override() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_tool_until_wrapup_router(),
+        &[
+            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            ("LLM_MAX_TOOL_ROUNDS", "2"),
+        ],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"keep exploring"}]}
+    }));
+    let (_, response) = h.read_until_response(2);
+
+    assert_eq!(response["result"]["status"], "partial");
+    let text = response["result"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("2-round"),
+        "expected the configured 2-round budget in the disclosure, got: {text}"
+    );
+
+    h.shutdown();
+}
+
+/// A model that re-issues the same failing tool call is in a loop, not
+/// working — `LLM_TOOL_FAILURE_STREAK` must abort the tool loop early
+/// and still land on the bounded wrap-up (not a hard failure).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_failure_streak_aborts_loop() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_failing_bash_router(),
+        &[
+            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            ("LLM_TOOL_FAILURE_STREAK", "2"),
+        ],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"run this"}]}
+    }));
+    let (_, response) = h.read_until_response(2);
+
+    // Two identical failures (bash `exit 3`) abort the loop after round 2
+    // — well before the 5-round budget — and the wrap-up still produces
+    // a disclosed partial answer.
+    assert_eq!(response["result"]["status"], "partial");
+    let text = response["result"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("failed 2 times in a row"),
+        "expected the streak disclosure, got: {text}"
+    );
+    assert!(
+        text.contains("Partial: the failing command"),
+        "expected the wrap-up answer, got: {text}"
+    );
+
+    h.shutdown();
+}
+
+/// `LLM_TURN_TIMEOUT` is the whole-turn deadline: a turn whose model call
+/// outlasts it must come back `failed` fast, not hang on the backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_turn_timeout_fails_prompt() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_slow_router(),
+        &[
+            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            ("LLM_TURN_TIMEOUT", "1"),
+        ],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let started = std::time::Instant::now();
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"hi"}]}
+    }));
+    let (_, response) = h.read_until_response(2);
+    let elapsed = started.elapsed();
+
+    assert_eq!(response["result"]["status"], "failed");
+    assert_eq!(response["result"]["stopReason"], "max_turn_requests");
+    let text = response["result"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("timed out"),
+        "expected timeout text, got: {text}"
+    );
+    // The mock sleeps 4s; the 1s deadline must win comfortably.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "turn timeout did not fire promptly: {elapsed:?}"
     );
 
     h.shutdown();
@@ -1506,10 +1693,13 @@ async fn test_tool_sandbox_prevents_escape() {
         Path::new("/tmp"),
         "read_file",
         &json!({"path": "../../etc/passwd"}),
-    );
+        30,
+    )
+    .await;
     assert!(
-        result.contains("Error") || result.contains("outside"),
-        "Should reject path traversal, got: {result}"
+        result.text.contains("Error") || result.text.contains("outside"),
+        "Should reject path traversal, got: {}",
+        result.text
     );
 }
 
@@ -1522,8 +1712,8 @@ async fn test_tool_read_file() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("test.txt"), "hello from test file").unwrap();
 
-    let result = tools::execute_tool(&dir, "read_file", &json!({"path": "test.txt"}));
-    assert_eq!(result, "hello from test file");
+    let result = tools::execute_tool(&dir, "read_file", &json!({"path": "test.txt"}), 30).await;
+    assert_eq!(result.text, "hello from test file");
 
     // Cleanup
     std::fs::remove_dir_all(&dir).ok();
@@ -1541,10 +1731,11 @@ async fn test_tool_search_code() {
     )
     .unwrap();
 
-    let result = tools::execute_tool(&dir, "search_code", &json!({"pattern": "println"}));
+    let result = tools::execute_tool(&dir, "search_code", &json!({"pattern": "println"}), 30).await;
     assert!(
-        result.contains("main.rs") && result.contains("println"),
-        "Should find pattern in file, got: {result}"
+        result.text.contains("main.rs") && result.text.contains("println"),
+        "Should find pattern in file, got: {}",
+        result.text
     );
 
     // Cleanup
@@ -1556,8 +1747,8 @@ async fn test_tool_unknown() {
     use acp_bridge::tools;
     use std::path::Path;
 
-    let result = tools::execute_tool(Path::new("/tmp"), "hack_the_planet", &json!({}));
-    assert!(result.contains("Unknown tool"));
+    let result = tools::execute_tool(Path::new("/tmp"), "hack_the_planet", &json!({}), 30).await;
+    assert!(result.text.contains("Unknown tool"));
 }
 
 // ----------------------------------------------------------------------------

@@ -602,6 +602,27 @@ pub struct LlmConfig {
     /// still display the percentage used.
     /// Override via `LLM_MODEL_CONTEXT` env var; defaults to 32768.
     pub context_size: u64,
+    /// Maximum model/tool round-trips in one prompt turn before the
+    /// wrap-up path runs. Override via `LLM_MAX_TOOL_ROUNDS` (default 5).
+    /// Widening this without the other budget controls (per-tool
+    /// timeout, turn deadline, repeated-failure abort) is exactly what
+    /// the plan warns against — it is configurable for deployments that
+    /// measured the need, not a recommendation.
+    pub max_tool_rounds: usize,
+    /// Per-tool wall-clock timeout in seconds. A subprocess tool (bash,
+    /// git, web_fetch) that exceeds it is killed, including its process
+    /// group. Override via `LLM_TOOL_TIMEOUT` (default 120).
+    pub tool_timeout_secs: u64,
+    /// Whole-turn deadline in seconds (0 = no limit). The turn ends
+    /// `failed` when it expires; subprocesses are killed via the same
+    /// process-group path. Override via `LLM_TURN_TIMEOUT`.
+    pub turn_timeout_secs: u64,
+    /// Abort the tool loop after this many consecutive identical tool
+    /// failures (same tool + same arguments + error). A model that
+    /// re-issues a failing call verbatim is in a loop, not working —
+    /// bail early instead of burning the round budget. Override via
+    /// `LLM_TOOL_FAILURE_STREAK` (default 3).
+    pub tool_failure_streak: usize,
     /// Shared HTTP client for connection pooling.
     pub client: Client,
 }
@@ -672,6 +693,10 @@ impl LlmConfig {
             session_idle_timeout_secs: env_parse("LLM_SESSION_IDLE_TIMEOUT")?.unwrap_or(0),
             prompt_supports_image: env_parse_bool("LLM_SUPPORTS_IMAGE")?.unwrap_or(false),
             context_size: env_parse("LLM_MODEL_CONTEXT")?.unwrap_or(32768),
+            max_tool_rounds: env_parse("LLM_MAX_TOOL_ROUNDS")?.unwrap_or(5),
+            tool_timeout_secs: env_parse("LLM_TOOL_TIMEOUT")?.unwrap_or(120),
+            turn_timeout_secs: env_parse("LLM_TURN_TIMEOUT")?.unwrap_or(0),
+            tool_failure_streak: env_parse("LLM_TOOL_FAILURE_STREAK")?.unwrap_or(3),
             client,
         })
     }
@@ -1236,6 +1261,10 @@ mod tests {
             session_idle_timeout_secs: 0,
             prompt_supports_image: false,
             context_size: 32768,
+            max_tool_rounds: 5,
+            tool_timeout_secs: 30,
+            turn_timeout_secs: 0,
+            tool_failure_streak: 3,
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()

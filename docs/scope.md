@@ -48,7 +48,7 @@ spec-shaped v2 payloads.
 | `initialize` | ✅ | Negotiates v1/v2; emits the corresponding `agentCapabilities` + `agentInfo` shape (v1) or `capabilities` + `info` shape (v2) |
 | `session/new` | ✅ | Multi-session with per-session conversation history. `mcpServers` accepted but ignored (acp-bridge does not relay MCP) |
 | `session/prompt` | ✅ | Progress via `session/update` notifications (thinking, tool calls, answer chunks). v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` |
-| `session/cancel` notification | ✅ | Aborts active LLM requests and reports cancellation on both wire versions. Synchronous tools finish before cancellation takes effect |
+| `session/cancel` notification | ✅ | Aborts active LLM requests and reports cancellation on both wire versions. Subprocess tools (bash/git) are killed with their process group on drop; synchronous file tools finish before cancellation takes effect |
 | `session/end` (v1) / `session/close` (v2 baseline) | ✅ | Removes the session and frees its history. Both methods share the same implementation |
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |
 | `session/new` cwd | ✅ | `cwd` is canonicalized and must name an existing directory; anything else is rejected with `-32602` (`data.reason` carries the validation failure). The working directory is never silently rewritten |
@@ -71,14 +71,24 @@ spec-shaped v2 payloads.
 | `read_file` | Read a file (sandboxed, max 1 MB) |
 | `list_dir` | List directory contents (max 4 levels, max 200 entries) |
 | `search_code` | Grep for a literal string in files under the working dir (max 50 matches). Symlinks are skipped; depth is bounded |
-| `write_file` | Create or overwrite a file (max 5 MB). Sandbox rejects `..` escapes |
+| `write_file` | Create or overwrite a file (max 5 MB). Sandbox rejects `..` escapes, symlinked parents escaping the working dir, and symlink targets outside it |
 | `edit` | Replace a unique substring in a file. Fails on missing / ambiguous / empty matches |
-| `web_fetch` | HTTP/HTTPS GET with HTML reduction. **Off by default** — requires `LLM_WEB_ALLOWLIST`. Redirects are limited to 5 hops and re-validated against the allowlist on every hop |
-| `bash` | Run a bash command. Note: no OS-level sandbox, no timeout enforcement (see "Things acp-bridge is not") |
+| `web_fetch` | HTTP/HTTPS GET with HTML reduction. **Off by default** — requires `LLM_WEB_ALLOWLIST`. Redirects are limited to 5 hops and re-validated against the allowlist on every hop. Body capped at 5 MB enforced *while downloading* (oversized bodies stop feeding memory and return a truncated note) |
+| `bash` | Run a bash command with a real wall-clock timeout and process-group kill (`LLM_TOOL_TIMEOUT`, default 120 s). Cancellation kills the process group. Note: no OS-level sandbox (see "Things acp-bridge is not") |
 | `git_status` | Compact `git status --short --branch` |
 | `git_diff` | Unified diff, optional `path` filter, optional `staged: true` (`--cached`) |
 | `git_log` | One-line-per-commit log, `max_count` clamped to 1–200 |
 | `git_commit` | Stage listed paths (or `git add -u`) and commit with the supplied message |
+
+### Execution budgets
+
+| Budget | Env var | Default | Behavior |
+|---|---|---|---|
+| Tool rounds per turn | `LLM_MAX_TOOL_ROUNDS` | 5 | Exhausted → one wrap-up call (no tools) → `partial` status with `stopReason: max_turn_requests`, or `failed` if no usable answer |
+| Per-tool wall time | `LLM_TOOL_TIMEOUT` | 120 s | bash/git/web_fetch killed (process group) on expiry; file tools are bounded and synchronous |
+| Whole-turn deadline | `LLM_TURN_TIMEOUT` | 0 (off) | Turn aborted as `failed`; async tools killed via the same process-group path |
+| Identical-failure streak | `LLM_TOOL_FAILURE_STREAK` | 3 | Same tool+args erroring N times consecutively aborts the loop into the same bounded wrap-up |
+| Tool output cap | — | 50 KB | UTF-8-safe truncation with a `[note]` marker; the result carries a `truncated` flag |
 
 ## Supported with caveats
 

@@ -47,6 +47,19 @@ pub struct LlmSection {
     /// `usage_update` notifications.
     #[serde(default)]
     pub model_context: Option<u64>,
+    /// Max model/tool round-trips per turn. Mirrors `LLM_MAX_TOOL_ROUNDS`.
+    #[serde(default)]
+    pub max_tool_rounds: Option<usize>,
+    /// Per-tool wall-clock timeout in seconds. Mirrors `LLM_TOOL_TIMEOUT`.
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+    /// Whole-turn deadline in seconds (0 = off). Mirrors `LLM_TURN_TIMEOUT`.
+    #[serde(default)]
+    pub turn_timeout_secs: Option<u64>,
+    /// Abort after N consecutive identical tool failures. Mirrors
+    /// `LLM_TOOL_FAILURE_STREAK`.
+    #[serde(default)]
+    pub tool_failure_streak: Option<usize>,
 }
 
 impl ConfigFile {
@@ -130,6 +143,22 @@ impl ConfigFile {
             .or(file.model_context)
             .unwrap_or(32768);
 
+        let max_tool_rounds = env_parse("LLM_MAX_TOOL_ROUNDS")?
+            .or(file.max_tool_rounds)
+            .unwrap_or(5);
+
+        let tool_timeout_secs = env_parse("LLM_TOOL_TIMEOUT")?
+            .or(file.tool_timeout_secs)
+            .unwrap_or(120);
+
+        let turn_timeout_secs = env_parse("LLM_TURN_TIMEOUT")?
+            .or(file.turn_timeout_secs)
+            .unwrap_or(0);
+
+        let tool_failure_streak = env_parse("LLM_TOOL_FAILURE_STREAK")?
+            .or(file.tool_failure_streak)
+            .unwrap_or(3);
+
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(4)
@@ -149,6 +178,10 @@ impl ConfigFile {
             session_idle_timeout_secs,
             prompt_supports_image,
             context_size,
+            max_tool_rounds,
+            tool_timeout_secs,
+            turn_timeout_secs,
+            tool_failure_streak,
             client,
         })
     }

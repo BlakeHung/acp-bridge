@@ -3,7 +3,6 @@
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tracing::{debug, warn};
 
 /// Maximum file size to read (1 MB).
@@ -12,6 +11,99 @@ const MAX_FILE_SIZE: u64 = 1024 * 1024;
 const MAX_LIST_DEPTH: usize = 3;
 /// Maximum entries in directory listing.
 const MAX_LIST_ENTRIES: usize = 200;
+/// Maximum chars of combined tool output returned to the model.
+const MAX_TOOL_OUTPUT_CHARS: usize = 50_000;
+
+/// Error classification for a tool result. The `text` field on
+/// [`ToolResult`] stays model-facing prose; `kind` is for the engine —
+/// budgeting, streak detection, policy decisions — without parsing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolErrorKind {
+    /// Missing or malformed arguments.
+    InvalidArgs,
+    /// Path resolves outside the working directory (or via a symlink).
+    OutOfSandbox,
+    /// Target does not exist / has the wrong type.
+    NotFound,
+    /// Input or output exceeded a configured limit.
+    TooLarge,
+    /// Policy or allowlist denied the operation.
+    Denied,
+    /// The operation exceeded its time budget and was terminated.
+    Timeout,
+    /// The command ran and exited non-zero / the OS call failed.
+    ExecFailed,
+    /// Network or remote-side failure (HTTP error, connect error).
+    Network,
+    /// Tool name is not registered.
+    UnknownTool,
+}
+
+/// Structured tool result (P1/E10 first slice). `text` remains the
+/// model-facing content stored in history; the structured fields let the
+/// engine reason about failures without string matching.
+pub struct ToolResult {
+    /// Model-facing result text (error text included when `error_kind`
+    /// is `Some`).
+    pub text: String,
+    /// Process exit code when the tool ran a subprocess.
+    pub exit_code: Option<i32>,
+    /// Structured error classification; `None` on success.
+    pub error_kind: Option<ToolErrorKind>,
+    /// `text` was cut to the output cap — the model sees a marker and can
+    /// ask for a narrower read instead of silently missing the tail.
+    pub truncated: bool,
+}
+
+impl ToolResult {
+    fn ok(text: String) -> Self {
+        Self {
+            text,
+            exit_code: None,
+            error_kind: None,
+            truncated: false,
+        }
+    }
+
+    fn err(kind: ToolErrorKind, text: String) -> Self {
+        Self {
+            text,
+            exit_code: None,
+            error_kind: Some(kind),
+            truncated: false,
+        }
+    }
+}
+
+impl From<ToolResult> for String {
+    fn from(r: ToolResult) -> String {
+        r.text
+    }
+}
+
+/// Truncate a string to at most `max` bytes without splitting a UTF-8
+/// code point. `String::truncate` panics when the cut lands mid-char —
+/// tool output in CJK hits that panic path.
+fn truncate_utf8(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
+/// Truncate tool output to the shared cap, UTF-8-safe, and flag it.
+fn cap_output(s: &mut String) -> bool {
+    if s.len() <= MAX_TOOL_OUTPUT_CHARS {
+        return false;
+    }
+    truncate_utf8(s, MAX_TOOL_OUTPUT_CHARS);
+    s.push_str("\n... (truncated)");
+    true
+}
 
 fn is_ignored_entry(name: &str) -> bool {
     name.starts_with('.') || matches!(name, "node_modules" | "target" | "__pycache__")
@@ -264,8 +356,18 @@ fn resolve_sandboxed_path(working_dir: &Path, relative_path: &str) -> Option<Pat
     }
 }
 
-/// Execute a tool call and return the result as a string.
-pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String {
+/// Execute a tool call and return a structured [`ToolResult`].
+///
+/// Subprocess tools (bash, git_*, web_fetch) are async and time-boxed;
+/// file tools stay synchronous because they are bounded and fast.
+/// `timeout_secs` applies per tool invocation and comes from the
+/// `LLM_TOOL_TIMEOUT` config.
+pub async fn execute_tool(
+    working_dir: &Path,
+    name: &str,
+    arguments: &Value,
+    timeout_secs: u64,
+) -> ToolResult {
     match name {
         "read_file" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -291,7 +393,7 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            execute_bash(working_dir, command)
+            execute_bash(working_dir, command, timeout_secs).await
         }
         "write_file" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -315,9 +417,16 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
         }
         "web_fetch" => {
             let url = arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            execute_web_fetch(url)
+            execute_web_fetch(url, timeout_secs).await
         }
-        "git_status" => execute_git(working_dir, &["status", "--short", "--branch"]),
+        "git_status" => {
+            execute_git(
+                working_dir,
+                &["status", "--short", "--branch"],
+                timeout_secs,
+            )
+            .await
+        }
         "git_diff" => {
             let path = arguments.get("path").and_then(|v| v.as_str());
             let staged = arguments
@@ -335,7 +444,7 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
                 path_owned = p.to_string();
                 let _ = path_owned; // suppress unused warning if branch not taken
             }
-            execute_git(working_dir, &args)
+            execute_git(working_dir, &args, timeout_secs).await
         }
         "git_log" => {
             let max_count = arguments
@@ -356,7 +465,7 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
                 args.push(p.into());
             }
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            execute_git(working_dir, &arg_refs)
+            execute_git(working_dir, &arg_refs, timeout_secs).await
         }
         "git_commit" => {
             let message = arguments
@@ -384,68 +493,97 @@ pub fn execute_tool(working_dir: &Path, name: &str, arguments: &Value) -> String
             };
             // `git add` first; surface its output before the commit so the
             // model sees if staging failed.
-            let staged = execute_git(working_dir, &add_args);
-            if !staged.is_empty() && !staged.starts_with("(no output)") {
-                output.push_str(&staged);
+            let staged = execute_git(working_dir, &add_args, timeout_secs).await;
+            if !staged.text.is_empty() && !staged.text.starts_with("(no output)") {
+                output.push_str(&staged.text);
             }
 
             if message.is_empty() {
                 output.push_str("Error: commit message is empty\n");
-                return output;
+                return ToolResult::err(ToolErrorKind::InvalidArgs, output);
             }
 
-            let commit = execute_git(working_dir, &["commit", "-m", message]);
-            output.push_str(&commit);
-            output
+            let commit = execute_git(working_dir, &["commit", "-m", message], timeout_secs).await;
+            output.push_str(&commit.text);
+            let mut result = ToolResult::ok(output);
+            result.error_kind = commit.error_kind;
+            result.truncated = staged.truncated || commit.truncated;
+            result
         }
-        _ => format!("Unknown tool: {name}"),
+        _ => ToolResult::err(ToolErrorKind::UnknownTool, format!("Unknown tool: {name}")),
     }
 }
 
-fn execute_read_file(working_dir: &Path, relative_path: &str) -> String {
+fn execute_read_file(working_dir: &Path, relative_path: &str) -> ToolResult {
     let Some(path) = resolve_sandboxed_path(working_dir, relative_path) else {
-        return format!(
-            "Error: path '{}' is outside the working directory or does not exist",
-            relative_path
+        return ToolResult::err(
+            ToolErrorKind::OutOfSandbox,
+            format!(
+                "Error: path '{}' is outside the working directory or does not exist",
+                relative_path
+            ),
         );
     };
 
     if !path.is_file() {
-        return format!("Error: '{}' is not a file", relative_path);
+        return ToolResult::err(
+            ToolErrorKind::NotFound,
+            format!("Error: '{}' is not a file", relative_path),
+        );
     }
 
     // Check file size
     match std::fs::metadata(&path) {
         Ok(meta) if meta.len() > MAX_FILE_SIZE => {
-            return format!(
-                "Error: file is too large ({} bytes, max {} bytes)",
-                meta.len(),
-                MAX_FILE_SIZE
+            return ToolResult::err(
+                ToolErrorKind::TooLarge,
+                format!(
+                    "Error: file is too large ({} bytes, max {} bytes)",
+                    meta.len(),
+                    MAX_FILE_SIZE
+                ),
             );
         }
-        Err(e) => return format!("Error reading file metadata: {e}"),
+        Err(e) => {
+            return ToolResult::err(
+                ToolErrorKind::ExecFailed,
+                format!("Error reading file metadata: {e}"),
+            )
+        }
         _ => {}
     }
 
     match std::fs::read_to_string(&path) {
-        Ok(content) => {
+        Ok(mut content) => {
             debug!(path = %relative_path, bytes = content.len(), "read_file");
-            content
+            let truncated = cap_output(&mut content);
+            let mut r = ToolResult::ok(content);
+            r.truncated = truncated;
+            r
         }
-        Err(e) => format!("Error reading file: {e}"),
+        Err(e) => ToolResult::err(
+            ToolErrorKind::ExecFailed,
+            format!("Error reading file: {e}"),
+        ),
     }
 }
 
-fn execute_list_dir(working_dir: &Path, relative_path: &str) -> String {
+fn execute_list_dir(working_dir: &Path, relative_path: &str) -> ToolResult {
     let Some(path) = resolve_sandboxed_path(working_dir, relative_path) else {
-        return format!(
-            "Error: path '{}' is outside the working directory or does not exist",
-            relative_path
+        return ToolResult::err(
+            ToolErrorKind::OutOfSandbox,
+            format!(
+                "Error: path '{}' is outside the working directory or does not exist",
+                relative_path
+            ),
         );
     };
 
     if !path.is_dir() {
-        return format!("Error: '{}' is not a directory", relative_path);
+        return ToolResult::err(
+            ToolErrorKind::NotFound,
+            format!("Error: '{}' is not a directory", relative_path),
+        );
     }
 
     let mut output = String::new();
@@ -459,7 +597,9 @@ fn execute_list_dir(working_dir: &Path, relative_path: &str) -> String {
     }
 
     debug!(path = %relative_path, entries = count, "list_dir");
-    output
+    let mut r = ToolResult::ok(output);
+    r.truncated = count >= MAX_LIST_ENTRIES;
+    r
 }
 
 fn list_dir_recursive(
@@ -520,9 +660,12 @@ fn list_dir_recursive(
     }
 }
 
-fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str>) -> String {
+fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str>) -> ToolResult {
     if pattern.is_empty() {
-        return "Error: search pattern is empty".to_string();
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            "Error: search pattern is empty".to_string(),
+        );
     }
 
     let mut results = String::new();
@@ -541,7 +684,7 @@ fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str
     );
 
     if match_count == 0 {
-        return format!("No matches found for '{pattern}'");
+        return ToolResult::ok(format!("No matches found for '{pattern}'"));
     }
 
     if match_count >= MAX_MATCHES {
@@ -549,7 +692,9 @@ fn execute_search_code(working_dir: &Path, pattern: &str, file_glob: Option<&str
     }
 
     debug!(pattern, matches = match_count, "search_code");
-    results
+    let mut r = ToolResult::ok(results);
+    r.truncated = match_count >= MAX_MATCHES;
+    r
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -667,21 +812,70 @@ fn search_dir(
     }
 }
 
-/// Execute a bash command in the working directory with a timeout.
-fn execute_bash(working_dir: &Path, command: &str) -> String {
-    if command.is_empty() {
-        return "Error: command is empty".to_string();
+/// Kills the child process's process group on drop (Unix). `bash -c`
+/// commands commonly spawn grandchildren (pipes, command substitution);
+/// SIGKILLing only the direct child would orphan them. The guard fires on
+/// timeout, on success, and when the surrounding future is dropped by a
+/// session cancel — which is what makes `session/cancel` actually stop
+/// work instead of waiting for the sync call to return.
+struct ProcessGroupGuard {
+    pgid: Option<u32>,
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            // `kill -KILL -<pgid>` targets the whole group; the child is
+            // its own group leader via process_group(0), so pgid == pid.
+            // Synchronous spawn is fine — `kill` execs and exits
+            // immediately; we intentionally don't wait for it.
+            let _ = std::process::Command::new("kill")
+                .args(["-s", "KILL", &format!("-{pgid}")])
+                .spawn();
+        }
     }
+}
 
-    debug!(command, "bash");
-
-    match Command::new("bash")
-        .arg("-c")
-        .arg(command)
+/// Spawn a subprocess, capture stdout/stderr with a timeout, and kill the
+/// process group when the future completes, times out, or is dropped
+/// (session cancel). Nothing spawned by a tool call survives the call —
+/// a `sleep &` background job would otherwise hold the output pipes open
+/// and hang `wait_with_output` until timeout. Returns
+/// (exit_code, combined_output, timed_out).
+async fn run_process(
+    program: &str,
+    args: &[&str],
+    working_dir: &Path,
+    timeout_secs: u64,
+) -> Result<(Option<i32>, String, bool), std::io::Error> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .current_dir(working_dir)
-        .output()
-    {
-        Ok(output) => {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd.spawn()?;
+    let _guard = ProcessGroupGuard {
+        #[cfg(unix)]
+        pgid: child.id(),
+        #[cfg(not(unix))]
+        pgid: None,
+    };
+
+    // Clamp to a 1s floor: timeout(0s) would expire before the child
+    // could run at all, which reads as a spawn failure rather than a
+    // configured zero-second budget.
+    let wait = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs.max(1)),
+        child.wait_with_output(),
+    )
+    .await;
+
+    match wait {
+        Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let mut result = String::new();
@@ -695,57 +889,156 @@ fn execute_bash(working_dir: &Path, command: &str) -> String {
                 result.push_str("[stderr] ");
                 result.push_str(&stderr);
             }
-            if result.is_empty() {
-                "(no output)".to_string()
-            } else {
-                // Truncate very long output
-                if result.len() > 50_000 {
-                    result.truncate(50_000);
-                    result.push_str("\n... (truncated)");
-                }
-                result
-            }
+            Ok((output.status.code(), result, false))
         }
-        Err(e) => format!("Error executing command: {e}"),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            // Dropping wait_with_output drops the Child → kill_on_drop
+            // SIGKILLs the leader; the guard then SIGKILLs the group for
+            // grandchildren. Both already happened by the time we return.
+            Ok((None, String::new(), true))
+        }
+    }
+}
+
+/// Execute a bash command in the working directory with a real timeout
+/// and cancellation support (P1/E11 first slice).
+async fn execute_bash(working_dir: &Path, command: &str, timeout_secs: u64) -> ToolResult {
+    if command.is_empty() {
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            "Error: command is empty".to_string(),
+        );
+    }
+
+    debug!(command, "bash");
+
+    match run_process("bash", &["-c", command], working_dir, timeout_secs).await {
+        Ok((exit_code, mut output, timed_out)) => {
+            if timed_out {
+                return ToolResult::err(
+                    ToolErrorKind::Timeout,
+                    format!("Error: command timed out after {timeout_secs}s and was terminated"),
+                );
+            }
+            if output.is_empty() {
+                output = "(no output)".to_string();
+            }
+            let truncated = cap_output(&mut output);
+            let mut r = ToolResult {
+                text: output,
+                exit_code,
+                error_kind: if exit_code.is_some_and(|c| c != 0) {
+                    Some(ToolErrorKind::ExecFailed)
+                } else {
+                    None
+                },
+                truncated,
+            };
+            // Non-zero exit is still a valid tool result (the model reads
+            // the failure text); keep it but surface the classification.
+            if r.error_kind.is_some() && !r.text.starts_with("Error") {
+                r.text = format!("(exit {})\n{}", exit_code.unwrap_or_default(), r.text);
+            }
+            r
+        }
+        Err(e) => ToolResult::err(
+            ToolErrorKind::ExecFailed,
+            format!("Error executing command: {e}"),
+        ),
     }
 }
 
 /// Maximum size of a file that `write_file` / `edit` will accept.
 const MAX_WRITE_FILE_SIZE: u64 = 5 * 1024 * 1024;
 
-fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) -> String {
+fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) -> ToolResult {
     if relative_path.is_empty() {
-        return "Error: path is empty".to_string();
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            "Error: path is empty".to_string(),
+        );
     }
     if content.len() as u64 > MAX_WRITE_FILE_SIZE {
-        return format!(
-            "Error: content too large ({} bytes, max {} bytes)",
-            content.len(),
-            MAX_WRITE_FILE_SIZE
+        return ToolResult::err(
+            ToolErrorKind::TooLarge,
+            format!(
+                "Error: content too large ({} bytes, max {} bytes)",
+                content.len(),
+                MAX_WRITE_FILE_SIZE
+            ),
         );
     }
 
-    // Resolve relative path against working_dir. Note: unlike read/list,
-    // write_file does NOT require the file to exist — it must be allowed
-    // to create new files. We still reject absolute paths and `..`
-    // traversal by canonicalizing the parent directory after the write
-    // would-be target.
     let cleaned = relative_path.trim_start_matches('/');
     let target = working_dir.join(cleaned);
 
     // Reject obvious `..` escapes: if any path component is `..`, refuse.
     for component in Path::new(cleaned).components() {
         if matches!(component, std::path::Component::ParentDir) {
-            return format!(
-                "Error: path '{}' escapes the working directory",
-                relative_path
+            return ToolResult::err(
+                ToolErrorKind::OutOfSandbox,
+                format!(
+                    "Error: path '{}' escapes the working directory",
+                    relative_path
+                ),
             );
         }
     }
 
+    let canonical_wd = match working_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return ToolResult::err(
+                ToolErrorKind::ExecFailed,
+                format!("Error resolving working directory: {e}"),
+            )
+        }
+    };
+
     if let Some(parent) = target.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return format!("Error creating parent directory: {e}");
+            return ToolResult::err(
+                ToolErrorKind::ExecFailed,
+                format!("Error creating parent directory: {e}"),
+            );
+        }
+        // The `..` component check cannot see through symlinks: a
+        // parent component that is itself a symlink to an outside
+        // directory would let write_file escape the sandbox (G1a-FS1).
+        // Canonicalize the now-existing parent and verify it stays
+        // inside the working directory before writing.
+        match parent.canonicalize() {
+            Ok(canon_parent) if canon_parent.starts_with(&canonical_wd) => {}
+            _ => {
+                return ToolResult::err(
+                    ToolErrorKind::OutOfSandbox,
+                    format!(
+                        "Error: path '{}' escapes the working directory via a symlinked parent",
+                        relative_path
+                    ),
+                );
+            }
+        }
+    }
+
+    // An existing target that is itself a symlink must not be followed —
+    // writing through it would modify a file outside the sandbox even
+    // when the parent is fine.
+    if let Ok(meta) = target.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            match target.canonicalize() {
+                Ok(canon_target) if canon_target.starts_with(&canonical_wd) => {}
+                _ => {
+                    return ToolResult::err(
+                        ToolErrorKind::OutOfSandbox,
+                        format!(
+                            "Error: path '{}' is a symlink outside the working directory",
+                            relative_path
+                        ),
+                    );
+                }
+            }
         }
     }
 
@@ -756,9 +1049,16 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
                 bytes = content.len(),
                 "write_file"
             );
-            format!("wrote {} bytes to {}", content.len(), relative_path)
+            ToolResult::ok(format!(
+                "wrote {} bytes to {}",
+                content.len(),
+                relative_path
+            ))
         }
-        Err(e) => format!("Error writing file: {e}"),
+        Err(e) => ToolResult::err(
+            ToolErrorKind::ExecFailed,
+            format!("Error writing file: {e}"),
+        ),
     }
 }
 
@@ -766,47 +1066,78 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
 /// file at `relative_path`. Fails clearly if `old_text` is missing or
 /// appears more than once — the model should re-read the file and try
 /// again rather than guess.
-fn execute_edit(working_dir: &Path, relative_path: &str, old_text: &str, new_text: &str) -> String {
+fn execute_edit(
+    working_dir: &Path,
+    relative_path: &str,
+    old_text: &str,
+    new_text: &str,
+) -> ToolResult {
     if relative_path.is_empty() {
-        return "Error: path is empty".to_string();
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            "Error: path is empty".to_string(),
+        );
     }
     if old_text.is_empty() {
-        return "Error: old_text is empty; refusing to do an open-ended replace".to_string();
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            "Error: old_text is empty; refusing to do an open-ended replace".to_string(),
+        );
     }
 
     // Use the same sandbox resolver as read_file so we cannot escape.
     let Some(path) = resolve_sandboxed_path(working_dir, relative_path) else {
-        return format!(
-            "Error: path '{}' is outside the working directory or does not exist",
-            relative_path
+        return ToolResult::err(
+            ToolErrorKind::OutOfSandbox,
+            format!(
+                "Error: path '{}' is outside the working directory or does not exist",
+                relative_path
+            ),
         );
     };
     if !path.is_file() {
-        return format!("Error: '{}' is not a file", relative_path);
+        return ToolResult::err(
+            ToolErrorKind::NotFound,
+            format!("Error: '{}' is not a file", relative_path),
+        );
     }
 
     let original = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) => return format!("Error reading file: {e}"),
+        Err(e) => {
+            return ToolResult::err(
+                ToolErrorKind::ExecFailed,
+                format!("Error reading file: {e}"),
+            )
+        }
     };
 
     let occurrences = original.matches(old_text).count();
     if occurrences == 0 {
-        return format!(
-            "Error: old_text not found in {}. Re-read the file and provide the exact current text.",
-            relative_path
+        return ToolResult::err(
+            ToolErrorKind::NotFound,
+            format!(
+                "Error: old_text not found in {}. Re-read the file and provide the exact current text.",
+                relative_path
+            ),
         );
     }
     if occurrences > 1 {
-        return format!(
-            "Error: old_text appears {} times in {}. Provide a more specific (longer) old_text that matches exactly once.",
-            occurrences, relative_path
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            format!(
+                "Error: old_text appears {} times in {}. Provide a more specific (longer) old_text that matches exactly once.",
+                occurrences, relative_path
+            ),
         );
     }
 
     let patched = original.replacen(old_text, new_text, 1);
     if let Err(e) = std::fs::write(&path, &patched) {
-        return format!("Error writing file: {e}");
+        return ToolResult::err(
+            ToolErrorKind::ExecFailed,
+            format!("Error writing file: {e}"),
+        );
     }
     debug!(
         path = %relative_path,
@@ -814,12 +1145,12 @@ fn execute_edit(working_dir: &Path, relative_path: &str, old_text: &str, new_tex
         after = patched.len(),
         "edit"
     );
-    format!(
+    ToolResult::ok(format!(
         "patched {} ({} bytes -> {} bytes)",
         relative_path,
         original.len(),
         patched.len()
-    )
+    ))
 }
 
 // ----------------------------------------------------------------------------
@@ -851,23 +1182,40 @@ fn web_fetch_allowed_hosts() -> Vec<String> {
 /// reduction (script/style stripped, tags removed, whitespace
 /// collapsed) so the model sees readable content; everything else is
 /// passed through (text/plain, application/json, …).
-fn execute_web_fetch(url: &str) -> String {
+///
+/// The body is read in chunks with a hard cap enforced *during* the
+/// download — a slow or oversized response stops feeding memory at
+/// [`MAX_WEB_BODY_BYTES`], keeps the bounded prefix, and flags
+/// `truncated` so the model knows it saw a partial document.
+async fn execute_web_fetch(url: &str, timeout_secs: u64) -> ToolResult {
     if url.is_empty() {
-        return "Error: url is empty".to_string();
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            "Error: url is empty".to_string(),
+        );
     }
     let Ok(parsed) = url::Url::parse(url) else {
-        return format!("Error: '{url}' is not a valid URL");
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            format!("Error: '{url}' is not a valid URL"),
+        );
     };
     if !matches!(parsed.scheme(), "http" | "https") {
-        return format!(
-            "Error: scheme '{}' is not allowed (only http and https)",
-            parsed.scheme()
+        return ToolResult::err(
+            ToolErrorKind::InvalidArgs,
+            format!(
+                "Error: scheme '{}' is not allowed (only http and https)",
+                parsed.scheme()
+            ),
         );
     }
 
     let allow = web_fetch_allowed_hosts();
     if allow.is_empty() {
-        return "Error: web_fetch is disabled (LLM_WEB_ALLOWLIST is empty)".to_string();
+        return ToolResult::err(
+            ToolErrorKind::Denied,
+            "Error: web_fetch is disabled (LLM_WEB_ALLOWLIST is empty)".to_string(),
+        );
     }
     let host = parsed
         .host_str()
@@ -877,15 +1225,19 @@ fn execute_web_fetch(url: &str) -> String {
         .iter()
         .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
     {
-        return format!(
-            "Error: host '{host}' is not in LLM_WEB_ALLOWLIST ({})",
-            allow.join(", ")
+        return ToolResult::err(
+            ToolErrorKind::Denied,
+            format!(
+                "Error: host '{host}' is not in LLM_WEB_ALLOWLIST ({})",
+                allow.join(", ")
+            ),
         );
     }
 
     let allow_for_redirect_check = allow.clone();
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(WEB_FETCH_TIMEOUT_SECS))
+    let timeout = timeout_secs.max(1).min(WEB_FETCH_TIMEOUT_SECS.max(1));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout))
         .user_agent(concat!("acp-bridge/", env!("CARGO_PKG_VERSION")))
         // Limit redirects to a small number and re-validate the host
         // on every hop. Without this, a server on an allowlisted
@@ -916,12 +1268,24 @@ fn execute_web_fetch(url: &str) -> String {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return format!("Error building HTTP client: {e}"),
+        Err(e) => {
+            return ToolResult::err(
+                ToolErrorKind::Network,
+                format!("Error building HTTP client: {e}"),
+            )
+        }
     };
 
-    let resp = match client.get(parsed).send() {
+    let mut resp = match client.get(parsed).send().await {
         Ok(r) => r,
-        Err(e) => return format!("Error fetching URL: {e}"),
+        Err(e) => {
+            let kind = if e.is_timeout() {
+                ToolErrorKind::Timeout
+            } else {
+                ToolErrorKind::Network
+            };
+            return ToolResult::err(kind, format!("Error fetching URL: {e}"));
+        }
     };
 
     let status = resp.status();
@@ -932,25 +1296,45 @@ fn execute_web_fetch(url: &str) -> String {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // Read body with a hard cap so a malicious server can't OOM us.
-    let bytes = match resp.bytes() {
-        Ok(b) if b.len() > MAX_WEB_BODY_BYTES => {
-            return format!(
-                "Error: response body too large ({} bytes, max {} bytes)",
-                b.len(),
-                MAX_WEB_BODY_BYTES
-            );
+    // Read the body chunk by chunk with the cap enforced while
+    // downloading — not after the fact. A server streaming an endless
+    // body cannot grow memory beyond MAX_WEB_BODY_BYTES.
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut body_truncated = false;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_WEB_BODY_BYTES.saturating_sub(bytes.len());
+                if room == 0 {
+                    body_truncated = true;
+                    break;
+                }
+                if chunk.len() > room {
+                    bytes.extend_from_slice(&chunk[..room]);
+                    body_truncated = true;
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return ToolResult::err(
+                    ToolErrorKind::Network,
+                    format!("Error reading response body: {e}"),
+                )
+            }
         }
-        Ok(b) => b,
-        Err(e) => return format!("Error reading response body: {e}"),
-    };
+    }
 
     if !status.is_success() {
-        return format!(
-            "Error: HTTP {} {} (response body {} bytes)",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or(""),
-            bytes.len()
+        return ToolResult::err(
+            ToolErrorKind::Network,
+            format!(
+                "Error: HTTP {} {} (response body {} bytes)",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                bytes.len()
+            ),
         );
     }
 
@@ -968,12 +1352,14 @@ fn execute_web_fetch(url: &str) -> String {
         status.canonical_reason().unwrap_or(""),
         content_type
     );
-    out.push_str(&body);
-    if out.len() > 50_000 {
-        out.truncate(50_000);
-        out.push_str("\n... (truncated)");
+    if body_truncated {
+        out.push_str("[note: body truncated at 5 MB during download]\n\n");
     }
-    out
+    out.push_str(&body);
+    let truncated = cap_output(&mut out);
+    let mut r = ToolResult::ok(out);
+    r.truncated = truncated || body_truncated;
+    r
 }
 
 /// Very small HTML-to-text reducer. Strips `<script>` / `<style>`
@@ -1057,59 +1443,53 @@ fn reduce_html(input: &str) -> String {
 // Git helpers
 // ----------------------------------------------------------------------------
 
-/// Run `git` in the working directory with the supplied args. Uses
-/// `execute_bash` style output formatting (stdout + `[stderr]` line)
-/// but with `git` as the binary directly so we don't shell-escape.
-fn execute_git(working_dir: &Path, args: &[&str]) -> String {
+/// Run `git` in the working directory with the supplied args under the
+/// same timeout/process-group discipline as `bash` — a `git` that hangs
+/// (e.g. blocked on a lock or credential helper) cannot stall the turn.
+async fn execute_git(working_dir: &Path, args: &[&str], timeout_secs: u64) -> ToolResult {
     debug!(args = ?args, "git");
 
-    let output = match Command::new("git")
-        .args(args)
-        .current_dir(working_dir)
-        .output()
-    {
-        Ok(o) => o,
+    match run_process("git", args, working_dir, timeout_secs).await {
+        Ok((exit_code, mut result, timed_out)) => {
+            if timed_out {
+                return ToolResult::err(
+                    ToolErrorKind::Timeout,
+                    format!(
+                        "Error: git {} timed out after {timeout_secs}s and was terminated",
+                        args.first().copied().unwrap_or("")
+                    ),
+                );
+            }
+            let code = exit_code.unwrap_or(0);
+            if code != 0 {
+                let text = format!(
+                    "git {} failed (exit {code:?}):\n{}",
+                    args.first().copied().unwrap_or(""),
+                    result
+                );
+                let mut r = ToolResult::err(ToolErrorKind::ExecFailed, text);
+                r.exit_code = Some(code);
+                return r;
+            }
+            if result.is_empty() {
+                result = "(no output)".to_string();
+            }
+            let truncated = cap_output(&mut result);
+            ToolResult {
+                text: result,
+                exit_code: Some(code),
+                error_kind: None,
+                truncated,
+            }
+        }
         Err(e) => {
-            return if e.kind() == std::io::ErrorKind::NotFound {
+            let text = if e.kind() == std::io::ErrorKind::NotFound {
                 "Error: git binary not found on PATH".to_string()
             } else {
                 format!("Error running git: {e}")
-            }
+            };
+            ToolResult::err(ToolErrorKind::ExecFailed, text)
         }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return format!(
-            "git {} failed (exit {:?}):\n{}\n{}",
-            args.first().copied().unwrap_or(""),
-            output.status.code(),
-            stdout,
-            stderr.trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut result = String::new();
-    if !stdout.is_empty() {
-        result.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !result.is_empty() && !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result.push_str(&stderr);
-    }
-    if result.is_empty() {
-        "(no output)".to_string()
-    } else if result.len() > 50_000 {
-        result.truncate(50_000);
-        result.push_str("\n... (truncated)");
-        result
-    } else {
-        result
     }
 }
 
@@ -1135,11 +1515,11 @@ mod tests {
     fn write_file_creates_and_overwrites() {
         let wd = tmpwd();
         let result = execute_write_file(&wd, "hello.txt", "hi\n");
-        assert!(result.contains("wrote"), "got: {result}");
+        assert!(result.text.contains("wrote"), "got: {}", result.text);
         assert_eq!(fs::read_to_string(wd.join("hello.txt")).unwrap(), "hi\n");
 
         let result = execute_write_file(&wd, "hello.txt", "there\n");
-        assert!(result.contains("wrote"));
+        assert!(result.text.contains("wrote"));
         assert_eq!(fs::read_to_string(wd.join("hello.txt")).unwrap(), "there\n");
 
         let _ = fs::remove_dir_all(&wd);
@@ -1149,10 +1529,57 @@ mod tests {
     fn write_file_rejects_parent_dir_traversal() {
         let wd = tmpwd();
         let result = execute_write_file(&wd, "../escape.txt", "x");
-        assert!(result.starts_with("Error"), "got: {result}");
+        assert!(result.text.starts_with("Error"), "got: {}", result.text);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::OutOfSandbox));
         assert!(!wd.parent().unwrap().join("escape.txt").exists());
 
         let _ = fs::remove_dir_all(&wd);
+    }
+
+    /// A symlinked parent directory must not smuggle writes outside the
+    /// sandbox — the `..` component check cannot see through symlinks
+    /// (G1a-FS1).
+    #[test]
+    fn write_file_rejects_symlinked_parent_escape() {
+        let wd = tmpwd();
+        let outside = tmpwd();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, wd.join("linkdir")).unwrap();
+            let result = execute_write_file(&wd, "linkdir/evil.txt", "x");
+            assert_eq!(result.error_kind, Some(ToolErrorKind::OutOfSandbox));
+            assert!(
+                !outside.join("evil.txt").exists(),
+                "write escaped via symlinked parent"
+            );
+
+            // A normal sibling path still works next to the link.
+            let ok = execute_write_file(&wd, "fine.txt", "y");
+            assert!(ok.error_kind.is_none(), "got: {}", ok.text);
+        }
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// An existing file that is itself a symlink to an outside target
+    /// must not be followed by write_file.
+    #[test]
+    fn write_file_rejects_symlink_target_outside() {
+        let wd = tmpwd();
+        let outside = tmpwd();
+        #[cfg(unix)]
+        {
+            fs::write(outside.join("victim.txt"), "keep").unwrap();
+            std::os::unix::fs::symlink(outside.join("victim.txt"), wd.join("link.txt")).unwrap();
+            let result = execute_write_file(&wd, "link.txt", "EVIL");
+            assert_eq!(result.error_kind, Some(ToolErrorKind::OutOfSandbox));
+            assert_eq!(
+                fs::read_to_string(outside.join("victim.txt")).unwrap(),
+                "keep"
+            );
+        }
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -1160,7 +1587,7 @@ mod tests {
         let wd = tmpwd();
         fs::write(wd.join("f.txt"), "alpha beta gamma").unwrap();
         let result = execute_edit(&wd, "f.txt", "beta", "BETA");
-        assert!(result.contains("patched"), "got: {result}");
+        assert!(result.text.contains("patched"), "got: {}", result.text);
         assert_eq!(
             fs::read_to_string(wd.join("f.txt")).unwrap(),
             "alpha BETA gamma"
@@ -1174,7 +1601,7 @@ mod tests {
         let wd = tmpwd();
         fs::write(wd.join("f.txt"), "alpha beta").unwrap();
         let result = execute_edit(&wd, "f.txt", "gamma", "GAMMA");
-        assert!(result.contains("not found"), "got: {result}");
+        assert!(result.text.contains("not found"), "got: {}", result.text);
         assert_eq!(fs::read_to_string(wd.join("f.txt")).unwrap(), "alpha beta");
 
         let _ = fs::remove_dir_all(&wd);
@@ -1185,7 +1612,11 @@ mod tests {
         let wd = tmpwd();
         fs::write(wd.join("f.txt"), "x x x").unwrap();
         let result = execute_edit(&wd, "f.txt", "x", "y");
-        assert!(result.contains("appears 3 times"), "got: {result}");
+        assert!(
+            result.text.contains("appears 3 times"),
+            "got: {}",
+            result.text
+        );
         assert_eq!(fs::read_to_string(wd.join("f.txt")).unwrap(), "x x x");
 
         let _ = fs::remove_dir_all(&wd);
@@ -1196,27 +1627,29 @@ mod tests {
         let wd = tmpwd();
         fs::write(wd.join("f.txt"), "x").unwrap();
         let result = execute_edit(&wd, "f.txt", "", "y");
-        assert!(result.contains("empty"), "got: {result}");
+        assert!(result.text.contains("empty"), "got: {}", result.text);
 
         let _ = fs::remove_dir_all(&wd);
     }
 
-    #[test]
-    fn web_fetch_blocks_when_allowlist_empty() {
+    #[tokio::test]
+    async fn web_fetch_blocks_when_allowlist_empty() {
         // Default: no allowlist → every request is blocked.
         std::env::remove_var("LLM_WEB_ALLOWLIST");
-        let result = execute_web_fetch("https://example.com/");
+        let result = execute_web_fetch("https://example.com/", 30).await;
         assert!(
-            result.contains("LLM_WEB_ALLOWLIST"),
-            "expected empty-allowlist block message, got: {result}"
+            result.text.contains("LLM_WEB_ALLOWLIST"),
+            "expected empty-allowlist block message, got: {}",
+            result.text
         );
+        assert_eq!(result.error_kind, Some(ToolErrorKind::Denied));
     }
 
-    #[test]
-    fn web_fetch_rejects_non_http_schemes() {
+    #[tokio::test]
+    async fn web_fetch_rejects_non_http_schemes() {
         std::env::set_var("LLM_WEB_ALLOWLIST", "example.com");
-        let result = execute_web_fetch("file:///etc/passwd");
-        assert!(result.contains("not allowed"), "got: {result}");
+        let result = execute_web_fetch("file:///etc/passwd", 30).await;
+        assert!(result.text.contains("not allowed"), "got: {}", result.text);
         std::env::remove_var("LLM_WEB_ALLOWLIST");
     }
 
@@ -1238,8 +1671,8 @@ mod tests {
         assert!(text.contains("line 1 line 2"), "got: {text}");
     }
 
-    #[test]
-    fn git_helper_runs_status() {
+    #[tokio::test]
+    async fn git_helper_runs_status() {
         // Init a throwaway repo and verify `git status` works.
         let wd = tmpwd();
         std::process::Command::new("git")
@@ -1259,10 +1692,68 @@ mod tests {
             .unwrap();
         std::fs::write(wd.join("a.txt"), "hello").unwrap();
 
-        let out = execute_git(&wd, &["status", "--short", "--branch"]);
-        assert!(!out.contains("failed"), "git status failed: {out}");
-        assert!(out.contains("a.txt"), "expected a.txt in output: {out}");
+        let out = execute_git(&wd, &["status", "--short", "--branch"], 30).await;
+        assert!(
+            !out.text.contains("failed"),
+            "git status failed: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("a.txt"),
+            "expected a.txt in output: {}",
+            out.text
+        );
 
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_kills_process() {
+        // A command that sleeps longer than the tool timeout must return
+        // a Timeout error quickly, not block the turn.
+        let wd = tmpwd();
+        let started = std::time::Instant::now();
+        let result = execute_bash(&wd, "sleep 30", 1).await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result.error_kind,
+            Some(ToolErrorKind::Timeout),
+            "got: {}",
+            result.text
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "timeout did not take effect promptly: {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_reports_exit_code() {
+        let wd = tmpwd();
+        let result = execute_bash(&wd, "echo out; echo err >&2; exit 7", 30).await;
+        assert_eq!(result.exit_code, Some(7));
+        assert!(result.text.contains("out"), "got: {}", result.text);
+        assert!(result.text.contains("err"), "got: {}", result.text);
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    /// UTF-8-heavy output must truncate on a char boundary — a mid-char
+    /// `String::truncate` panics and would crash the tool loop (plan's
+    /// 「巨量 UTF-8」 boundary case).
+    #[tokio::test]
+    async fn bash_output_truncates_on_utf8_boundary() {
+        let wd = tmpwd();
+        // 30_000 CJK chars = 90_000 bytes — beyond the 50 KB cap, and the
+        // 50_000th byte lands mid-char.
+        let result = execute_bash(&wd, "printf '中%.0s' {1..30000}", 30).await;
+        assert!(result.error_kind.is_none(), "got: {}", result.text);
+        assert!(result.truncated, "expected truncated flag");
+        assert!(
+            result.text.len() <= MAX_TOOL_OUTPUT_CHARS + 32,
+            "output was not capped: {} bytes",
+            result.text.len()
+        );
         let _ = fs::remove_dir_all(&wd);
     }
 }

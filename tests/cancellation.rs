@@ -190,6 +190,86 @@ async fn cancel_and_follow_up_work_on_both_wire_versions() {
     }
 }
 
+/// `session/cancel` must terminate a running subprocess tool, not just
+/// the in-flight LLM request. Before async tool execution, a `bash`
+/// `sleep` blocked the turn until the command finished on its own —
+/// cancel had no effect for tens of seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_kills_running_subprocess_tool() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    let app = router().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = counter.clone();
+            async move {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // First request: ask for a long-running bash command.
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_sleep",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": "{\"command\": \"sleep 60\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    }))
+                } else {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "done"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }
+        }),
+    );
+    let mut client = Client::start(app, false, 1).await;
+    let sid = client.session();
+    client.prompt(&sid, 2);
+
+    // Wait until the bash tool actually starts running (tool_call
+    // notification) so the cancel lands mid-execution, not mid-LLM-call.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_tool = false;
+    while Instant::now() < deadline {
+        let v = client
+            .messages
+            .recv_timeout(Duration::from_secs(15))
+            .expect("no tool notification");
+        if v["params"]["update"]["sessionUpdate"] == "tool_call"
+            || v["params"]["update"]["sessionUpdate"] == "tool_call_update"
+        {
+            saw_tool = true;
+            break;
+        }
+    }
+    assert!(saw_tool, "bash tool call never started");
+
+    let started = Instant::now();
+    client.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}}));
+    let (_, response) = client.response(2);
+
+    // With synchronous `Command::output()` this turn could not end until
+    // `sleep 60` exited on its own; the process-group kill path must end
+    // it promptly instead.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "cancel did not stop the running subprocess in time"
+    );
+    assert_eq!(response["result"]["stopReason"], "cancelled", "{response}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompt_answers_after_stdin_closes() {
     let app = router().route(
