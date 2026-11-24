@@ -229,6 +229,24 @@ pub struct AppState {
     /// Optional on-disk session snapshot store (P1/E14). `None` →
     /// `session/load` answers `-32001 no_persistence`.
     pub session_store: Option<std::sync::Arc<crate::session_store::SessionStore>>,
+    /// Single-use, TTL-bound per-operation permits (G1a round-3):
+    /// issued via `session/permit`, consumed by a `confirm`-gated tool
+    /// call. Deployment-scope `Policy::grants` stay as the coarse knob;
+    /// a permit is the per-operation grant the confirm action wants.
+    permits: std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<Permit>>>>,
+}
+
+/// A single-use, TTL-bound authorization for one `confirm`-gated
+/// capability, optionally scoped to a specific tool within it. Issued
+/// by the Client via `session/permit` — that call IS the interactive
+/// grant channel the `confirm` action verifies against.
+pub struct Permit {
+    pub id: String,
+    pub capability: crate::policy::Capability,
+    /// When set, the permit only unlocks this tool name.
+    pub tool: Option<String>,
+    pub expires_at: std::time::Instant,
+    pub consumed: bool,
 }
 
 impl Clone for AppState {
@@ -240,6 +258,7 @@ impl Clone for AppState {
             protocol_version: self.protocol_version,
             policy: self.policy.clone(),
             session_store: self.session_store.clone(),
+            permits: Arc::clone(&self.permits),
         }
     }
 }
@@ -257,6 +276,7 @@ impl AppState {
             protocol_version: crate::protocol::ProtocolVersion::V1,
             policy: crate::policy::Policy::default_policy(),
             session_store: None,
+            permits: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -318,6 +338,103 @@ impl AppState {
         if evicted > 0 {
             info!(evicted, remaining = sessions.len(), "Evicted idle sessions");
         }
+    }
+
+    /// Issue a single-use, TTL-bound permit for a `confirm`-gated
+    /// capability. This IS the interactive grant channel — the Client
+    /// calls `session/permit` when the user (or its policy) approves one
+    /// specific operation, and the next matching confirm-gated call
+    /// consumes it. TTL clamps to [1, 3600]s, default 300.
+    pub fn session_permit(
+        &self,
+        session_id: &str,
+        capability_name: &str,
+        tool: Option<&str>,
+        ttl_secs: u64,
+    ) -> Result<Value, AcpError> {
+        if !self.sessions_read().contains_key(session_id) {
+            return Err(AcpError::UnknownSession {
+                session_id: session_id.to_string(),
+            });
+        }
+        let capability = match capability_name.trim().to_ascii_lowercase().as_str() {
+            "read" => crate::policy::Capability::Read,
+            "write" => crate::policy::Capability::Write,
+            "shell" => crate::policy::Capability::Shell,
+            "web" => crate::policy::Capability::Web,
+            other => {
+                return Err(AcpError::MissingParam {
+                    field: format!("capability: '{other}' is not one of read|write|shell|web"),
+                })
+            }
+        };
+        if let Some(t) = tool {
+            match crate::policy::Policy::capability_of(t) {
+                Some(c) if c == capability => {}
+                Some(_) => {
+                    return Err(AcpError::MissingParam {
+                        field: format!("tool: '{t}' is not a {capability_name} tool"),
+                    })
+                }
+                None => {
+                    return Err(AcpError::MissingParam {
+                        field: format!("tool: unknown tool '{t}'"),
+                    })
+                }
+            }
+        }
+        let ttl = ttl_secs.clamp(1, 3600);
+        let permit = Permit {
+            id: Uuid::new_v4().to_string(),
+            capability,
+            tool: tool.map(|s| s.to_string()),
+            expires_at: std::time::Instant::now() + Duration::from_secs(ttl),
+            consumed: false,
+        };
+        let out = json!({
+            "permitId": permit.id,
+            "capability": format!("{:?}", permit.capability),
+            "tool": permit.tool,
+            "expiresInSeconds": ttl,
+            "singleUse": true,
+        });
+        let mut permits = match self.permits.lock() {
+            Ok(p) => p,
+            Err(p) => p.into_inner(),
+        };
+        // Housekeeping: drop expired+consumed permits while we're here.
+        let v = permits.entry(session_id.to_string()).or_default();
+        v.retain(|p| !p.consumed && p.expires_at > std::time::Instant::now());
+        v.push(permit);
+        Ok(out)
+    }
+
+    /// Consume the oldest matching live permit for (capability, tool).
+    /// Returns the permit id on success — single-use means it is marked
+    /// consumed before the tool runs, so a crashed call still burns it.
+    fn consume_permit(
+        &self,
+        session_id: &str,
+        cap: crate::policy::Capability,
+        tool_name: &str,
+    ) -> Option<String> {
+        let mut permits = match self.permits.lock() {
+            Ok(p) => p,
+            Err(p) => p.into_inner(),
+        };
+        let v = permits.get_mut(session_id)?;
+        let now = std::time::Instant::now();
+        v.iter_mut()
+            .find(|p| {
+                !p.consumed
+                    && p.expires_at > now
+                    && p.capability == cap
+                    && p.tool.as_deref().is_none_or(|t| t == tool_name)
+            })
+            .map(|p| {
+                p.consumed = true;
+                p.id.clone()
+            })
     }
 
     /// Clean up all sessions. Returns the number of sessions cleaned.
@@ -801,27 +918,59 @@ pub async fn session_prompt(
                     // execute only with a deployment grant, else deny;
                     // allow → execute.
                     evidence.tool_calls += 1;
+                    let cap = crate::policy::Policy::capability_of(name);
                     let decision = state.policy.decide(name, &args);
-                    let policy_denied = matches!(decision, crate::policy::Decision::Deny(_));
-                    let result = match decision {
-                        crate::policy::Decision::Deny(reason) => tools::ToolResult::err(
-                            tools::ToolErrorKind::Denied,
-                            format!("Error: {reason}"),
-                        ),
-                        decision => {
-                            if let crate::policy::Decision::Audit(reason) = &decision {
-                                notify(Notification::TextChunk(format!(
-                                    "\n\n*[policy:audit] {reason} — proceeding (logged; no interactive permission channel configured)*"
-                                )));
+                    // A Deny produced by an ungranted `confirm` action
+                    // (not a hard `deny`) can be rescued by a live
+                    // single-use permit for this capability — and tool,
+                    // when the permit is tool-scoped.
+                    let confirm_blocked = matches!(decision, crate::policy::Decision::Deny(_))
+                        && cap
+                            .map(|c| {
+                                state.policy.action_for(c) == crate::policy::Action::Confirm
+                                    && !state.policy.grants.contains(&c)
+                            })
+                            .unwrap_or(false);
+                    let permit_id = if confirm_blocked {
+                        state.consume_permit(session_id, cap.unwrap(), name)
+                    } else {
+                        None
+                    };
+                    let policy_denied =
+                        matches!(decision, crate::policy::Decision::Deny(_)) && permit_id.is_none();
+                    let result = if let Some(pid) = &permit_id {
+                        notify(Notification::TextChunk(format!(
+                            "\n\n*[policy:permit] consumed {pid} — '{name}' authorized for this call only*"
+                        )));
+                        tools::execute_tool(
+                            &working_dir,
+                            name,
+                            &args,
+                            tool_timeout_secs,
+                            &state.policy.deny_path_globs,
+                        )
+                        .await
+                    } else {
+                        match decision {
+                            crate::policy::Decision::Deny(reason) => tools::ToolResult::err(
+                                tools::ToolErrorKind::Denied,
+                                format!("Error: {reason}"),
+                            ),
+                            decision => {
+                                if let crate::policy::Decision::Audit(reason) = &decision {
+                                    notify(Notification::TextChunk(format!(
+                                        "\n\n*[policy:audit] {reason} — proceeding (logged; no interactive permission channel configured)*"
+                                    )));
+                                }
+                                tools::execute_tool(
+                                    &working_dir,
+                                    name,
+                                    &args,
+                                    tool_timeout_secs,
+                                    &state.policy.deny_path_globs,
+                                )
+                                .await
                             }
-                            tools::execute_tool(
-                                &working_dir,
-                                name,
-                                &args,
-                                tool_timeout_secs,
-                                &state.policy.deny_path_globs,
-                            )
-                            .await
                         }
                     };
                     notify(Notification::ToolDone {
@@ -1306,6 +1455,61 @@ mod tests {
         let text = extract_user_text_from_prompt(&prompt);
         assert!(text.contains("describe this"));
         assert!(text.contains("[Attached resource: hostname (file:///etc/hostname)]"));
+    }
+
+    /// Permits are single-use, session-scoped, and tool-scoped.
+    #[test]
+    fn permits_are_single_use_and_scoped() {
+        let state = AppState::new(cfg_with_image(false));
+        let sid = crate::engine::session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1)
+            .unwrap();
+
+        // Capability-scoped permit consumes once.
+        let p1 = state.session_permit(&sid, "shell", None, 60).unwrap();
+        assert!(p1["permitId"].is_string());
+        assert_eq!(p1["singleUse"], true);
+        assert!(state
+            .consume_permit(&sid, crate::policy::Capability::Shell, "bash")
+            .is_some());
+        assert!(
+            state
+                .consume_permit(&sid, crate::policy::Capability::Shell, "bash")
+                .is_none(),
+            "consumed permit must not match twice"
+        );
+
+        // Tool-scoped permit only unlocks its tool.
+        state
+            .session_permit(&sid, "shell", Some("git_status"), 60)
+            .unwrap();
+        assert!(
+            state
+                .consume_permit(&sid, crate::policy::Capability::Shell, "bash")
+                .is_none(),
+            "tool-scoped permit must not unlock another tool"
+        );
+        assert!(state
+            .consume_permit(&sid, crate::policy::Capability::Shell, "git_status")
+            .is_some());
+
+        // Permits don't leak across sessions, and bad inputs fail clean.
+        let sid2 = crate::engine::session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1)
+            .unwrap();
+        state.session_permit(&sid2, "web", None, 60).unwrap();
+        assert!(
+            state
+                .consume_permit(&sid, crate::policy::Capability::Web, "web_fetch")
+                .is_none(),
+            "permit must not leak across sessions"
+        );
+        assert!(state.session_permit(&sid2, "bogus", None, 60).is_err());
+        assert!(
+            state
+                .session_permit(&sid2, "shell", Some("write_file"), 60)
+                .is_err(),
+            "tool outside the capability must be rejected"
+        );
+        assert!(state.session_permit("no-such", "shell", None, 60).is_err());
     }
 
     #[test]

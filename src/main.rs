@@ -476,6 +476,54 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                     }
                                 }
                             }
+                            "session/permit" => {
+                                // Per-operation grant channel for
+                                // `confirm`-gated tools (G1a round-3):
+                                // the Client issues a single-use,
+                                // TTL-bound permit; the next matching
+                                // confirm-gated tool call consumes it.
+                                // `confirm` never executes unconfirmed.
+                                let sid = params
+                                    .get("sessionId")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let cap = params
+                                    .get("capability")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let tool = params
+                                    .get("tool")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let ttl = params
+                                    .get("ttlSeconds")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(300);
+                                match (sid, cap) {
+                                    (None, _) | (_, None) => acp::send_error_with_data(
+                                        &id,
+                                        -32602,
+                                        "missing required parameters: sessionId, capability",
+                                        json!({ "reason": "invalid_params" }),
+                                    ),
+                                    (Some(sid), Some(cap)) => {
+                                        match state.session_permit(
+                                            &sid,
+                                            &cap,
+                                            tool.as_deref(),
+                                            ttl,
+                                        ) {
+                                            Ok(out) => acp::send_response(&id, out),
+                                            Err(e) => acp::send_error_with_data(
+                                                &id,
+                                                e.code(),
+                                                &e.to_string(),
+                                                json!({ "reason": "permit_rejected" }),
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
                             "session/delete" => {
                                 // v2 optional session method (advertised via
                                 // `capabilities.session.delete: {}`). acp-bridge

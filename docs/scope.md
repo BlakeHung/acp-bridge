@@ -102,7 +102,7 @@ Every tool call is gated by a capability rule before dispatch:
 | shell | `bash`, `git_*` | `LLM_POLICY_SHELL` | `audit` |
 | web | `web_fetch` | `LLM_POLICY_WEB` | `audit` |
 
-Actions: `allow` executes; `audit` emits a visible `[policy:audit]` notice then executes (a logged proceed — OpenAB exposes no interactive permission channel, so nothing can be approved mid-turn); `confirm` executes only when the capability holds a deployment grant (`[policy] grants` / `LLM_POLICY_GRANTS`) — ungranted, it returns a structured `Denied` result naming how to grant; `deny` returns a structured `Denied` tool error without executing. `LLM_POLICY_DENY_PATHS` / `deny_path_globs` is a workspace-relative glob deny list applied to file tools' `path` argument AND to every path `list_dir`/`search_code` enumerate — `.env` contents cannot leak through a search either. Defaults cover credential-shaped files (`.env`, `*.pem`, `*.key`, `.ssh/**`, `.aws/**`, `.gnupg/**`). `*` does not cross `/`, `**` does; a glob without `/` matches basenames at any depth.
+Actions: `allow` executes; `audit` emits a visible `[policy:audit]` notice then executes (a logged proceed); `confirm` executes only with a grant — either a deployment-scope `[policy] grants` / `LLM_POLICY_GRANTS` entry, or a live single-use permit issued by the Client via `session/permit` (capability-scoped, optionally tool-scoped, TTL ≤ 3600s, consumed on first match — a `confirm`-blocked call consumed by a permit emits `[policy:permit]`), else a structured `Denied` result naming how to grant; `deny` returns a structured `Denied` tool error without executing. `LLM_POLICY_DENY_PATHS` / `deny_path_globs` is a workspace-relative glob deny list applied to file tools' `path` argument AND to every path `list_dir`/`search_code` enumerate — `.env` contents cannot leak through a search either. Defaults cover credential-shaped files (`.env`, `*.pem`, `*.key`, `.ssh/**`, `.aws/**`, `.gnupg/**`). `*` does not cross `/`, `**` does; a glob without `/` matches basenames at any depth.
 
 ## Supported with caveats
 
@@ -158,8 +158,15 @@ above are a safety net for Clients that don't.
 - **Not a session database.** Without `LLM_SESSION_DIR` there is no
   persistence at all. With it set, sessions snapshot to flat JSON files
   at turn boundaries and `session/load` can restore them across
-  restarts — that is a snapshot, not the durable store the plan's P3
-  work wants (no concurrent writers, no crash markers, no compaction).
+  restarts. Saves go through a per-session writer lock (`{id}.lock`,
+  stale after 5 min), fsync the body before rename, and only count as
+  committed when a `{id}.done` marker exists — a `.json` without its
+  marker loads as corrupt, not as a session. Schema is validated on
+  load (format_version, session_id match, message_count, required
+  fields). The store itself is bounded: 2 MB per snapshot, 500 files,
+  64 MB total — over-limit saves are skipped rather than truncated.
+  Still honest limits: no cross-machine coordination, no compaction,
+  no encryption at rest.
 - **Not an auth provider.** No login flow, no token storage, no user
   identity. If you need per-user sessions, route through a Client that
   gates on its own identity.

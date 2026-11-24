@@ -141,7 +141,7 @@ impl ConfigFile {
 
         let max_sessions = env_parse("LLM_MAX_SESSIONS")?
             .or(file.max_sessions)
-            .unwrap_or(0);
+            .unwrap_or(256);
 
         let session_idle_timeout_secs = env_parse("LLM_SESSION_IDLE_TIMEOUT")?
             .or(file.session_idle_timeout_secs)

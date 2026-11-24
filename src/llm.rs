@@ -689,7 +689,7 @@ impl LlmConfig {
             max_tokens: env_parse("LLM_MAX_TOKENS")?,
             timeout_secs,
             max_history_turns: env_parse("LLM_MAX_HISTORY_TURNS")?.unwrap_or(50),
-            max_sessions: env_parse("LLM_MAX_SESSIONS")?.unwrap_or(0),
+            max_sessions: env_parse("LLM_MAX_SESSIONS")?.unwrap_or(256),
             session_idle_timeout_secs: env_parse("LLM_SESSION_IDLE_TIMEOUT")?.unwrap_or(0),
             prompt_supports_image: env_parse_bool("LLM_SUPPORTS_IMAGE")?.unwrap_or(false),
             context_size: env_parse("LLM_MODEL_CONTEXT")?.unwrap_or(32768),

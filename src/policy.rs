@@ -222,7 +222,7 @@ impl Policy {
     /// Which capability a tool name maps to. Unknown tools are
     /// denied outright — an unmapped tool is a surface nobody
     /// classified, not an implicit allow.
-    fn capability_of(name: &str) -> Option<Capability> {
+    pub fn capability_of(name: &str) -> Option<Capability> {
         match name {
             "read_file" | "list_dir" | "search_code" => Some(Capability::Read),
             "write_file" | "edit" => Some(Capability::Write),
@@ -254,12 +254,7 @@ impl Policy {
             }
         }
 
-        let action = match cap {
-            Capability::Read => self.read,
-            Capability::Write => self.write,
-            Capability::Shell => self.shell,
-            Capability::Web => self.web,
-        };
+        let action = self.action_for(cap);
         match action {
             Action::Allow => Decision::Allow,
             Action::Audit => Decision::Audit(format!(
@@ -277,6 +272,20 @@ impl Policy {
                 }
             }
             Action::Deny => Decision::Deny(format!("policy denies {cap:?} tool '{name}'")),
+        }
+    }
+}
+
+impl Policy {
+    /// The configured action for a capability — exposed so the engine
+    /// can distinguish a `confirm`-blocked call (permit may rescue it)
+    /// from a hard `deny`.
+    pub fn action_for(&self, cap: Capability) -> Action {
+        match cap {
+            Capability::Read => self.read,
+            Capability::Write => self.write,
+            Capability::Shell => self.shell,
+            Capability::Web => self.web,
         }
     }
 }

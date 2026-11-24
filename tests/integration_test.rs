@@ -1539,7 +1539,7 @@ async fn test_policy_deny_reaches_model_as_tool_result() {
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
     h.send(&json!({
         "jsonrpc":"2.0","id":2,"method":"session/prompt",
-        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"read .env"}]}
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"run ls"}]}
     }));
     let (_, response) = h.read_until_response(2);
     assert_eq!(response["result"]["status"], "completed");
@@ -1562,6 +1562,105 @@ async fn test_policy_deny_reaches_model_as_tool_result() {
             .unwrap_or(false)),
         "denial did not reach the model: {second}"
     );
+
+    h.shutdown();
+}
+
+/// session/permit issues a single-use grant that rescues exactly one
+/// `confirm`-blocked tool call — ungranted stays denied, consumed stays
+/// consumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_session_permit_rescues_one_confirm_call() {
+    let port = free_port();
+    let app = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let has_tool = msgs.iter().any(|m| m["role"] == "tool");
+                if has_tool {
+                    axum::Json(json!({
+                        "choices": [{"message": {"role":"assistant","content":"done."},"finish_reason":"stop"}]
+                    }))
+                } else {
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role":"assistant","content": null,"tool_calls":[{
+                                "id":"c1","type":"function",
+                                "function":{"name":"bash","arguments":"{\"command\":\"echo hi\"}"}
+                            }]},
+                            "finish_reason":"tool_calls"
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags));
+
+    let mut h =
+        TestHarness::start_with_router_and_env(port, app, &[("LLM_POLICY_SHELL", "confirm")]).await;
+
+    // Session A: no permit — the bash call must be denied (tool fails).
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sida = resp["result"]["sessionId"].as_str().unwrap().to_string();
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sida,"prompt":[{"type":"text","text":"run echo"}]}
+    }));
+    let (notif_a, _) = h.read_until_response(2);
+    assert!(
+        notif_a
+            .iter()
+            .any(|n| n["params"]["update"]["status"] == "failed"),
+        "confirm-blocked call without permit must fail: {notif_a:?}"
+    );
+
+    // Session B: a shell permit rescues the same call once.
+    h.send(&json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sidb = resp["result"]["sessionId"].as_str().unwrap().to_string();
+    h.send(&json!({
+        "jsonrpc":"2.0","id":4,"method":"session/permit",
+        "params":{"sessionId":&sidb,"capability":"shell","ttlSeconds":120}
+    }));
+    let resp = h.read_line();
+    let permit_id = resp["result"]["permitId"].as_str().unwrap().to_string();
+    assert!(!permit_id.is_empty());
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":5,"method":"session/prompt",
+        "params":{"sessionId":&sidb,"prompt":[{"type":"text","text":"run echo"}]}
+    }));
+    let (notif_b, _) = h.read_until_response(5);
+    let joined = serde_json::to_string(&notif_b).unwrap();
+    assert!(
+        joined.contains("[policy:permit]"),
+        "permit consumption must be visible: {joined}"
+    );
+    assert!(
+        notif_b
+            .iter()
+            .any(|n| n["params"]["update"]["status"] == "completed"),
+        "permit-rescued call must run: {notif_b:?}"
+    );
+
+    // Single-use: this session's permit is consumed — a later call in
+    // the same session must not be rescued again.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":6,"method":"session/prompt",
+        "params":{"sessionId":&sidb,"prompt":[{"type":"text","text":"run echo again"}]}
+    }));
+    let (notif_c, _) = h.read_until_response(6);
+    for n in &notif_c {
+        assert!(
+            !serde_json::to_string(n)
+                .unwrap()
+                .contains("[policy:permit]"),
+            "consumed permit must not fire twice: {n}"
+        );
+    }
 
     h.shutdown();
 }

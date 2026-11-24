@@ -940,21 +940,25 @@ fn search_dir(
 /// timeout, on success, and when the surrounding future is dropped by a
 /// session cancel — which is what makes `session/cancel` actually stop
 /// work instead of waiting for the sync call to return.
+fn kill_process_group(pgid: Option<u32>) {
+    if let Some(pgid) = pgid {
+        // `kill -KILL -<pgid>` targets the whole group; the child is
+        // its own group leader via process_group(0), so pgid == pid.
+        // Synchronous spawn is fine — `kill` execs and exits
+        // immediately; we intentionally don't wait for it.
+        let _ = std::process::Command::new("kill")
+            .args(["-s", "KILL", &format!("-{pgid}")])
+            .spawn();
+    }
+}
+
 struct ProcessGroupGuard {
     pgid: Option<u32>,
 }
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        if let Some(pgid) = self.pgid.take() {
-            // `kill -KILL -<pgid>` targets the whole group; the child is
-            // its own group leader via process_group(0), so pgid == pid.
-            // Synchronous spawn is fine — `kill` execs and exits
-            // immediately; we intentionally don't wait for it.
-            let _ = std::process::Command::new("kill")
-                .args(["-s", "KILL", &format!("-{pgid}")])
-                .spawn();
-        }
+        kill_process_group(self.pgid.take());
     }
 }
 
@@ -1035,23 +1039,29 @@ async fn run_process(
 
     let (status, timed_out) = match wait {
         Ok(r) => (Some(r), false),
-        Err(_) => {
-            // Kill immediately: the reader tasks only finish once the
-            // child's pipes close, and pipes only close when it dies.
-            // Waiting on the readers before killing would hang until
-            // the process exits on its own (a `sleep 30` bug).
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            (None, true)
-        }
+        Err(_) => (None, true),
     };
 
-    // The child is dead — pipes are closed; collect what the readers kept.
+    // Kill the whole group NOW — before joining the readers — on every
+    // path: a timeout kill obviously needs it, but so does the success
+    // path: a `cmd &`-style grandchild that outlives the child still
+    // holds the pipes open, and joining the readers first would hang
+    // forever on those pipes (the guard's drop-kill only runs after
+    // this function returns — exactly the deadlock the wait was for).
+    kill_process_group(_guard.pgid);
+    if timed_out {
+        // Bounded wait: the group kill above is asynchronous, give the
+        // child a short grace to reap rather than awaiting forever.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    }
+
+    // Join the readers with a grace deadline — pipes close when the
+    // group dies, but we never wait on them unboundedly.
     let collect = |h: Option<tokio::task::JoinHandle<(Vec<u8>, usize)>>| async move {
         match h {
-            Some(h) => match h.await {
-                Ok((kept, total)) => (kept, total),
-                Err(_) => (Vec::new(), 0),
+            Some(h) => match tokio::time::timeout(std::time::Duration::from_secs(3), h).await {
+                Ok(Ok((kept, total))) => (kept, total),
+                _ => (Vec::new(), 0),
             },
             None => (Vec::new(), 0),
         }
@@ -1187,6 +1197,9 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
         }
     };
 
+    // Resolved write target — set to the canonical parent + basename so
+    // the open()/rename() path contains no symlink components at all.
+    let target_real;
     if let Some(parent) = target.parent() {
         // Validate the deepest EXISTING ancestor before creating
         // anything. A blind `create_dir_all` first would happily make
@@ -1232,7 +1245,12 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
         // in for a symlink between the checks above and now would
         // still land the write outside the sandbox.
         match parent.canonicalize() {
-            Ok(canon_parent) if canon_parent.starts_with(&canonical_wd) => {}
+            Ok(canon_parent) if canon_parent.starts_with(&canonical_wd) => {
+                // Write through the CANONICAL path — every component is
+                // a verified real directory, so no symlink component can
+                // be swapped in on the open() path.
+                target_real = canon_parent.join(target.file_name().unwrap());
+            }
             _ => {
                 return ToolResult::err(
                     ToolErrorKind::OutOfSandbox,
@@ -1243,11 +1261,15 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
                 );
             }
         }
+    } else {
+        target_real = canonical_wd.join(target.file_name().unwrap());
     }
 
-    // An existing target that is itself a symlink must not be followed —
-    // writing through it would modify a file outside the sandbox even
-    // when the parent is fine.
+    // An existing target that is itself a symlink: the tmp-write+rename
+    // below REPLACES the dentry instead of following it, so a swapped-in
+    // link at write time can no longer redirect bytes outside (G1a-FS2).
+    // Still refuse outright for a clear error — and refuse when it
+    // resolves inside but the model clearly meant to write through it.
     if let Ok(meta) = target.symlink_metadata() {
         if meta.file_type().is_symlink() {
             match target.canonicalize() {
@@ -1265,8 +1287,44 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
         }
     }
 
-    match std::fs::write(&target, content) {
+    // Atomic publish: write the payload to a same-dir temp name, then
+    // rename() over the target. rename() replaces the dentry — it can
+    // never follow a swapped-in symlink — and readers see either the
+    // old file or the new one, never a partial write.
+    let tmp_name = format!(
+        ".{}.acp-tmp-{}",
+        target.file_name().unwrap().to_string_lossy(),
+        std::process::id()
+    );
+    let tmp_target = target_real
+        .parent()
+        .map(|p| p.join(&tmp_name))
+        .unwrap_or_else(|| target_real.with_file_name(&tmp_name));
+    match std::fs::write(&tmp_target, content) {
         Ok(()) => {
+            // Post-write re-verify: the parent must STILL be in-sandbox
+            // (a component swap between our checks and now is refused
+            // and its temp file cleaned up).
+            match target_real.parent().and_then(|p| p.canonicalize().ok()) {
+                Some(p) if p.starts_with(&canonical_wd) => {}
+                _ => {
+                    let _ = std::fs::remove_file(&tmp_target);
+                    return ToolResult::err(
+                        ToolErrorKind::OutOfSandbox,
+                        format!(
+                            "Error: path '{}' escaped the working directory during write",
+                            relative_path
+                        ),
+                    );
+                }
+            }
+            if let Err(e) = std::fs::rename(&tmp_target, &target_real) {
+                let _ = std::fs::remove_file(&tmp_target);
+                return ToolResult::err(
+                    ToolErrorKind::ExecFailed,
+                    format!("Error publishing file: {e}"),
+                );
+            }
             debug!(
                 path = %relative_path,
                 bytes = content.len(),

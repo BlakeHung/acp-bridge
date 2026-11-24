@@ -256,7 +256,7 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_MAX_TOKENS` | (model default) | Maximum tokens to generate |
 | `LLM_TIMEOUT` | `300` | HTTP request timeout in seconds |
 | `LLM_MAX_HISTORY_TURNS` | `50` | Max conversation turns to keep (0 = unlimited) |
-| `LLM_MAX_SESSIONS` | `0` | Max concurrent sessions (0 = unlimited) |
+| `LLM_MAX_SESSIONS` | `256` | Max concurrent sessions; `0` restores the old unlimited behavior |
 | `LLM_SESSION_IDLE_TIMEOUT` | `0` | Evict idle sessions after N seconds (0 = disabled) |
 | `LLM_SUPPORTS_IMAGE` | `false` | Opt-in: advertise `promptCapabilities.image: true` at `initialize`. Set to `true` only if the configured backend can actually accept image content blocks (e.g. a vision-capable model). |
 | `LLM_MODEL_CONTEXT` | `32768` | Model context window in tokens. Reported as `size` in `usage_update` notifications. |
@@ -266,7 +266,7 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_TOOL_FAILURE_STREAK` | `3` | Abort the tool loop after N consecutive identical tool failures (same tool + args + error) |
 | `LLM_POLICY_READ` / `LLM_POLICY_WRITE` | `allow` / `allow` | Tool policy actions: `allow` · `audit` (visible notice, then run) · `confirm` (run only with a grant) · `deny` |
 | `LLM_POLICY_SHELL` / `LLM_POLICY_WEB` | `audit` / `audit` | Tool policy actions for shell/network tools |
-| `LLM_POLICY_GRANTS` | (empty) | Comma-separated capability grants (`read,write,shell,web`) that let `confirm` actions execute — deployment scope |
+| `LLM_POLICY_GRANTS` | (empty) | Comma-separated capability grants (`read,write,shell,web`) that let `confirm` actions execute — deployment scope. For per-operation grants the Client can also call `session/permit` (single-use, TTL-bound, optional tool scope; emits `[policy:permit]` on consumption) |
 | `LLM_POLICY_DENY_PATHS` | `.env, .env.*, *.pem, *.key, .ssh/**, .aws/**, .gnupg/**` | Workspace-relative globs refused on `path` args AND inside list_dir/search_code results |
 | `LLM_SESSION_DIR` | (unset) | Directory for per-session JSON snapshots. Unset = no persistence; `session/load` answers `no_persistence` |
 | `LLM_WEB_ALLOWLIST` | (empty) | Comma-separated host suffixes the `web_fetch` tool is allowed to reach. Empty = block all web access. |
@@ -391,7 +391,7 @@ When the LLM supports function calling (Ollama with compatible models, OpenAI-co
 | `write_file` | Create or overwrite a file | Max 5MB; rejects `..`, symlinked-parent escapes, and symlink targets outside the working dir |
 | `edit` | Replace a unique substring in a file | Refuses ambiguous / missing matches |
 | `web_fetch` | Fetch a URL over HTTP/HTTPS | 5MB cap enforced while downloading, 30s timeout. Requires `LLM_WEB_ALLOWLIST` |
-| `bash` | Run a bash command in the working dir | `LLM_TOOL_TIMEOUT` wall-clock timeout, process-group kill, output truncated at 50 KB |
+| `bash` | Run a bash command in the working dir | `LLM_TOOL_TIMEOUT` wall-clock timeout, process-group kill on timeout AND on exit (grandchildren can't hold pipes), retained output bounded (~1 MB/stream, truncated at 50 KB for the model) |
 | `git_status` | Compact `git status` | — |
 | `git_diff` | Show unstaged (or staged) changes | Optional `path` filter |
 | `git_log` | One-line-per-commit log | `max_count` (default 20, max 200) |
