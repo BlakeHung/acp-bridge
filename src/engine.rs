@@ -1233,26 +1233,128 @@ const MIN_OUTPUT_TOKENS: u64 = 512;
 /// context arithmetic, so we must too.
 const DEFAULT_OUTPUT_TOKENS: u64 = 4096;
 
-/// Drop oldest history (keeping `messages[0]` = system prompt) until
-/// the char-estimate fits `prompt_budget`. Returns (fitted, dropped).
-fn compact_for_context(mut messages: Vec<Value>, prompt_budget: u64) -> (Vec<Value>, usize) {
+/// How much of an old message's text survives in-place shrinking.
+/// A 50 KB tool result becomes ~2 KB: the model keeps the "what ran
+/// and what came back" skeleton without paying full price per token.
+const ELIDED_KEEP_CHARS: usize = 2048;
+
+/// Compact messages to fit `prompt_budget` tokens (char/4 estimate).
+///
+/// Kiro-style anchoring for long investigations: `messages[0]` (system)
+/// and `messages[1]` (the first user message — THE TASK) are never
+/// dropped, or the agent literally forgets what it was investigating
+/// mid-way. Three escalating steps:
+///   1. Shrink oversized message contents IN PLACE (elide the middle,
+///      keep head+tail) — the tool-call structure and a usable excerpt
+///      survive.
+///   2. Drop oldest non-anchor messages until the estimate fits —
+///      a marker records how many went away so the loss is explicit
+///      on the wire.
+///
+/// Returns (fitted_messages, dropped_count, elided_count).
+fn compact_for_context(mut messages: Vec<Value>, prompt_budget: u64) -> (Vec<Value>, usize, usize) {
     if estimate_tokens(&messages) <= prompt_budget {
-        return (messages, 0);
+        return (messages, 0, 0);
     }
+
+    // Step 1 — shrink contents in place, oldest first. The task anchor
+    // (messages[1]) is eligible for elision — its head+tail survive —
+    // only the system prompt and the live (last) message are immune.
+    let mut elided = 0usize;
+    for i in 1..messages.len().saturating_sub(1) {
+        if estimate_tokens(&messages) <= prompt_budget {
+            break;
+        }
+        if elide_message(&mut messages[i]) {
+            elided += 1;
+        }
+    }
+    if estimate_tokens(&messages) <= prompt_budget {
+        return (messages, 0, elided);
+    }
+
+    // Step 2 — drop whole messages oldest-first between the anchors
+    // and the tail. Insert a marker so the model sees the seam.
     let system = messages.first().cloned();
-    let mut rest: Vec<Value> = if messages.len() > 1 {
-        messages.split_off(1)
+    let task = messages.get(1).cloned();
+    let mut rest: Vec<Value> = if messages.len() > 2 {
+        messages.split_off(2)
     } else {
         Vec::new()
     };
+    let anchor_est = system
+        .as_ref()
+        .map(|s| estimate_tokens(std::slice::from_ref(s)))
+        .unwrap_or(0)
+        + task
+            .as_ref()
+            .map(|t| estimate_tokens(std::slice::from_ref(t)))
+            .unwrap_or(0);
     let mut dropped = 0usize;
-    while rest.len() > 1 && estimate_tokens(&rest) > prompt_budget {
+    // Drop until the WHOLE fitted prompt (anchors + tail) fits — the
+    // budget applies to what goes on the wire, not just the tail.
+    while rest.len() > 1 && anchor_est + estimate_tokens(&rest) > prompt_budget {
         rest.remove(0);
         dropped += 1;
     }
-    let mut out: Vec<Value> = system.into_iter().collect();
+    let mut out: Vec<Value> = system.into_iter().chain(task).collect();
+    if dropped > 0 {
+        out.push(json!({
+            "role": "user",
+            "content": format!("[{dropped} earlier message(s) were compacted away to fit the context window — their contents are gone; reason from the task and the remaining history]")
+        }));
+    }
     out.extend(rest);
-    (out, dropped)
+    (out, dropped, elided)
+}
+
+/// Elide a message's oversized text in place: keep head + tail, drop
+/// the middle, mark the elision. Applies to string content and to the
+/// text blocks inside array-shaped content. Returns whether it
+/// actually shrank anything.
+fn elide_message(msg: &mut Value) -> bool {
+    fn elide(s: &str) -> Option<String> {
+        if s.len() <= ELIDED_KEEP_CHARS * 2 {
+            return None;
+        }
+        // char-boundary-safe head + tail: byte offsets can split a
+        // multibyte char (CJK tool output hits this constantly).
+        let mut head_end = ELIDED_KEEP_CHARS;
+        while head_end > 0 && !s.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let head = &s[..head_end];
+        let mut start = s.len() - ELIDED_KEEP_CHARS;
+        while start < s.len() && !s.is_char_boundary(start) {
+            start += 1;
+        }
+        let tail = &s[start..];
+        Some(format!(
+            "{head}\n[…{} bytes elided…]\n{tail}",
+            s.len() - (head.len() + tail.len())
+        ))
+    }
+    let mut changed = false;
+    match msg.get_mut("content") {
+        Some(Value::String(s)) => {
+            if let Some(e) = elide(s) {
+                *s = e;
+                changed = true;
+            }
+        }
+        Some(Value::Array(arr)) => {
+            for b in arr.iter_mut() {
+                if let Some(Value::String(s)) = b.get_mut("text") {
+                    if let Some(e) = elide(s) {
+                        *s = e;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 /// True when a backend error is the deterministic "prompt + max_tokens
@@ -1317,7 +1419,8 @@ async fn fit_and_call(
     let out_want = config_output_budget(&state.config)
         .min(budget.saturating_sub(MIN_OUTPUT_TOKENS))
         .max(MIN_OUTPUT_TOKENS.min(budget));
-    let (mut msgs, dropped) = compact_for_context(messages, budget.saturating_sub(out_want));
+    let (mut msgs, dropped, mut elided_total) =
+        compact_for_context(messages, budget.saturating_sub(out_want));
     let mut dropped_total = dropped;
 
     let send = |cfg_max: Option<u64>, msgs: &[Value]| {
@@ -1349,15 +1452,16 @@ async fn fit_and_call(
                 }
                 _ => budget / 2,
             };
-            let (m2, d2) = compact_for_context(msgs.clone(), target.max(1));
+            let (m2, d2, e2) = compact_for_context(msgs.clone(), target.max(1));
             msgs = m2;
             dropped_total += d2;
-            if dropped_total > 0 {
+            elided_total += e2;
+            if dropped_total + elided_total > 0 {
                 if let Some(s) = state.sessions_write().get_mut(session_id) {
                     s.messages = msgs.clone();
                 }
                 notify(Notification::TextChunk(format!(
-                    "\n\n*[context] dropped {dropped_total} oldest message(s) — prompt no longer fits the {}-token window; earliest history compacted*",
+                    "\n\n*[context] compacted history ({dropped_total} message(s) dropped, {elided_total} elided) — prompt no longer fits the {}-token window; earliest history compressed*",
                     state.config.context_size
                 )));
             }
@@ -1368,12 +1472,12 @@ async fn fit_and_call(
             send(Some(eff2), &msgs).await
         }
         r => {
-            if dropped_total > 0 {
+            if dropped_total + elided_total > 0 {
                 if let Some(s) = state.sessions_write().get_mut(session_id) {
                     s.messages = msgs;
                 }
                 notify(Notification::TextChunk(format!(
-                    "\n\n*[context] dropped {dropped_total} oldest message(s) — prompt exceeded the {}-token window; earliest history compacted*",
+                    "\n\n*[context] compacted history ({dropped_total} message(s) dropped, {elided_total} elided) — prompt exceeded the {}-token window; earliest history compressed*",
                     state.config.context_size
                 )));
             }
@@ -1642,16 +1746,22 @@ mod tests {
             json!({"role":"assistant","content":"b".repeat(4000)}),
             json!({"role":"user","content":"c".repeat(100)}),
         ];
-        // ~2025 token est (8100 chars/4). Budget 1100 → the oldest
-        // 4000-char message drops; the remaining 1025 fits.
-        let (fitted, dropped) = compact_for_context(msgs, 1100);
+        // ~2025 token est (8100 chars/4). Budget 900: elision is too
+        // small to elide (4KB max) → the oldest non-anchor message
+        // drops; system + task anchors + tail survive.
+        let (fitted, dropped, _) = compact_for_context(msgs, 900);
         assert_eq!(dropped, 1);
-        assert_eq!(fitted.len(), 3);
         assert_eq!(fitted[0]["role"], "system");
-        assert_eq!(fitted[2]["content"], "c".repeat(100));
+        assert_eq!(fitted[1]["content"], "a".repeat(4000)); // task anchor
+                                                            // marker + remaining tail
+        assert!(fitted.iter().any(|m| m["content"]
+            .as_str()
+            .map(|s| s.contains("compacted away"))
+            .unwrap_or(false)));
+        assert_eq!(fitted.last().unwrap()["content"], "c".repeat(100));
         // Under budget → untouched.
         let msgs2 = vec![json!({"role":"system","content":"s"})];
-        let (f2, d2) = compact_for_context(msgs2, 500);
+        let (f2, d2, _) = compact_for_context(msgs2, 500);
         assert_eq!(d2, 0);
         assert_eq!(f2.len(), 1);
     }

@@ -1582,15 +1582,10 @@ async fn test_context_overflow_compacts_and_retries() {
                 let recorded = recorded.clone();
                 async move {
                     let msgs = body["messages"].as_array().cloned().unwrap_or_default();
-                    let chars: usize = msgs
-                        .iter()
-                        .map(|m| m["content"].as_str().map(|s| s.len()).unwrap_or(0))
-                        .sum();
-                    recorded.lock().unwrap().push(chars);
-                    // Deterministic trigger: the full accumulated history
-                    // (system + p1 user + p1 reply + p2 user = 4 msgs)
-                    // is "too long"; the compacted retry (≤3) passes.
-                    if msgs.len() >= 4 {
+                    recorded.lock().unwrap().push(msgs.len());
+                    // Deterministic trigger: a 5+ message prompt is
+                    // "too long"; the compacted retry has fewer.
+                    if msgs.len() >= 5 {
                         // Real-world llama.cpp rejection shape — the
                         // 400 status is what classifies it BadRequest.
                         return (
@@ -1618,23 +1613,25 @@ async fn test_context_overflow_compacts_and_retries() {
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
-    // Prompt 1: fat user text lands in history (~3200 chars — under
-    // the 6000-char mock threshold, so it answers fine).
-    let fat = "x".repeat(3000);
-    h.send(&json!({
-        "jsonrpc":"2.0","id":2,"method":"session/prompt",
-        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":fat}]}
-    }));
-    let (_, r1) = h.read_until_response(2);
-    assert_eq!(r1["result"]["status"], "completed");
+    // Two normal prompts build history; the first user message is the
+    // task anchor — compaction must NEVER drop it.
+    for (id, text) in [(2u64, "first task"), (3, "second")] {
+        h.send(&json!({
+            "jsonrpc":"2.0","id":id,"method":"session/prompt",
+            "params":{"sessionId":&sid,"prompt":[{"type":"text","text":text}]}
+        }));
+        let (_, r) = h.read_until_response(id);
+        assert_eq!(r["result"]["status"], "completed");
+    }
 
-    // Prompt 2: history ~6600 chars → backend rejects the full
-    // prompt; the retry must arrive compacted and succeed.
+    // Prompt 3: history is now 6 messages (sys + u1/a1 + u2/a2 + u3)
+    // → backend rejects it; the retry must arrive compacted (<5 msgs)
+    // and succeed.
     h.send(&json!({
-        "jsonrpc":"2.0","id":3,"method":"session/prompt",
+        "jsonrpc":"2.0","id":4,"method":"session/prompt",
         "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"more"}]}
     }));
-    let (notif, r2) = h.read_until_response(3);
+    let (notif, r2) = h.read_until_response(4);
     assert_eq!(
         r2["result"]["status"],
         "completed",
@@ -1643,7 +1640,7 @@ async fn test_context_overflow_compacts_and_retries() {
     );
     let joined = serde_json::to_string(&notif).unwrap();
     assert!(
-        joined.contains("[context] dropped"),
+        joined.contains("[context] compacted"),
         "compaction must be announced: {joined}"
     );
     let sizes = seen.lock().unwrap();
@@ -1653,8 +1650,8 @@ async fn test_context_overflow_compacts_and_retries() {
     );
     let last = sizes[sizes.len() - 1];
     assert!(
-        last < 3000,
-        "retry should carry a compacted prompt, got {last} chars (all: {sizes:?})"
+        last < 5,
+        "retry should carry a compacted prompt, got {last} messages (all: {sizes:?})"
     );
     h.shutdown();
 }
