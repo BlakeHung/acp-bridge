@@ -51,6 +51,8 @@ spec-shaped v2 payloads.
 | `session/cancel` notification | ✅ | Aborts active LLM requests and reports cancellation on both wire versions. Synchronous tools finish before cancellation takes effect |
 | `session/end` (v1) / `session/close` (v2 baseline) | ✅ | Removes the session and frees its history. Both methods share the same implementation |
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |
+| `session/new` cwd | ✅ | `cwd` is canonicalized and must name an existing directory; anything else is rejected with `-32602` (`data.reason` carries the validation failure). The working directory is never silently rewritten |
+| Prompt result `status` | ✅ | Three values: `completed` (model answered within budget), `partial` (tool budget exhausted — model answered via a forced wrap-up; `stopReason: max_turn_requests`), `failed` (error or no usable answer). Automation should branch on `partial` vs `completed`, not on the presence of text |
 | Streaming `agent_message_chunk` | ✅ | Typed `content: {type: "text", text: …}`. v1 and v2 use the same discriminator |
 | `agent_thought_chunk` | ✅ | Typed `content: {type: "text", text: ""}` — emitted so Clients render the thought bubble |
 | `tool_call` (v1) / `tool_call_update` (v1 + v2) | ✅ | Carries the required `toolCallId`, `title`, `kind`, `status`. v1 Clients see `tool_call`; v2 Clients see only `tool_call_update` with `status: "in_progress"` |
@@ -85,6 +87,22 @@ spec-shaped v2 payloads.
 | Image content blocks (`ContentBlock::Image`) | Off by default. With support off, image blocks are **dropped before dispatch** and the Client gets a visible text notice (`[note: image content was removed…]`) instead of a provider 400 | Set `LLM_SUPPORTS_IMAGE=true` or `[llm].supports_image = true` |
 | `session/prompt` with audio / embedded resource content | Not parsed; audio/resource blocks are silently dropped from the prompt | Out of scope; document if you need it |
 | `mcpServers` on `session/new` | Accepted for spec compatibility but **not relayed** to the underlying LLM. The agent uses its own built-in tool set | Future work; tracked but not scheduled |
+
+## Configuration contract
+
+Configuration is strict — startup fails (exit code 2) rather than
+silently defaulting when:
+
+- the TOML config file is unreadable or does not parse,
+- the file contains an unknown section or field (`deny_unknown_fields`
+  on every table — a config written for fields this binary does not know
+  is a config error, not a forward-compat hint),
+- a present `LLM_*` env var does not parse (non-numeric port/timeout,
+  non-boolean flags, non-finite temperature, …).
+
+Env vars override file values; an absent env var or missing config file
+falls back to documented defaults. See `config.toml.example` for the
+accepted fields.
 
 ## Deliberately not implemented
 
