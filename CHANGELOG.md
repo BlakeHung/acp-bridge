@@ -9,6 +9,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 - `session/cancel` aborts an active ACP prompt and reports cancellation on both wire versions; concurrent prompts for one session are rejected; a cancelled turn is closed in history with a `[cancelled by user]` reply; an LLM response cut off mid-body is retried once.
+- Recovery path no longer pushes the raw assistant response into history twice, and recovered tool calls are recorded on the assistant message they belong to so `embedded_*` tool results are not orphaned.
+- `session/new` validates `cwd` by canonicalizing it and requiring an existing directory; invalid paths are rejected with `-32602` instead of being silently character-filtered (which mangled Windows paths like `C:\tools\proj`).
+- `session/prompt` drops image content blocks when image support is disabled (`LLM_SUPPORTS_IMAGE` unset/false) and emits a visible notice, instead of forwarding them and surfacing a provider HTTP 400.
+
+### Changed
+- **Configuration is now strict.** An unreadable or unparseable TOML config file, an unknown section/field, or a present-but-invalid `LLM_*` env var is a startup error (exit code 2) instead of a silent fallback to defaults. `LlmConfig::from_env` and `ConfigFile::into_llm_config` return `Result`. Old configs that only used documented fields are unaffected; configs written for future fields (e.g. `[permissions]`) must now be updated or the binary refuses to start.
 
 ## [0.9.2] - 2026-10-06
 

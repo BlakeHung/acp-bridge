@@ -25,7 +25,19 @@ and emits the corresponding wire shape for every notification and method.
 The two wire surfaces are not a separate feature flag — every notification
 goes through `acp::notify_*_for(version, …)` dispatchers. v1 Clients
 see no behavior change from previous versions; v2 Clients receive
-spec-compliant v2 payloads.
+spec-shaped v2 payloads.
+
+> **v2 spec pin (2026-11-24).** The v2 documents at
+> `agentclientprotocol.com/protocol/v2/` were evaluated on 2026-11-24 —
+> the spec site publishes no versioned snapshot, so "current v2" here means
+> "the site content on that date". Under that revision, advertising
+> `capabilities.session` carries three baseline requirements acp-bridge
+> does **not** yet meet: `session/resume` support, `idempotencyKey`
+> dedup on `session/prompt`, and `state_update` reporting `running`
+> when foreground work starts. v2 also requires accepting or holding
+> prompts during active work — acp-bridge currently rejects with
+> `turn_in_progress` instead. These are tracked gaps, not bugs; treat
+> the v2 wire as preview-quality until they close.
 
 ## Supported
 
@@ -35,7 +47,7 @@ spec-compliant v2 payloads.
 |---|---|---|
 | `initialize` | ✅ | Negotiates v1/v2; emits the corresponding `agentCapabilities` + `agentInfo` shape (v1) or `capabilities` + `info` shape (v2) |
 | `session/new` | ✅ | Multi-session with per-session conversation history. `mcpServers` accepted but ignored (acp-bridge does not relay MCP) |
-| `session/prompt` | ✅ | Streaming via SSE → `session/update` notifications. v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` (per schema) |
+| `session/prompt` | ✅ | Progress via `session/update` notifications (thinking, tool calls, answer chunks). v1 final response carries `stopReason` (`end_turn` / `max_turn_requests`). v2 final response carries `messageId` and the turn end is reported via `state_update` |
 | `session/cancel` notification | ✅ | Aborts active LLM requests and reports cancellation on both wire versions. Synchronous tools finish before cancellation takes effect |
 | `session/end` (v1) / `session/close` (v2 baseline) | ✅ | Removes the session and frees its history. Both methods share the same implementation |
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |
@@ -70,7 +82,7 @@ spec-compliant v2 payloads.
 
 | ACP surface | Caveat | How to enable |
 |---|---|---|
-| Image content blocks (`ContentBlock::Image`) | Off by default. Turning it on without a vision-capable backend causes Clients (Meuxe, ACP UI, …) to forward images that the LLM cannot parse | Set `LLM_SUPPORTS_IMAGE=true` or `[llm].supports_image = true` |
+| Image content blocks (`ContentBlock::Image`) | Off by default. With support off, image blocks are **dropped before dispatch** and the Client gets a visible text notice (`[note: image content was removed…]`) instead of a provider 400 | Set `LLM_SUPPORTS_IMAGE=true` or `[llm].supports_image = true` |
 | `session/prompt` with audio / embedded resource content | Not parsed; audio/resource blocks are silently dropped from the prompt | Out of scope; document if you need it |
 | `mcpServers` on `session/new` | Accepted for spec compatibility but **not relayed** to the underlying LLM. The agent uses its own built-in tool set | Future work; tracked but not scheduled |
 

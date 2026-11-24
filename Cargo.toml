@@ -10,6 +10,21 @@ homepage = "https://wchung.tw/acp-bridge/"
 keywords = ["acp", "ollama", "local-ai", "agent-protocol"]
 categories = ["command-line-utilities"]
 
+# crates.io contents: only what someone needs to build and verify the
+# crate. Planning docs, reports, marketing files and website assets stay
+# out of the package (they live in the repo, untracked).
+include = [
+    "src/**",
+    "tests/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "config.toml.example",
+    "docs/scope.md",
+]
+
 [lib]
 name = "acp_bridge"
 path = "src/lib.rs"
