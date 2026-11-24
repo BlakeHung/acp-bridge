@@ -262,6 +262,7 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_MODEL_CONTEXT` | `32768` | Actual server context window. Request estimates include message metadata, tool arguments and schemas; successful provider usage calibrates the estimate. Output and a 512-token safety margin are reserved before dispatch. |
 | `LLM_AUTO_SUMMARIZE` | `true` | Summarize older history using the same backend without tools. Failure falls back to deterministic tool-output elision and group pruning; four calls elapse before another summary attempt. |
 | `LLM_SUMMARIZE_AT` | `0.6` | Summary trigger as a fraction of the available prompt budget (finite value from 0.1 to 0.95). TOML: `llm.summarize_at`. |
+| `LLM_ARTIFACT_CHARS` | `8192` | Inline budget per tool result. Larger outputs are written to `{LLM_SESSION_DIR}/artifacts/<session>/<call>.txt` and history keeps a head excerpt plus a `read_file` pointer. Without `LLM_SESSION_DIR` outputs truncate at this size. |
 | `LLM_MAX_TOOL_ROUNDS` | `50` | Max model↔tool round-trips per turn before the bounded wrap-up path runs (aligned with openab-agent's default) |
 | `LLM_TOOL_TIMEOUT` | `120` | Per-tool wall-clock timeout in seconds; bash/git/web_fetch processes are killed (with their process group) on expiry |
 | `LLM_TURN_TIMEOUT` | `0` | Whole-turn deadline in seconds (0 = no limit) |

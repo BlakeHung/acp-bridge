@@ -66,6 +66,9 @@ pub struct LlmSection {
     pub tool_failure_streak: Option<usize>,
     pub auto_summarize: Option<bool>,
     pub summarize_at: Option<f64>,
+    /// Inline budget per tool result. Mirrors `LLM_ARTIFACT_CHARS`.
+    #[serde(default)]
+    pub artifact_inline_chars: Option<usize>,
 }
 
 impl ConfigFile {
@@ -200,6 +203,9 @@ impl ConfigFile {
                 .or(file.auto_summarize)
                 .unwrap_or(true),
             auto_summarize_at: crate::llm::summarize_threshold(file.summarize_at)?,
+            artifact_inline_chars: env_parse("LLM_ARTIFACT_CHARS")?
+                .or(file.artifact_inline_chars)
+                .unwrap_or(8192),
             client,
         };
         Ok((llm, policy))

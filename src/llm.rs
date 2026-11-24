@@ -648,6 +648,13 @@ pub struct LlmConfig {
     pub auto_summarize: bool,
     /// Fraction of the prompt budget that triggers summarization (0.1-0.95).
     pub auto_summarize_at: f64,
+    /// Inline budget for a single tool result. Outputs past this are
+    /// written to a session artifact file and history keeps a head
+    /// excerpt plus a `read_file` pointer — Kiro/OpenCode-style
+    /// "file the evidence, keep the pointer" instead of truncating.
+    /// Requires `LLM_SESSION_DIR`; without persistence the old
+    /// hard-truncation path runs. `LLM_ARTIFACT_CHARS`, default 8192.
+    pub artifact_inline_chars: usize,
     /// Shared HTTP client for connection pooling.
     pub client: Client,
 }
@@ -724,6 +731,7 @@ impl LlmConfig {
             tool_failure_streak: env_parse("LLM_TOOL_FAILURE_STREAK")?.unwrap_or(3),
             auto_summarize: env_parse_bool("LLM_AUTO_SUMMARIZE")?.unwrap_or(true),
             auto_summarize_at: summarize_threshold(None)?,
+            artifact_inline_chars: env_parse("LLM_ARTIFACT_CHARS")?.unwrap_or(8192),
             client,
         })
     }
@@ -1294,6 +1302,7 @@ mod tests {
             tool_failure_streak: 3,
             auto_summarize: true,
             auto_summarize_at: 0.6,
+            artifact_inline_chars: 8192,
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()

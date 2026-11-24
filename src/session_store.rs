@@ -59,6 +59,14 @@ impl SessionStore {
         Some(Self { dir })
     }
 
+    /// Direct constructor — `from_env` is the production path; tests and
+    /// embedders that already hold a validated dir can build one here.
+    /// Creates the dir if missing.
+    pub fn new(dir: PathBuf) -> io::Result<Self> {
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
     /// Session ids are UUIDs in practice, but we validate strictly —
     /// ANY character outside `[A-Za-z0-9_-]` rejects the id outright.
     /// Silently stripping characters would let two different hostile
@@ -147,17 +155,87 @@ impl SessionStore {
     }
 
     fn store_usage(&self) -> (usize, u64) {
-        let mut files = 0usize;
-        let mut bytes = 0u64;
-        if let Ok(rd) = std::fs::read_dir(&self.dir) {
-            for e in rd.flatten() {
-                if let Ok(m) = e.metadata() {
-                    files += 1;
-                    bytes += m.len();
+        // Recursive: artifacts live in a subdir and must count toward
+        // the same cumulative quotas — otherwise offloading becomes a
+        // quota bypass (G1a-Q1).
+        fn walk(dir: &std::path::Path, files: &mut usize, bytes: &mut u64) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let Ok(m) = e.metadata() else { continue };
+                    if m.is_dir() {
+                        walk(&e.path(), files, bytes);
+                    } else {
+                        *files += 1;
+                        *bytes += m.len();
+                    }
                 }
             }
         }
+        let (mut files, mut bytes) = (0usize, 0u64);
+        walk(&self.dir, &mut files, &mut bytes);
         (files, bytes)
+    }
+
+    /// Store root — engine needs it to bound artifact re-reads.
+    pub fn root(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Per-session artifact directory (offloaded tool outputs).
+    /// Created lazily on first write; `None` for hostile ids.
+    pub fn artifact_dir(&self, session_id: &str) -> Option<PathBuf> {
+        Self::safe_name(session_id).map(|n| self.dir.join("artifacts").join(n))
+    }
+
+    /// Persist an oversized tool output so the model can re-read it
+    /// instead of carrying the whole payload in history. Same quota
+    /// contract as snapshots: over-limit writes fail closed (caller
+    /// falls back to truncation), never a half file — tmp+rename+fsync.
+    pub fn write_artifact(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        content: &str,
+    ) -> Option<PathBuf> {
+        let dir = self.artifact_dir(session_id)?;
+        if content.len() as u64 > Self::MAX_SNAPSHOT_BYTES {
+            warn!(
+                session_id,
+                bytes = content.len(),
+                "artifact exceeds per-file quota; skipped"
+            );
+            return None;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(session_id, error = %e, "artifact dir creation failed");
+            return None;
+        }
+        let (files, bytes) = self.store_usage();
+        if files >= Self::MAX_STORE_FILES || bytes + content.len() as u64 > Self::MAX_STORE_BYTES {
+            warn!(
+                session_id,
+                files, bytes, "artifact write refused: store quota reached"
+            );
+            return None;
+        }
+        // call_id is model-controlled text — sanitize like a session id.
+        let safe_call = Self::safe_name(call_id).unwrap_or_else(|| "call".to_string());
+        let final_path = dir.join(format!("{safe_call}.txt"));
+        let tmp = dir.join(format!("{safe_call}.tmp"));
+        let result = (|| -> io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &final_path)
+        })();
+        match result {
+            Ok(()) => Some(final_path),
+            Err(e) => {
+                warn!(session_id, error = %e, "artifact write failed");
+                let _ = std::fs::remove_file(&tmp);
+                None
+            }
+        }
     }
 
     /// Rewrite the session's snapshot atomically and durably:
@@ -548,6 +626,39 @@ mod tests {
             store.load("sess-9").is_err(),
             "count-mismatched snapshot must load as corrupt"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_store(tag: &str) -> (SessionStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "acp-art-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        (SessionStore { dir: dir.clone() }, dir)
+    }
+
+    #[test]
+    fn artifact_writes_under_session_dir_and_counts_toward_quota() {
+        let (store, dir) = temp_store("quota");
+        let path = store
+            .write_artifact("sess-a", "call-1", &"x".repeat(1000))
+            .expect("artifact write should succeed");
+        assert!(path.starts_with(dir.join("artifacts").join("sess-a")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().len(), 1000);
+        // Artifact bytes are inside the recursive usage walk — no quota bypass.
+        let (_, bytes) = store.store_usage();
+        assert!(bytes >= 1000);
+        // Oversized content is refused outright.
+        assert!(store
+            .write_artifact("sess-a", "big", &"x".repeat(2_000_001))
+            .is_none());
+        // Hostile call ids sanitize, hostile session ids refuse.
+        assert!(store.write_artifact("../escape", "c", "x").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

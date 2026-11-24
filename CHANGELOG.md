@@ -17,6 +17,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Drop tool calls with their results, account for loss markers, and avoid retrying an unchanged overflowing request.
 - Emit classified context diagnostics with estimated/actual sizes and attempt numbers without logging request content.
 
+### Added
+- Tool-output artifacts: results past `LLM_ARTIFACT_CHARS` (default 8192) are written to `{LLM_SESSION_DIR}/artifacts/<session>/<call>.txt` (tmp+rename+fsync, inside the recursive store quota) and history keeps a head excerpt plus a re-readable `read_file` pointer. `read_file` accepts absolute paths only inside the session artifact root — every other absolute path stays denied. Without `LLM_SESSION_DIR` outputs truncate at the same budget.
+
 ## [0.10.0] - 2026-11-24
 
 First slice of the agent-harness hardening plan (P0–P1): the bridge grows

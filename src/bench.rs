@@ -337,6 +337,7 @@ mod tests {
             tool_failure_streak: 3,
             auto_summarize: true,
             auto_summarize_at: 0.6,
+            artifact_inline_chars: 8192,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()

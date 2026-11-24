@@ -936,6 +936,10 @@ pub async fn session_prompt(
                     };
                     let policy_denied =
                         matches!(decision, crate::policy::Decision::Deny(_)) && permit_id.is_none();
+                    let artifact_root = state
+                        .session_store
+                        .as_ref()
+                        .and_then(|s| s.artifact_dir(session_id));
                     let result = if let Some(pid) = &permit_id {
                         notify(Notification::TextChunk(format!(
                             "\n\n*[policy:permit] consumed {pid} — '{name}' authorized for this call only*"
@@ -946,6 +950,7 @@ pub async fn session_prompt(
                             &args,
                             tool_timeout_secs,
                             &state.policy.deny_path_globs,
+                            artifact_root.as_deref(),
                         )
                         .await
                     } else {
@@ -966,6 +971,7 @@ pub async fn session_prompt(
                                     &args,
                                     tool_timeout_secs,
                                     &state.policy.deny_path_globs,
+                                    artifact_root.as_deref(),
                                 )
                                 .await
                             }
@@ -1017,12 +1023,18 @@ pub async fn session_prompt(
                         fail_count = 0;
                     }
 
+                    // Boundary optimization: file oversized outputs to a
+                    // session artifact and keep a pointer instead of
+                    // dragging the full payload through every later call.
+                    let result_text =
+                        offload_tool_output(state, session_id, tool_call_id, result.text);
+
                     {
                         let mut sessions = state.sessions_write();
                         if let Some(session) = sessions.get_mut(session_id) {
                             session
                                 .messages
-                                .push(backend.format_tool_result(tool_call_id, &result.text));
+                                .push(backend.format_tool_result(tool_call_id, &result_text));
                         }
                     }
 
@@ -1462,6 +1474,49 @@ async fn fit_and_call(
         }
     }
     unreachable!("bounded retry returns on the second attempt")
+}
+
+/// Boundary optimization (Kiro/OpenCode "file the evidence, keep the
+/// pointer"): a tool result past `LLM_ARTIFACT_CHARS` is written to the
+/// session artifact dir and history carries a head excerpt plus the
+/// absolute path — the model re-reads slices via `read_file` instead of
+/// paying full price every later call. Quota/IO failure or a missing
+/// store falls back to plain truncation — the tool answer still lands.
+fn offload_tool_output(
+    state: &AppState,
+    session_id: &str,
+    tool_call_id: &str,
+    text: String,
+) -> String {
+    let inline = state.config.artifact_inline_chars;
+    if text.len() <= inline {
+        return text;
+    }
+    let Some(store) = &state.session_store else {
+        let mut t = text;
+        crate::tools::truncate_utf8(&mut t, inline);
+        t.push_str(
+            "\n\n[...truncated; set LLM_SESSION_DIR to keep full outputs as re-readable artifacts]",
+        );
+        return t;
+    };
+    let Some(path) = store.write_artifact(session_id, tool_call_id, &text) else {
+        let mut t = text;
+        crate::tools::truncate_utf8(&mut t, inline);
+        t.push_str("\n\n[...truncated; artifact quota/storage refused the full output]");
+        return t;
+    };
+    // Head excerpt: enough for the "what ran and what came back"
+    // skeleton without paying the full price.
+    let head = inline / 4;
+    let mut t = text;
+    let total = t.len();
+    crate::tools::truncate_utf8(&mut t, head);
+    t.push_str(&format!(
+        "\n\n[artifact: full output ({total} bytes) saved to {} — call read_file with this absolute path for the rest]",
+        path.display()
+    ));
+    t
 }
 
 /// Response budget for the next call: configured `LLM_MAX_TOKENS` or
@@ -1953,6 +2008,7 @@ mod tests {
             tool_failure_streak: 3,
             auto_summarize: true,
             auto_summarize_at: 0.6,
+            artifact_inline_chars: 8192,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
@@ -2236,6 +2292,38 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 2);
         server.abort();
     }
+    #[test]
+    fn offload_keeps_pointer_when_store_present_and_truncates_without() {
+        let mut cfg = cfg_with_image(false);
+        cfg.artifact_inline_chars = 200;
+        let no_store = AppState::new(cfg.clone());
+        let out = offload_tool_output(&no_store, "s1", "c1", "x".repeat(1000));
+        assert!(out.contains("[...truncated; set LLM_SESSION_DIR"));
+        assert!(out.len() < 400);
+
+        let dir = std::env::temp_dir().join(format!(
+            "acp-offload-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = crate::session_store::SessionStore::new(dir.clone()).unwrap();
+        let base = AppState::new(cfg);
+        let state = AppState {
+            session_store: Some(std::sync::Arc::new(store)),
+            ..(*base).clone()
+        };
+        let out = offload_tool_output(&state, "sess-art", "call-9", "y".repeat(1000));
+        assert!(out.contains("[artifact: full output (1000 bytes) saved to"));
+        assert!(out.contains("read_file"));
+        // The artifact round-trips through the store path the pointer names.
+        let saved = dir.join("artifacts").join("sess-art").join("call-9.txt");
+        assert_eq!(std::fs::read_to_string(&saved).unwrap().len(), 1000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn context_does_not_retry_an_identical_request() {
         let (url, server, calls) = context_backend(false, true).await;

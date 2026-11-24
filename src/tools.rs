@@ -84,7 +84,7 @@ impl From<ToolResult> for String {
 /// Truncate a string to at most `max` bytes without splitting a UTF-8
 /// code point. `String::truncate` panics when the cut lands mid-char —
 /// tool output in CJK hits that panic path.
-fn truncate_utf8(s: &mut String, max: usize) {
+pub(crate) fn truncate_utf8(s: &mut String, max: usize) {
     if s.len() <= max {
         return;
     }
@@ -328,7 +328,23 @@ pub fn tool_definitions() -> Vec<Value> {
 
 /// Resolve and validate a path within the sandbox.
 /// Returns None if the path escapes the working directory.
-fn resolve_sandboxed_path(working_dir: &Path, relative_path: &str) -> Option<PathBuf> {
+fn resolve_sandboxed_path(
+    working_dir: &Path,
+    relative_path: &str,
+    artifact_root: Option<&Path>,
+) -> Option<PathBuf> {
+    // Absolute paths are only allowed when they resolve inside the
+    // session artifact root (offloaded tool outputs the model may
+    // re-read). Everything else stays workspace-relative — an absolute
+    // path that escapes both roots is rejected, never clamped.
+    if relative_path.starts_with('/') {
+        let canonical = std::path::PathBuf::from(relative_path)
+            .canonicalize()
+            .ok()?;
+        let root = artifact_root?.canonicalize().ok()?;
+        return canonical.starts_with(&root).then_some(canonical);
+    }
+
     // Normalize: strip leading slashes to force relative
     let cleaned = relative_path.trim_start_matches('/');
     let full = working_dir.join(cleaned);
@@ -374,20 +390,26 @@ fn resolve_sandboxed_path(working_dir: &Path, relative_path: &str) -> Option<Pat
 ///
 /// An empty slice means "no path denies" — shell tools ignore it
 /// entirely: a command string can't be path-filtered honestly.
+/// `artifact_root` is the session artifact directory (offloaded tool
+/// outputs). `read_file` may take an absolute path that canonicalizes
+/// inside it — the only escape allowed past the workspace root.
 pub async fn execute_tool(
     working_dir: &Path,
     name: &str,
     arguments: &Value,
     timeout_secs: u64,
     deny_globs: &[String],
+    artifact_root: Option<&Path>,
 ) -> ToolResult {
     match name {
         "read_file" => {
             let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(e) = path_denied(path, deny_globs) {
-                return e;
+            if !path.starts_with('/') {
+                if let Some(e) = path_denied(path, deny_globs) {
+                    return e;
+                }
             }
-            execute_read_file(working_dir, path)
+            execute_read_file(working_dir, path, artifact_root)
         }
         "list_dir" => {
             let path = arguments
@@ -536,8 +558,12 @@ pub async fn execute_tool(
     }
 }
 
-fn execute_read_file(working_dir: &Path, relative_path: &str) -> ToolResult {
-    let Some(path) = resolve_sandboxed_path(working_dir, relative_path) else {
+fn execute_read_file(
+    working_dir: &Path,
+    relative_path: &str,
+    artifact_root: Option<&Path>,
+) -> ToolResult {
+    let Some(path) = resolve_sandboxed_path(working_dir, relative_path, artifact_root) else {
         return ToolResult::err(
             ToolErrorKind::OutOfSandbox,
             format!(
@@ -614,7 +640,7 @@ fn is_denied(rel_path: &str, deny_globs: &[String]) -> bool {
 }
 
 fn execute_list_dir(working_dir: &Path, relative_path: &str, deny_globs: &[String]) -> ToolResult {
-    let Some(path) = resolve_sandboxed_path(working_dir, relative_path) else {
+    let Some(path) = resolve_sandboxed_path(working_dir, relative_path, None) else {
         return ToolResult::err(
             ToolErrorKind::OutOfSandbox,
             format!(
@@ -1367,7 +1393,7 @@ fn execute_edit(
     }
 
     // Use the same sandbox resolver as read_file so we cannot escape.
-    let Some(path) = resolve_sandboxed_path(working_dir, relative_path) else {
+    let Some(path) = resolve_sandboxed_path(working_dir, relative_path, None) else {
         return ToolResult::err(
             ToolErrorKind::OutOfSandbox,
             format!(
@@ -2124,5 +2150,64 @@ mod tests {
             result.text.len()
         );
         let _ = fs::remove_dir_all(&wd);
+    }
+
+    #[tokio::test]
+    async fn read_file_absolute_path_bounded_to_artifact_root() {
+        let wd = tmpwd();
+        let art = tmpwd();
+        std::fs::write(art.join("call-1.txt"), "artifact body").unwrap();
+        std::fs::write(wd.join("local.txt"), "local").unwrap();
+
+        // Inside the artifact root: allowed.
+        let ok = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": art.join("call-1.txt").to_string_lossy()}),
+            5,
+            &[],
+            Some(&art),
+        )
+        .await;
+        assert_eq!(ok.text, "artifact body");
+
+        // Outside it: rejected, even though the file exists.
+        let dir = tmpwd();
+        std::fs::write(dir.join("secret.txt"), "nope").unwrap();
+        let denied = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": dir.join("secret.txt").to_string_lossy()}),
+            5,
+            &[],
+            Some(&art),
+        )
+        .await;
+        assert!(denied.error_kind.is_some());
+        // Traversal out of the artifact root is also rejected.
+        let trav = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": format!("{}/../local.txt", art.display())}),
+            5,
+            &[],
+            Some(&art),
+        )
+        .await;
+        assert!(trav.error_kind.is_some());
+        // Without an artifact root every absolute path is refused.
+        let no_root = execute_tool(
+            &wd,
+            "read_file",
+            &json!({"path": art.join("call-1.txt").to_string_lossy()}),
+            5,
+            &[],
+            None,
+        )
+        .await;
+        assert!(no_root.error_kind.is_some());
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&art);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

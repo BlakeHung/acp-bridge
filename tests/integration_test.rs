@@ -2071,6 +2071,7 @@ async fn test_tool_sandbox_prevents_escape() {
         &json!({"path": "../../etc/passwd"}),
         30,
         &[],
+        None,
     )
     .await;
     assert!(
@@ -2089,8 +2090,15 @@ async fn test_tool_read_file() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("test.txt"), "hello from test file").unwrap();
 
-    let result =
-        tools::execute_tool(&dir, "read_file", &json!({"path": "test.txt"}), 30, &[]).await;
+    let result = tools::execute_tool(
+        &dir,
+        "read_file",
+        &json!({"path": "test.txt"}),
+        30,
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(result.text, "hello from test file");
 
     // Cleanup
@@ -2109,8 +2117,15 @@ async fn test_tool_search_code() {
     )
     .unwrap();
 
-    let result =
-        tools::execute_tool(&dir, "search_code", &json!({"pattern": "println"}), 30, &[]).await;
+    let result = tools::execute_tool(
+        &dir,
+        "search_code",
+        &json!({"pattern": "println"}),
+        30,
+        &[],
+        None,
+    )
+    .await;
     assert!(
         result.text.contains("main.rs") && result.text.contains("println"),
         "Should find pattern in file, got: {}",
@@ -2126,8 +2141,15 @@ async fn test_tool_unknown() {
     use acp_bridge::tools;
     use std::path::Path;
 
-    let result =
-        tools::execute_tool(Path::new("/tmp"), "hack_the_planet", &json!({}), 30, &[]).await;
+    let result = tools::execute_tool(
+        Path::new("/tmp"),
+        "hack_the_planet",
+        &json!({}),
+        30,
+        &[],
+        None,
+    )
+    .await;
     assert!(result.text.contains("Unknown tool"));
 }
 
