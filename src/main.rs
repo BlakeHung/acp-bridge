@@ -86,8 +86,9 @@ async fn main() {
     let config_path = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
 
     let config_result = match &config_path {
-        Some(path) => ConfigFile::load(std::path::Path::new(path))
-            .and_then(|file| file.into_llm_config()),
+        Some(path) => {
+            ConfigFile::load(std::path::Path::new(path)).and_then(|file| file.into_llm_config())
+        }
         None => llm::LlmConfig::from_env(),
     };
 

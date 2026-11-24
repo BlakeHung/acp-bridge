@@ -93,9 +93,16 @@ impl ConfigFile {
             .ok()
             .or(file.system_prompt);
 
-        let temperature = env_parse::<f64>("LLM_TEMPERATURE")?
-            .or(file.temperature)
-            .filter(|t| t.is_finite());
+        let temperature = env_parse::<f64>("LLM_TEMPERATURE")?.or(file.temperature);
+        if let Some(t) = temperature {
+            if !t.is_finite() {
+                return Err(ConfigError::InvalidEnv {
+                    var: "LLM_TEMPERATURE",
+                    value: t.to_string(),
+                    reason: "must be finite".into(),
+                });
+            }
+        }
 
         let max_tokens = env_parse("LLM_MAX_TOKENS")?.or(file.max_tokens);
 
@@ -115,8 +122,9 @@ impl ConfigFile {
             .or(file.session_idle_timeout_secs)
             .unwrap_or(0);
 
-        let prompt_supports_image =
-            env_parse_bool("LLM_SUPPORTS_IMAGE")?.or(file.supports_image).unwrap_or(false);
+        let prompt_supports_image = env_parse_bool("LLM_SUPPORTS_IMAGE")?
+            .or(file.supports_image)
+            .unwrap_or(false);
 
         let context_size = env_parse("LLM_MODEL_CONTEXT")?
             .or(file.model_context)

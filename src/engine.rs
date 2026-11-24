@@ -698,9 +698,7 @@ pub async fn session_prompt(
                                 "content": text,
                                 "tool_calls": &tool_calls,
                             }),
-                            None => {
-                                backend.format_assistant_message("", &tool_calls, &response)
-                            }
+                            None => backend.format_assistant_message("", &tool_calls, &response),
                         };
                         session.messages.push(assistant_msg);
                     }

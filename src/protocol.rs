@@ -161,7 +161,7 @@ impl AcpError {
             AcpError::MethodNotFound { .. } => -32601, // Method not found
             AcpError::LlmError { .. } => -32003,       // Application error
             AcpError::SessionLimitReached { .. } => -32004, // Application error
-            AcpError::InvalidCwd { .. } => -32602,          // Invalid params
+            AcpError::InvalidCwd { .. } => -32602,     // Invalid params
         }
     }
 }
