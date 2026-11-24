@@ -1303,9 +1303,11 @@ async fn test_tool_round_limit_wraps_up_with_partial_answer() {
     let (_notifications, response) = h.read_until_response(2);
 
     // Exhausting the tool budget no longer hard-fails when the model can
-    // wrap up: the turn completes with a partial answer that discloses the
-    // truncation.
-    assert_eq!(response["result"]["status"], "completed");
+    // wrap up — but the turn must not claim `completed` either. A partial
+    // answer is marked `partial` with `stopReason: max_turn_requests` so
+    // downstream automation can tell it apart from a real completion.
+    assert_eq!(response["result"]["status"], "partial");
+    assert_eq!(response["result"]["stopReason"], "max_turn_requests");
     let text = response["result"]["text"].as_str().unwrap();
     assert!(
         text.contains("Partial findings so far"),

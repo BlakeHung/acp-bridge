@@ -514,7 +514,7 @@ pub fn session_new_post_create_notifications(
 /// Handle `session/prompt` — runs the LLM with tool loop.
 ///
 /// Sends `Notification` events through `notify_tx` as they happen (for ACP streaming).
-/// Returns the final status ("completed" or "failed") and accumulated text.
+/// Returns the final status ("completed", "partial", or "failed") and accumulated text.
 ///
 /// `message_id` is the opaque identifier acp-bridge mints for this
 /// prompt. It is required on the v2 `PromptResponse` and used by v2
@@ -621,6 +621,7 @@ pub async fn session_prompt(
 
     let mut had_error = false;
     let mut got_final_response = false;
+    let mut truncated_by_budget = false;
     let mut final_text = String::new();
     let mut last_error_class: Option<crate::llm::LlmErrorKind> = None;
     let tool_defs = tools::tool_definitions();
@@ -784,9 +785,11 @@ pub async fn session_prompt(
     // The loop can also exit by exhausting MAX_TOOL_ROUNDS while the model
     // keeps requesting tools. Before reporting failure, give the model one
     // final call with no tool definitions: it must answer with what it
-    // has. This converts a hard error into a bounded partial answer while
-    // still disclosing the truncation in the response text. The wrap-up is
-    // not a tool round — no tools are offered or executed.
+    // has. This converts a hard error into a bounded partial answer — the
+    // turn is reported as `partial` (not `completed`) so downstream
+    // automation can distinguish "answered within budget" from "answered
+    // because the budget forced a stop". The wrap-up is not a tool round —
+    // no tools are offered or executed.
     if !had_error && !got_final_response {
         let messages = {
             let sessions = state.sessions_read();
@@ -812,6 +815,7 @@ pub async fn session_prompt(
                         notify(Notification::TextChunk(text.clone()));
                         final_text = text;
                         got_final_response = true;
+                        truncated_by_budget = true;
                     }
                 }
                 Err(e) => {
@@ -834,7 +838,18 @@ pub async fn session_prompt(
         had_error = true;
     }
 
-    let status = if had_error { "failed" } else { "completed" };
+    // `partial` = the turn produced an answer only because the tool
+    // budget forced a wrap-up. It is not a failure (the model did answer)
+    // and it is not `completed` (the model was cut off mid-work); the
+    // wire-level `stopReason: max_turn_requests` carries the same
+    // distinction for Clients that branch on it.
+    let status = if had_error {
+        "failed"
+    } else if truncated_by_budget {
+        "partial"
+    } else {
+        "completed"
+    };
     notify(Notification::ToolDone {
         id: format!("llm_chat:{session_id}"),
         name: "llm_chat".into(),
