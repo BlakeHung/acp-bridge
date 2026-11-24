@@ -585,6 +585,7 @@ pub async fn session_prompt(
         }
     }
 
+    let mut dropped_image_note: Option<String> = None;
     if images_dropped {
         let note = "[note: image content was removed before sending — this endpoint was configured with image support disabled (LLM_SUPPORTS_IMAGE=false).]";
         if user_text.trim().is_empty() {
@@ -606,6 +607,10 @@ pub async fn session_prompt(
             };
         }
         notify(Notification::TextChunk(note.to_string()));
+        // Carry the notice into the final result text too — streamed
+        // chunks are transient, and a Client that only renders the result
+        // must still see that the image never reached the model.
+        dropped_image_note = Some(note.to_string());
     }
 
     notify(Notification::Thinking);
@@ -848,6 +853,11 @@ pub async fn session_prompt(
             .get(session_id)
             .map(|s| estimate_tokens(&s.messages))
             .unwrap_or(0)
+    };
+
+    let final_text = match (&dropped_image_note, had_error, final_text.is_empty()) {
+        (Some(note), false, false) => format!("{note}\n\n{final_text}"),
+        _ => final_text,
     };
 
     PromptResult {

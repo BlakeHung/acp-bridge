@@ -1141,6 +1141,73 @@ async fn mock_chat_completions_tool_until_wrapup(req: Request<Body>) -> impl Int
     }
 }
 
+/// Mock that inspects every chat request for image content and counts both
+/// total calls and how many image parts actually reached the backend. Used
+/// to verify the image-capability gate drops (or forwards) image blocks.
+#[derive(Default)]
+struct ImageInspect {
+    calls: AtomicUsize,
+    image_parts_seen: AtomicUsize,
+}
+
+fn count_image_parts(messages: &Value) -> usize {
+    messages
+        .as_array()
+        .map(|msgs| {
+            msgs.iter()
+                .map(|m| match &m["content"] {
+                    // OpenAI multimodal shape: content is an array of parts
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter(|p| {
+                            matches!(
+                                p["type"].as_str(),
+                                Some("image_url") | Some("image") | Some("input_image")
+                            )
+                        })
+                        .count(),
+                    // ACP-style or string content can't carry image parts —
+                    // a bare `"type":"image"` block in a prompt is dropped or
+                    // rejected before this point.
+                    _ => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn mock_llm_image_inspector_router(inspect: Arc<ImageInspect>) -> Router {
+    Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(move |req: Request<Body>| {
+                let inspect = inspect.clone();
+                async move {
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+                    inspect.calls.fetch_add(1, Ordering::SeqCst);
+                    inspect
+                        .image_parts_seen
+                        .fetch_add(count_image_parts(&body["messages"]), Ordering::SeqCst);
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "Acknowledged."
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags))
+}
+
 /// Mock that always returns a `list_dir` tool call and never a final answer,
 /// forcing the engine's tool loop to exhaust MAX_TOOL_ROUNDS.
 fn mock_llm_always_tool_router() -> Router {
@@ -1247,6 +1314,123 @@ async fn test_tool_round_limit_wraps_up_with_partial_answer() {
     assert!(
         text.contains("tool-call limit") && text.contains("incomplete"),
         "expected truncation disclosure, got: {text}"
+    );
+
+    h.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Image capability gate (B4): image blocks must not reach a backend that
+// was configured without image support.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_image_blocks_dropped_before_backend_when_unsupported() {
+    let port = free_port();
+    let inspect = Arc::new(ImageInspect::default());
+    let mut h =
+        TestHarness::start_with_router(port, mock_llm_image_inspector_router(inspect.clone()))
+            .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Text + image prompt with LLM_SUPPORTS_IMAGE unset (default off).
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[
+            {"type":"text","text":"what is in this image?"},
+            {"type":"image","data":"aGk=","mimeType":"image/png"}
+        ]}
+    }));
+    let (_, response) = h.read_until_response(2);
+
+    assert_eq!(response["result"]["status"], "completed");
+    let text = response["result"]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("image content was removed"),
+        "expected the dropped-image notice, got: {text}"
+    );
+    assert_eq!(
+        inspect.calls.load(Ordering::SeqCst),
+        1,
+        "backend should still receive the text part"
+    );
+    assert_eq!(
+        inspect.image_parts_seen.load(Ordering::SeqCst),
+        0,
+        "no image part may reach the backend when image support is off"
+    );
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_image_only_prompt_completes_without_backend_call() {
+    let port = free_port();
+    let inspect = Arc::new(ImageInspect::default());
+    let mut h =
+        TestHarness::start_with_router(port, mock_llm_image_inspector_router(inspect.clone()))
+            .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // An image-only prompt with support off has nothing left to send —
+    // it completes with the notice and must not hit the backend at all.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[
+            {"type":"image","data":"aGk=","mimeType":"image/png"}
+        ]}
+    }));
+    let (_, response) = h.read_until_response(2);
+
+    assert_eq!(response["result"]["status"], "completed");
+    let text = response["result"]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("image content was removed"),
+        "expected the dropped-image notice, got: {text}"
+    );
+    assert_eq!(
+        inspect.calls.load(Ordering::SeqCst),
+        0,
+        "image-only prompt must not dispatch an empty request to the backend"
+    );
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_image_blocks_forwarded_when_supported() {
+    let port = free_port();
+    let inspect = Arc::new(ImageInspect::default());
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_image_inspector_router(inspect.clone()),
+        &[("LLM_SUPPORTS_IMAGE", "true")],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[
+            {"type":"text","text":"what is in this image?"},
+            {"type":"image","data":"aGk=","mimeType":"image/png"}
+        ]}
+    }));
+    let (_, response) = h.read_until_response(2);
+
+    assert_eq!(response["result"]["status"], "completed");
+    assert!(
+        inspect.image_parts_seen.load(Ordering::SeqCst) >= 1,
+        "image part must reach the backend when image support is on"
     );
 
     h.shutdown();
