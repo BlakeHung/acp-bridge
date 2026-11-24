@@ -53,6 +53,7 @@ spec-shaped v2 payloads.
 | `session/list` (v2 baseline) | ✅ | Returns currently active sessions as `{sessions: [{sessionId, cwd}], nextCursor: null}` |
 | `session/new` cwd | ✅ | `cwd` is canonicalized and must name an existing directory; anything else is rejected with `-32602` (`data.reason` carries the validation failure). The working directory is never silently rewritten |
 | Prompt result `status` | ✅ | Three values: `completed` (model answered within budget), `partial` (tool budget exhausted — model answered via a forced wrap-up; `stopReason: max_turn_requests`), `failed` (error or no usable answer). Automation should branch on `partial` vs `completed`, not on the presence of text |
+| Turn `evidence` | ✅ | Structured per-turn counters: v1 prompt responses carry `evidence {rounds, toolCalls, toolsOk, toolsFailed, toolsDenied, toolsTimedOut, outputsTruncated, budgetHit, wallMs}`; v2 carries the same object on the turn-ending `state_update`. `budgetHit` is `null`, `"rounds"`, or `"failure_streak"` |
 | Streaming `agent_message_chunk` | ✅ | Typed `content: {type: "text", text: …}`. v1 and v2 use the same discriminator |
 | `agent_thought_chunk` | ✅ | Typed `content: {type: "text", text: ""}` — emitted so Clients render the thought bubble |
 | `tool_call` (v1) / `tool_call_update` (v1 + v2) | ✅ | Carries the required `toolCallId`, `title`, `kind`, `status`. v1 Clients see `tool_call`; v2 Clients see only `tool_call_update` with `status: "in_progress"` |

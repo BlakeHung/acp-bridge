@@ -695,6 +695,7 @@ async fn handle_acp_prompt(
                 state.protocol_version,
                 &session_id,
                 Some("max_turn_requests"),
+                None,
             );
             acp::send_response(&id, json!({"messageId": message_id}));
         } else {
@@ -708,7 +709,12 @@ async fn handle_acp_prompt(
     if cancelled {
         drop(guard);
         if state.protocol_version == ProtocolVersion::V2 {
-            acp::notify_state_idle_for(state.protocol_version, &session_id, Some("cancelled"));
+            acp::notify_state_idle_for(
+                state.protocol_version,
+                &session_id,
+                Some("cancelled"),
+                None,
+            );
             acp::send_response(&id, json!({"messageId": message_id}));
         } else {
             acp::send_response(
@@ -727,6 +733,7 @@ async fn handle_acp_prompt(
             used: 0,
             size: state.config.context_size,
         },
+        evidence: engine::TurnEvidence::default(),
         error_class: Some(acp_bridge::llm::LlmErrorKind::Unknown),
         error_retryable: false,
         message_id: message_id.clone(),
@@ -805,7 +812,12 @@ async fn handle_acp_prompt(
         } else {
             "max_turn_requests"
         };
-        acp::notify_state_idle_for(state.protocol_version, &session_id, Some(stop_reason));
+        acp::notify_state_idle_for(
+            state.protocol_version,
+            &session_id,
+            Some(stop_reason),
+            Some(serde_json::to_value(&result.evidence).unwrap_or_default()),
+        );
     }
 
     // Wire-shape dispatch on the response itself. v1 Clients keep the
@@ -828,6 +840,7 @@ async fn handle_acp_prompt(
             "stopReason": stop_reason,
             "status": result.status,
             "text": result.text,
+            "evidence": serde_json::to_value(&result.evidence).unwrap_or_default(),
         });
         if let Some(meta) = error_meta {
             body["error"] = meta;

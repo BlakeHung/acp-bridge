@@ -1384,6 +1384,13 @@ async fn test_tool_round_limit_wraps_up_with_partial_answer() {
         "expected truncation disclosure, got: {text}"
     );
 
+    // Turn evidence (E13): structured counters on the response so
+    // automation sees the budget wall without parsing prose.
+    let ev = &response["result"]["evidence"];
+    assert_eq!(ev["budgetHit"], "rounds", "evidence: {ev}");
+    assert_eq!(ev["rounds"], 5, "evidence: {ev}");
+    assert_eq!(ev["toolCalls"], 5, "evidence: {ev}");
+
     h.shutdown();
 }
 
@@ -1461,6 +1468,11 @@ async fn test_tool_failure_streak_aborts_loop() {
         text.contains("Partial: the failing command"),
         "expected the wrap-up answer, got: {text}"
     );
+
+    // Evidence records the failure streak and the failing tool calls.
+    let ev = &response["result"]["evidence"];
+    assert_eq!(ev["budgetHit"], "failure_streak", "evidence: {ev}");
+    assert_eq!(ev["toolsFailed"], 2, "evidence: {ev}");
 
     h.shutdown();
 }

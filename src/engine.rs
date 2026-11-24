@@ -570,6 +570,7 @@ pub async fn session_prompt(
                         used: 0,
                         size: state.config.context_size,
                     },
+                    evidence: TurnEvidence::default(),
                     error_class: None,
                     error_retryable: false,
                     // Caller never wired a prompt through this branch —
@@ -614,6 +615,7 @@ pub async fn session_prompt(
                     used: 0,
                     size: state.config.context_size,
                 },
+                evidence: TurnEvidence::default(),
                 error_class: None,
                 error_retryable: false,
                 message_id: message_id.to_string(),
@@ -641,6 +643,8 @@ pub async fn session_prompt(
     let max_tool_rounds = state.config.max_tool_rounds;
     let tool_timeout_secs = state.config.tool_timeout_secs;
     let tool_failure_streak = state.config.tool_failure_streak;
+    let turn_start = std::time::Instant::now();
+    let mut evidence = TurnEvidence::default();
     // Consecutive identical failures (same tool + args + error). A model
     // re-issuing a failing call verbatim is looping, not working.
     let mut fail_key: Option<String> = None;
@@ -649,6 +653,7 @@ pub async fn session_prompt(
 
     // Tool call loop
     for round in 0..max_tool_rounds {
+        evidence.rounds = round as u32 + 1;
         let (messages, working_dir) = {
             let sessions = state.sessions_read();
             match sessions.get(session_id) {
@@ -756,7 +761,10 @@ pub async fn session_prompt(
                     // execution; confirm → visible in-session notice,
                     // then execute (the documented no-permission-UI
                     // fallback); allow → execute.
-                    let result = match state.policy.decide(name, &args) {
+                    evidence.tool_calls += 1;
+                    let decision = state.policy.decide(name, &args);
+                    let policy_denied = matches!(decision, crate::policy::Decision::Deny(_));
+                    let result = match decision {
                         crate::policy::Decision::Deny(reason) => tools::ToolResult::err(
                             tools::ToolErrorKind::Denied,
                             format!("Error: {reason}"),
@@ -782,6 +790,22 @@ pub async fn session_prompt(
                     });
 
                     debug!(tool = name, result_len = result.text.len(), error_kind = ?result.error_kind, "Tool executed");
+
+                    match result.error_kind {
+                        None => evidence.tools_ok += 1,
+                        Some(kind) => {
+                            evidence.tools_failed += 1;
+                            if policy_denied || matches!(kind, tools::ToolErrorKind::Denied) {
+                                evidence.tools_denied += 1;
+                            }
+                            if matches!(kind, tools::ToolErrorKind::Timeout) {
+                                evidence.tools_timed_out += 1;
+                            }
+                        }
+                    }
+                    if result.truncated {
+                        evidence.outputs_truncated += 1;
+                    }
 
                     // Identical-failure streak: a model re-issuing the
                     // exact same call after an error is in a loop. Stop
@@ -815,6 +839,7 @@ pub async fn session_prompt(
                             streak = fail_count,
                             "identical tool failure streak, aborting loop"
                         );
+                        evidence.budget_hit = Some("failure_streak".into());
                         {
                             let mut sessions = state.sessions_write();
                             if let Some(session) = sessions.get_mut(session_id) {
@@ -875,6 +900,11 @@ pub async fn session_prompt(
     // distinguish "answered within budget" from "answered because the
     // budget forced a stop". The wrap-up is not a tool round — no tools
     // are offered or executed.
+    if !had_error && !got_final_response && evidence.budget_hit.is_none() {
+        // Reaching here without a final response and without a streak
+        // abort means the round budget ran out.
+        evidence.budget_hit = Some("rounds".into());
+    }
     if !had_error && !got_final_response {
         let limit_note = if streak_aborted {
             format!("the same tool call failed {tool_failure_streak} times in a row")
@@ -965,6 +995,8 @@ pub async fn session_prompt(
         _ => final_text,
     };
 
+    evidence.wall_ms = turn_start.elapsed().as_millis();
+
     PromptResult {
         status: status.into(),
         text: final_text,
@@ -973,6 +1005,7 @@ pub async fn session_prompt(
             used: used_tokens,
             size: state.config.context_size,
         },
+        evidence,
         error_class: last_error_class.clone(),
         error_retryable: last_error_class.as_ref().is_some_and(|k| k.is_retryable()),
         message_id: message_id.to_string(),
@@ -1063,11 +1096,43 @@ pub fn session_list(state: &AppState) -> Vec<Value> {
 // Result type
 // ---------------------------------------------------------------------------
 
+/// Per-turn execution evidence (P1/E13 GoalState): what the turn
+/// actually did, in structured form. Automation reads this instead of
+/// parsing prose — e.g. "did the agent hit a budget wall, and where".
+/// Serialized under `evidence` on the v1 prompt response and on the
+/// v2 `state_update` that ends the turn.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEvidence {
+    /// Model/tool round-trips used (the wrap-up call is not a round).
+    pub rounds: u32,
+    /// Tool calls dispatched or gated.
+    pub tool_calls: u32,
+    /// Tool calls that returned without an error kind.
+    pub tools_ok: u32,
+    /// Tool calls that returned an error kind (policy denies and
+    /// timeouts included — they are also counted separately below).
+    pub tools_failed: u32,
+    /// Tool calls rejected by policy before executing.
+    pub tools_denied: u32,
+    /// Tool calls killed by the per-tool timeout.
+    pub tools_timed_out: u32,
+    /// Tool results that hit the output cap.
+    pub outputs_truncated: u32,
+    /// Which budget forced the wrap-up, if any: "rounds" |
+    /// "failure_streak". `None` = the model finished inside budget.
+    pub budget_hit: Option<String>,
+    /// Whole-turn wall-clock time.
+    pub wall_ms: u128,
+}
+
 pub struct PromptResult {
     pub status: String,
     pub text: String,
     pub error: Option<AcpError>,
     pub usage: UsageReport,
+    /// Structured execution evidence for the turn — see [`TurnEvidence`].
+    pub evidence: TurnEvidence,
     /// Classification of the most recent LLM error (if any). `None` means
     /// the turn completed without a backend failure. Carries a stable
     /// `LlmErrorKind` so the JSON-RPC response can attach a structured

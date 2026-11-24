@@ -560,6 +560,7 @@ pub fn notify_state_idle_for(
     version: ProtocolVersion,
     session_id: &str,
     stop_reason: Option<&str>,
+    evidence: Option<Value>,
 ) {
     if version != ProtocolVersion::V2 {
         return; // v1 has no state_update sessionUpdate
@@ -570,6 +571,11 @@ pub fn notify_state_idle_for(
     });
     if let Some(reason) = stop_reason {
         payload["stopReason"] = json!(reason);
+    }
+    // Turn-evidence rides inside the update object as a vendor field —
+    // v2 Clients that don't know it ignore it per JSON-RPC tolerance.
+    if let Some(ev) = evidence {
+        payload["evidence"] = ev;
     }
     send_session_update(session_id, payload);
 }
