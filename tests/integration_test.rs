@@ -1566,6 +1566,99 @@ async fn test_policy_deny_reaches_model_as_tool_result() {
     h.shutdown();
 }
 
+/// Context overflow: a backend that rejects prompt+max_tokens>context
+/// gets a compacted retry — oldest history drops, a `[context]` notice
+/// announces the loss, and the turn still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_context_overflow_compacts_and_retries() {
+    let port = free_port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+    let recorded = seen.clone();
+    let app = Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                    let chars: usize = msgs
+                        .iter()
+                        .map(|m| m["content"].as_str().map(|s| s.len()).unwrap_or(0))
+                        .sum();
+                    recorded.lock().unwrap().push(chars);
+                    // Deterministic trigger: the full accumulated history
+                    // (system + p1 user + p1 reply + p2 user = 4 msgs)
+                    // is "too long"; the compacted retry (≤3) passes.
+                    if msgs.len() >= 4 {
+                        // Real-world llama.cpp rejection shape — the
+                        // 400 status is what classifies it BadRequest.
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(json!({
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "message": "prompt (31000 tokens) + max tokens (4096) exceeds the context (32768); requests are never truncated."
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(json!({
+                        "choices": [{"message":{"role":"assistant","content":"understood."},"finish_reason":"stop"}]
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route("/api/tags", get(mock_ollama_tags));
+
+    let mut h = TestHarness::start_with_router_and_env(port, app, &[]).await;
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Prompt 1: fat user text lands in history (~3200 chars — under
+    // the 6000-char mock threshold, so it answers fine).
+    let fat = "x".repeat(3000);
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":fat}]}
+    }));
+    let (_, r1) = h.read_until_response(2);
+    assert_eq!(r1["result"]["status"], "completed");
+
+    // Prompt 2: history ~6600 chars → backend rejects the full
+    // prompt; the retry must arrive compacted and succeed.
+    h.send(&json!({
+        "jsonrpc":"2.0","id":3,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"more"}]}
+    }));
+    let (notif, r2) = h.read_until_response(3);
+    assert_eq!(
+        r2["result"]["status"],
+        "completed",
+        "compacted retry should still complete: {r2} sizes={:?}",
+        seen.lock().unwrap()
+    );
+    let joined = serde_json::to_string(&notif).unwrap();
+    assert!(
+        joined.contains("[context] dropped"),
+        "compaction must be announced: {joined}"
+    );
+    let sizes = seen.lock().unwrap();
+    assert!(
+        sizes.len() >= 3,
+        "expected the retry to hit the backend: {sizes:?}"
+    );
+    let last = sizes[sizes.len() - 1];
+    assert!(
+        last < 3000,
+        "retry should carry a compacted prompt, got {last} chars (all: {sizes:?})"
+    );
+    h.shutdown();
+}
+
 /// session/permit issues a single-use grant that rescues exactly one
 /// `confirm`-blocked tool call — ungranted stays denied, consumed stays
 /// consumed.

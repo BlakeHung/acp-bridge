@@ -805,6 +805,12 @@ pub async fn session_prompt(
     let mut fail_count = 0usize;
     let mut streak_aborted = false;
 
+    // Tool calls go through `fit_and_call`: fit the request into the
+    // model's context window (drop oldest history + clamp max_tokens;
+    // local backends reject prompt+max_tokens>context outright instead
+    // of truncating), retry once with harder compaction on a still-
+    // overflowing 400.
+
     // Tool call loop
     for round in 0..max_tool_rounds {
         evidence.rounds = round as u32 + 1;
@@ -822,7 +828,8 @@ pub async fn session_prompt(
         };
 
         let backend = state.config.backend();
-        let chat_result = llm::chat(&state.config, &messages, None, Some(&tool_defs)).await;
+        let chat_result =
+            fit_and_call(state, session_id, messages, Some(&tool_defs), &notify).await;
 
         match chat_result {
             Ok(response) => {
@@ -1111,7 +1118,7 @@ pub async fn session_prompt(
             sessions.get(session_id).map(|s| s.messages.clone())
         };
         if let Some(messages) = messages {
-            match llm::chat(&state.config, &messages, None, None).await {
+            match fit_and_call(state, session_id, messages, None, &notify).await {
                 Ok(response) => {
                     let raw_text = state.config.backend().extract_response_text(&response);
                     let (clean_text, _) = llm::recover_tool_calls_from_content(&raw_text);
@@ -1215,6 +1222,175 @@ pub async fn session_prompt(
 /// content of every message and divides by 4 chars/token. We do NOT try
 /// to be precise — local backends do not stream stable per-turn token
 /// counts, and clients use this only for progress visualisation.
+/// Headroom held back from `context_size` — the char/4 estimate
+/// undercounts CJK and tokenizer-heavy text, so the real prompt
+/// is often bigger than the number suggests.
+const CONTEXT_MARGIN_TOKENS: u64 = 512;
+/// Floor for clamped `max_tokens` — a response needs room to exist.
+const MIN_OUTPUT_TOKENS: u64 = 512;
+/// Assumed generation budget when `LLM_MAX_TOKENS` is unset —
+/// most local backends default to ~4096 and count it into the
+/// context arithmetic, so we must too.
+const DEFAULT_OUTPUT_TOKENS: u64 = 4096;
+
+/// Drop oldest history (keeping `messages[0]` = system prompt) until
+/// the char-estimate fits `prompt_budget`. Returns (fitted, dropped).
+fn compact_for_context(mut messages: Vec<Value>, prompt_budget: u64) -> (Vec<Value>, usize) {
+    if estimate_tokens(&messages) <= prompt_budget {
+        return (messages, 0);
+    }
+    let system = messages.first().cloned();
+    let mut rest: Vec<Value> = if messages.len() > 1 {
+        messages.split_off(1)
+    } else {
+        Vec::new()
+    };
+    let mut dropped = 0usize;
+    while rest.len() > 1 && estimate_tokens(&rest) > prompt_budget {
+        rest.remove(0);
+        dropped += 1;
+    }
+    let mut out: Vec<Value> = system.into_iter().collect();
+    out.extend(rest);
+    (out, dropped)
+}
+
+/// True when a backend error is the deterministic "prompt + max_tokens
+/// exceeds the context" shape local backends emit (llama.cpp, LM
+/// Studio, vLLM all phrase it around `context`/`length`).
+fn is_context_overflow(e: &crate::llm::LlmError) -> bool {
+    if e.kind != crate::llm::LlmErrorKind::BadRequest {
+        return false;
+    }
+    let m = e.message.to_ascii_lowercase();
+    m.contains("exceeds the context")
+        || m.contains("context length")
+        || m.contains("context window")
+        || (m.contains("context") && (m.contains("exceed") || m.contains("too long")))
+}
+
+/// Extract the real prompt-token count from a context-overflow error —
+/// llama.cpp / LM Studio phrase it as `prompt (30314 tokens) + ...`.
+/// Knowing the REAL count lets the retry scale the char/4 estimate by
+/// the measured ratio instead of guessing again.
+fn reported_prompt_tokens(message: &str) -> Option<u64> {
+    let m = message.to_ascii_lowercase();
+    let start = m.find("prompt (")? + "prompt (".len();
+    let digits: String = m[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() || !m[start..].starts_with(&format!("{digits} tokens")) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Fit a request into the model's context window, then call.
+///
+/// Local backends reject `prompt + max_tokens > context` outright —
+/// they never truncate the prompt. So before every call: (1) drop
+/// oldest history when the estimate overflows the prompt budget,
+/// (2) clamp `max_tokens` to what the window can actually emit.
+/// Dropped history is written back into the session — it is really
+/// gone — and the drop is announced via a `[context]` chunk so the
+/// turn's memory loss is visible instead of silent.
+///
+/// If the backend still answers a context-overflow 400 (estimate was
+/// optimistic for this content), compact harder and retry once. A
+/// second overflow surfaces the backend's error unchanged — nothing
+/// here hides a real failure.
+async fn fit_and_call(
+    state: &AppState,
+    session_id: &str,
+    messages: Vec<Value>,
+    tools: Option<&[Value]>,
+    notify: &impl Fn(Notification),
+) -> Result<Value, crate::llm::LlmError> {
+    let budget = state
+        .config
+        .context_size
+        .saturating_sub(CONTEXT_MARGIN_TOKENS);
+    // Clamp the OUTPUT budget into the window first — otherwise a big
+    // desired max_tokens would leave zero prompt room and we'd drop
+    // every history message even though a smaller response fits fine.
+    let out_want = config_output_budget(&state.config)
+        .min(budget.saturating_sub(MIN_OUTPUT_TOKENS))
+        .max(MIN_OUTPUT_TOKENS.min(budget));
+    let (mut msgs, dropped) = compact_for_context(messages, budget.saturating_sub(out_want));
+    let mut dropped_total = dropped;
+
+    let send = |cfg_max: Option<u64>, msgs: &[Value]| {
+        let mut cfg = state.config.clone();
+        cfg.max_tokens = cfg_max;
+        let msgs = msgs.to_vec();
+        let tools = tools.map(|t| t.to_vec());
+        async move { crate::llm::chat(&cfg, &msgs, None, tools.as_deref()).await }
+    };
+
+    let est = estimate_tokens(&msgs);
+    let eff_max = out_want
+        .min(budget.saturating_sub(est))
+        .max(MIN_OUTPUT_TOKENS);
+    match send(Some(eff_max), &msgs).await {
+        Err(e) if is_context_overflow(&e) => {
+            // Estimate undercounted. If the backend told us the REAL
+            // prompt size (llama.cpp family does), scale the estimate by
+            // the measured ratio — CJK text can be 4-10x off char/4, so
+            // a fixed halving would still overflow. Fall back to a
+            // hard halving when the count isn't reported.
+            let est_now = estimate_tokens(&msgs);
+            let target = match reported_prompt_tokens(&e.message) {
+                Some(real) if real > 0 => {
+                    // est = real * (est_now/real) → to land the real
+                    // prompt at ~3/4 of the window.
+                    let scale = est_now as f64 / real as f64;
+                    ((budget * 3 / 4) as f64 * scale) as u64
+                }
+                _ => budget / 2,
+            };
+            let (m2, d2) = compact_for_context(msgs.clone(), target.max(1));
+            msgs = m2;
+            dropped_total += d2;
+            if dropped_total > 0 {
+                if let Some(s) = state.sessions_write().get_mut(session_id) {
+                    s.messages = msgs.clone();
+                }
+                notify(Notification::TextChunk(format!(
+                    "\n\n*[context] dropped {dropped_total} oldest message(s) — prompt no longer fits the {}-token window; earliest history compacted*",
+                    state.config.context_size
+                )));
+            }
+            let est2 = estimate_tokens(&msgs);
+            let eff2 = out_want
+                .min(budget.saturating_sub(est2))
+                .clamp(MIN_OUTPUT_TOKENS, 2048);
+            send(Some(eff2), &msgs).await
+        }
+        r => {
+            if dropped_total > 0 {
+                if let Some(s) = state.sessions_write().get_mut(session_id) {
+                    s.messages = msgs;
+                }
+                notify(Notification::TextChunk(format!(
+                    "\n\n*[context] dropped {dropped_total} oldest message(s) — prompt exceeded the {}-token window; earliest history compacted*",
+                    state.config.context_size
+                )));
+            }
+            r
+        }
+    }
+}
+
+/// Response budget for the next call: configured `LLM_MAX_TOKENS` or
+/// the local-backend-style default, never under the floor.
+fn config_output_budget(config: &LlmConfig) -> u64 {
+    config
+        .max_tokens
+        .unwrap_or(DEFAULT_OUTPUT_TOKENS)
+        .max(MIN_OUTPUT_TOKENS)
+}
+
 pub fn estimate_tokens(messages: &[Value]) -> u64 {
     let total_chars: usize = messages
         .iter()
@@ -1455,6 +1631,29 @@ mod tests {
         let text = extract_user_text_from_prompt(&prompt);
         assert!(text.contains("describe this"));
         assert!(text.contains("[Attached resource: hostname (file:///etc/hostname)]"));
+    }
+
+    /// Context compaction keeps system + newest, drops oldest first.
+    #[test]
+    fn compact_for_context_drops_oldest() {
+        let msgs = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"a".repeat(4000)}),
+            json!({"role":"assistant","content":"b".repeat(4000)}),
+            json!({"role":"user","content":"c".repeat(100)}),
+        ];
+        // ~2025 token est (8100 chars/4). Budget 1100 → the oldest
+        // 4000-char message drops; the remaining 1025 fits.
+        let (fitted, dropped) = compact_for_context(msgs, 1100);
+        assert_eq!(dropped, 1);
+        assert_eq!(fitted.len(), 3);
+        assert_eq!(fitted[0]["role"], "system");
+        assert_eq!(fitted[2]["content"], "c".repeat(100));
+        // Under budget → untouched.
+        let msgs2 = vec![json!({"role":"system","content":"s"})];
+        let (f2, d2) = compact_for_context(msgs2, 500);
+        assert_eq!(d2, 0);
+        assert_eq!(f2.len(), 1);
     }
 
     /// Permits are single-use, session-scoped, and tool-scoped.

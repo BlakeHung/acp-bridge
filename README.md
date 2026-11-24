@@ -259,7 +259,7 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_MAX_SESSIONS` | `256` | Max concurrent sessions; `0` restores the old unlimited behavior |
 | `LLM_SESSION_IDLE_TIMEOUT` | `0` | Evict idle sessions after N seconds (0 = disabled) |
 | `LLM_SUPPORTS_IMAGE` | `false` | Opt-in: advertise `promptCapabilities.image: true` at `initialize`. Set to `true` only if the configured backend can actually accept image content blocks (e.g. a vision-capable model). |
-| `LLM_MODEL_CONTEXT` | `32768` | Model context window in tokens. Reported as `size` in `usage_update` notifications. |
+| `LLM_MODEL_CONTEXT` | `32768` | Model context window in tokens. Reported as `size` in `usage_update` notifications AND used to fit every call into the window: when history grows past it the oldest messages are compacted away (announced via a `[context]` chunk) and `max_tokens` is clamped — local backends reject `prompt + max_tokens > context` rather than truncating |
 | `LLM_MAX_TOOL_ROUNDS` | `50` | Max model↔tool round-trips per turn before the bounded wrap-up path runs (aligned with openab-agent's default) |
 | `LLM_TOOL_TIMEOUT` | `120` | Per-tool wall-clock timeout in seconds; bash/git/web_fetch processes are killed (with their process group) on expiry |
 | `LLM_TURN_TIMEOUT` | `0` | Whole-turn deadline in seconds (0 = no limit) |
