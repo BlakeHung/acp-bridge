@@ -1088,6 +1088,59 @@ async fn mock_chat_completions_with_tools(
     }
 }
 
+/// Mock that returns a `list_dir` tool call while `tools` is offered, and a
+/// plain text answer once the engine stops offering tools (the wrap-up call).
+fn mock_llm_tool_until_wrapup_router() -> Router {
+    Router::new()
+        .route("/v1/models", get(mock_models))
+        .route(
+            "/v1/chat/completions",
+            post(mock_chat_completions_tool_until_wrapup),
+        )
+        .route("/api/tags", get(mock_ollama_tags))
+}
+
+async fn mock_chat_completions_tool_until_wrapup(req: Request<Body>) -> impl IntoResponse {
+    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    if body["tools"].is_null() {
+        // Wrap-up call: engine dropped tool definitions — produce the
+        // partial answer it is asking for.
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Partial findings so far: the project has a src dir."
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .into_response()
+    } else {
+        axum::Json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_wrap",
+                        "type": "function",
+                        "function": {
+                            "name": "list_dir",
+                            "arguments": "{\"path\": \".\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .into_response()
+    }
+}
+
 /// Mock that always returns a `list_dir` tool call and never a final answer,
 /// forcing the engine's tool loop to exhaust MAX_TOOL_ROUNDS.
 fn mock_llm_always_tool_router() -> Router {
@@ -1142,8 +1195,8 @@ async fn test_tool_round_limit_surfaces_failure() {
 
     let (_notifications, response) = h.read_until_response(2);
 
-    // The model never produces a final answer, so instead of a silent
-    // "completed" with empty text the turn must be reported as failed with a
+    // The model never produces a final answer even without tools (wrap-up
+    // returns null content), so the turn must be reported as failed with a
     // message that explains the tool-call limit was reached. Per ACP the stop
     // reason for exhausting the per-turn model-request budget is
     // `max_turn_requests`.
@@ -1156,6 +1209,44 @@ async fn test_tool_round_limit_surfaces_failure() {
             .contains("tool-call limit"),
         "Expected tool-call limit message, got: {:?}",
         response["result"]["text"]
+    );
+
+    h.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tool_round_limit_wraps_up_with_partial_answer() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_tool_until_wrapup_router(),
+        &[("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1"))],
+    )
+    .await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    let resp = h.read_line();
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    h.send(&json!({
+        "jsonrpc":"2.0","id":2,"method":"session/prompt",
+        "params":{"sessionId":&sid,"prompt":[{"type":"text","text":"keep exploring"}]}
+    }));
+
+    let (_notifications, response) = h.read_until_response(2);
+
+    // Exhausting the tool budget no longer hard-fails when the model can
+    // wrap up: the turn completes with a partial answer that discloses the
+    // truncation.
+    assert_eq!(response["result"]["status"], "completed");
+    let text = response["result"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Partial findings so far"),
+        "expected wrap-up answer, got: {text}"
+    );
+    assert!(
+        text.contains("tool-call limit") && text.contains("incomplete"),
+        "expected truncation disclosure, got: {text}"
     );
 
     h.shutdown();

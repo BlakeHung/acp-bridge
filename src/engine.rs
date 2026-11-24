@@ -777,9 +777,45 @@ pub async fn session_prompt(
     }
 
     // The loop can also exit by exhausting MAX_TOOL_ROUNDS while the model
-    // keeps requesting tools. Without this the turn would be reported as a
-    // successful "completed" with empty text, silently swallowing the fact
-    // that the model never produced a final answer.
+    // keeps requesting tools. Before reporting failure, give the model one
+    // final call with no tool definitions: it must answer with what it
+    // has. This converts a hard error into a bounded partial answer while
+    // still disclosing the truncation in the response text. The wrap-up is
+    // not a tool round — no tools are offered or executed.
+    if !had_error && !got_final_response {
+        let messages = {
+            let sessions = state.sessions_read();
+            sessions.get(session_id).map(|s| s.messages.clone())
+        };
+        if let Some(messages) = messages {
+            match llm::chat(&state.config, &messages, None, None).await {
+                Ok(response) => {
+                    let raw_text = state.config.backend().extract_response_text(&response);
+                    let (clean_text, _) = llm::recover_tool_calls_from_content(&raw_text);
+                    if !clean_text.trim().is_empty() {
+                        let text = format!(
+                            "{clean_text}\n\n[note: reached the {MAX_TOOL_ROUNDS}-round tool-call limit — this answer may be incomplete]"
+                        );
+                        {
+                            let mut sessions = state.sessions_write();
+                            if let Some(session) = sessions.get_mut(session_id) {
+                                session
+                                    .messages
+                                    .push(json!({"role": "assistant", "content": &text}));
+                            }
+                        }
+                        notify(Notification::TextChunk(text.clone()));
+                        final_text = text;
+                        got_final_response = true;
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "Wrap-up call after round limit failed");
+                }
+            }
+        }
+    }
+
     if !had_error && !got_final_response {
         warn!(
             max_rounds = MAX_TOOL_ROUNDS,
