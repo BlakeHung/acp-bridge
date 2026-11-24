@@ -9,7 +9,6 @@ use crate::protocol::{AcpError, Session};
 use crate::tools;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -407,11 +406,28 @@ pub fn session_new(
         }
     }
 
-    // Sanitize cwd
-    let cwd: String = cwd
-        .chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ' ' | '~'))
-        .collect();
+    // Resolve and validate cwd. The session's `working_dir` is the base of
+    // the tool sandbox (`resolve_sandboxed_path` canonicalizes both sides
+    // before comparing), so it must be canonical and must actually exist —
+    // a mangled or nonexistent cwd would either break every file tool or
+    // anchor the sandbox at the wrong place. Reject with a visible error
+    // instead of silently rewriting characters (previous behavior stripped
+    // `:`/`(`/`)` etc., which destroyed Windows paths like `C:\tools\proj`).
+    let working_dir = match std::fs::canonicalize(cwd) {
+        Ok(p) if p.is_dir() => p,
+        Ok(_) => {
+            return Err(AcpError::InvalidCwd {
+                cwd: cwd.into(),
+                reason: "path exists but is not a directory".into(),
+            });
+        }
+        Err(e) => {
+            return Err(AcpError::InvalidCwd {
+                cwd: cwd.into(),
+                reason: e.to_string(),
+            });
+        }
+    };
 
     let session_id = Uuid::new_v4().to_string();
 
@@ -423,7 +439,7 @@ pub fn session_new(
 
     let session = Session::new(
         json!({"role": "system", "content": system_prompt}),
-        PathBuf::from(&cwd),
+        working_dir,
         protocol_version,
     );
     state.sessions_write().insert(session_id.clone(), session);
@@ -518,6 +534,13 @@ pub async fn session_prompt(
         }
     };
 
+    // Image capability gate (review B4): when the backend was configured
+    // without image support, drop image blocks before they reach the
+    // provider. Forwarding them produced a bare HTTP 400 from vision-less
+    // endpoints — the user-visible symptom was "agent didn't respond".
+    let images_dropped = !state.config.prompt_supports_image && !user_images.is_empty();
+    let user_images: &[ImageBlock] = if images_dropped { &[] } else { user_images };
+
     // Add user message, touch session, and trim history
     {
         let mut sessions = state.sessions_write();
@@ -562,6 +585,29 @@ pub async fn session_prompt(
         }
     }
 
+    if images_dropped {
+        let note = "[note: image content was removed before sending — this endpoint was configured with image support disabled (LLM_SUPPORTS_IMAGE=false).]";
+        if user_text.trim().is_empty() {
+            // The prompt carried images only; with them dropped there is
+            // nothing to send. Answer with the removal notice instead of
+            // dispatching an empty prompt to the model.
+            notify(Notification::TextChunk(note.to_string()));
+            return PromptResult {
+                status: "completed".into(),
+                text: note.into(),
+                error: None,
+                usage: UsageReport {
+                    used: 0,
+                    size: state.config.context_size,
+                },
+                error_class: None,
+                error_retryable: false,
+                message_id: message_id.to_string(),
+            };
+        }
+        notify(Notification::TextChunk(note.to_string()));
+    }
+
     notify(Notification::Thinking);
     notify(Notification::ToolStart {
         id: format!("llm_chat:{session_id}"),
@@ -595,6 +641,10 @@ pub async fn session_prompt(
         match chat_result {
             Ok(response) => {
                 let mut tool_calls = backend.extract_tool_calls(&response);
+                // When tool calls were recovered from the content channel
+                // (thinking-mode workaround), this carries the cleaned text
+                // that belongs on the recorded assistant message.
+                let mut recovered_text: Option<String> = None;
 
                 // Thinking-mode workarounds (0.9.2): reasoning models
                 // sometimes embed the tool call inside the content
@@ -610,17 +660,7 @@ pub async fn session_prompt(
                             "Recovered tool calls embedded in content (thinking-mode workaround)"
                         );
                         tool_calls = recovered;
-                        {
-                            let mut sessions = state.sessions_write();
-                            if let Some(session) = sessions.get_mut(session_id) {
-                                let assistant_msg = backend.format_assistant_message(
-                                    &clean_text,
-                                    &tool_calls,
-                                    &response,
-                                );
-                                session.messages.push(assistant_msg);
-                            }
-                        }
+                        recovered_text = Some(clean_text);
                     } else {
                         got_final_response = true;
                         let text = clean_text;
@@ -643,11 +683,25 @@ pub async fn session_prompt(
                 // Execute tool calls
                 info!(round, count = tool_calls.len(), "Executing tool calls");
 
+                // Record exactly one assistant message for this round (B1).
+                // Recovered calls need an explicit message: cloning the raw
+                // response would record `tool_calls: null`/absent and orphan
+                // the `embedded_*` tool results that reference it — and the
+                // recovery path previously pushed a second copy of the raw
+                // message here, duplicating the assistant turn in history.
                 {
                     let mut sessions = state.sessions_write();
                     if let Some(session) = sessions.get_mut(session_id) {
-                        let assistant_msg =
-                            backend.format_assistant_message("", &tool_calls, &response);
+                        let assistant_msg = match &recovered_text {
+                            Some(text) => json!({
+                                "role": "assistant",
+                                "content": text,
+                                "tool_calls": &tool_calls,
+                            }),
+                            None => {
+                                backend.format_assistant_message("", &tool_calls, &response)
+                            }
+                        };
                         session.messages.push(assistant_msg);
                     }
                 }

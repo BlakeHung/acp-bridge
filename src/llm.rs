@@ -521,6 +521,59 @@ const MAX_RETRIES: u32 = 3;
 /// Initial backoff delay in milliseconds (doubles each retry).
 const INITIAL_BACKOFF_MS: u64 = 500;
 
+/// Startup configuration failure. Raised when a config file or an
+/// environment variable is present but cannot be honored — running with
+/// silently different limits is worse than refusing to start.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("failed to read config file {path}: {reason}")]
+    Read { path: String, reason: String },
+    #[error("failed to parse config file {path}: {reason}")]
+    Parse { path: String, reason: String },
+    #[error("invalid value for env var {var}: {value:?} ({reason})")]
+    InvalidEnv {
+        var: &'static str,
+        value: String,
+        reason: String,
+    },
+}
+
+/// Parse an optional env var into `T`. Absent → `Ok(None)`; present but
+/// unparseable → `Err(InvalidEnv)` instead of silently falling back.
+pub(crate) fn env_parse<T>(var: &'static str) -> Result<Option<T>, ConfigError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(var) {
+        Ok(value) => value.parse::<T>().map(Some).map_err(|e| {
+            ConfigError::InvalidEnv {
+                var,
+                value,
+                reason: e.to_string(),
+            }
+        }),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Parse a boolean env var accepting `1|true|yes|on` / `0|false|no|off`.
+/// Any other set value is an error, never a silent default.
+pub(crate) fn env_parse_bool(var: &'static str) -> Result<Option<bool>, ConfigError> {
+    match std::env::var(var) {
+        Ok(value) => match value.as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" => Ok(Some(false)),
+            _ => Err(ConfigError::InvalidEnv {
+                var,
+                value,
+                reason: "expected one of 1|true|yes|on or 0|false|no|off".into(),
+            }),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
 #[derive(Clone)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -579,11 +632,8 @@ impl LlmConfig {
         self.backend().chat_url(&self.base_url)
     }
 
-    pub fn from_env() -> Self {
-        let timeout_secs = std::env::var("LLM_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let timeout_secs = env_parse("LLM_TIMEOUT")?.unwrap_or(300);
 
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -591,7 +641,18 @@ impl LlmConfig {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self {
+        let temperature = env_parse::<f64>("LLM_TEMPERATURE")?;
+        if let Some(t) = temperature {
+            if !t.is_finite() {
+                return Err(ConfigError::InvalidEnv {
+                    var: "LLM_TEMPERATURE",
+                    value: t.to_string(),
+                    reason: "must be finite".into(),
+                });
+            }
+        }
+
+        Ok(Self {
             base_url: std::env::var("LLM_BASE_URL")
                 .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
                 .unwrap_or_else(|_| "http://localhost:11434/v1".into()),
@@ -602,36 +663,16 @@ impl LlmConfig {
                 .or_else(|_| std::env::var("OLLAMA_API_KEY"))
                 .unwrap_or_else(|_| "local-ai".into()),
             system_prompt: std::env::var("LLM_SYSTEM_PROMPT").ok(),
-            temperature: std::env::var("LLM_TEMPERATURE")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|t| t.is_finite()),
-            max_tokens: std::env::var("LLM_MAX_TOKENS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            temperature,
+            max_tokens: env_parse("LLM_MAX_TOKENS")?,
             timeout_secs,
-            max_history_turns: std::env::var("LLM_MAX_HISTORY_TURNS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(50),
-            max_sessions: std::env::var("LLM_MAX_SESSIONS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            session_idle_timeout_secs: std::env::var("LLM_SESSION_IDLE_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            prompt_supports_image: matches!(
-                std::env::var("LLM_SUPPORTS_IMAGE").as_deref(),
-                Ok("1") | Ok("true") | Ok("yes") | Ok("on")
-            ),
-            context_size: std::env::var("LLM_MODEL_CONTEXT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(32768),
+            max_history_turns: env_parse("LLM_MAX_HISTORY_TURNS")?.unwrap_or(50),
+            max_sessions: env_parse("LLM_MAX_SESSIONS")?.unwrap_or(0),
+            session_idle_timeout_secs: env_parse("LLM_SESSION_IDLE_TIMEOUT")?.unwrap_or(0),
+            prompt_supports_image: env_parse_bool("LLM_SUPPORTS_IMAGE")?.unwrap_or(false),
+            context_size: env_parse("LLM_MODEL_CONTEXT")?.unwrap_or(32768),
             client,
-        }
+        })
     }
 }
 

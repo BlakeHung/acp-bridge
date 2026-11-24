@@ -137,6 +137,43 @@ fn assert_tool_result_rounded(messages: &Value) {
     assert!(has_tool, "second round must carry the tool result");
 }
 
+/// History-sequence invariant (review B1): the messages sent to the backend
+/// must form a valid tool-call transcript —
+///   * every `role: "tool"` message's `tool_call_id` appears in the
+///     `tool_calls` of an assistant message earlier in the same request
+///   * no two consecutive assistant messages (the recovery path used to
+///     push the raw response clone twice)
+fn assert_history_invariant(messages: &Value) {
+    let msgs = messages.as_array().expect("messages array");
+
+    let mut known_call_ids: Vec<String> = Vec::new();
+    let mut prev_role = "";
+    for (i, m) in msgs.iter().enumerate() {
+        let role = m["role"].as_str().unwrap_or("");
+        assert!(
+            !(role == "assistant" && prev_role == "assistant"),
+            "consecutive assistant messages at index {i}: {msgs:?}"
+        );
+        if role == "assistant" {
+            if let Some(calls) = m["tool_calls"].as_array() {
+                for c in calls {
+                    if let Some(id) = c["id"].as_str() {
+                        known_call_ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+        if role == "tool" {
+            let id = m["tool_call_id"].as_str().unwrap_or_default();
+            assert!(
+                known_call_ids.iter().any(|k| k == id),
+                "tool result at index {i} references unknown tool_call id {id:?}: {msgs:?}"
+            );
+        }
+        prev_role = role;
+    }
+}
+
 fn assert_rounded_dispatch(agent: &mut Agent, state: &Arc<MockState>) {
     agent.request(
         1,
@@ -191,6 +228,7 @@ fn assert_rounded_dispatch(agent: &mut Agent, state: &Arc<MockState>) {
     );
     let messages = state.last_messages.lock().unwrap().clone().unwrap();
     assert_tool_result_rounded(&messages);
+    assert_history_invariant(&messages);
 }
 
 /// Shape 1 — Strata/Qwen returns structured tool_calls next to a think

@@ -85,13 +85,20 @@ async fn main() {
     // Load config: CLI arg (optional TOML path) → env vars → defaults
     let config_path = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
 
-    let config_file = config_path
-        .as_ref()
-        .map(|path| ConfigFile::load(std::path::Path::new(path)));
-
-    let config = match config_file {
-        Some(file) => file.into_llm_config(),
+    let config_result = match &config_path {
+        Some(path) => ConfigFile::load(std::path::Path::new(path))
+            .and_then(|file| file.into_llm_config()),
         None => llm::LlmConfig::from_env(),
+    };
+
+    // A bad config is a startup error, never a silent fallback (B7):
+    // exiting non-zero keeps a broken deployment visible to the spawner.
+    let config = match config_result {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("acp-bridge: {e}");
+            std::process::exit(2);
+        }
     };
 
     if let RunMode::Bench = mode {

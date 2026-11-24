@@ -147,6 +147,9 @@ pub enum AcpError {
 
     #[error("Session limit reached (max: {max})")]
     SessionLimitReached { max: usize },
+
+    #[error("Invalid working directory {cwd}: {reason}")]
+    InvalidCwd { cwd: String, reason: String },
 }
 
 impl AcpError {
@@ -158,6 +161,7 @@ impl AcpError {
             AcpError::MethodNotFound { .. } => -32601, // Method not found
             AcpError::LlmError { .. } => -32003,       // Application error
             AcpError::SessionLimitReached { .. } => -32004, // Application error
+            AcpError::InvalidCwd { .. } => -32602,          // Invalid params
         }
     }
 }

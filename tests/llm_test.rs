@@ -15,6 +15,10 @@ fn clear_env_vars() {
     std::env::remove_var("LLM_MAX_TOKENS");
     std::env::remove_var("LLM_TIMEOUT");
     std::env::remove_var("LLM_MAX_HISTORY_TURNS");
+    std::env::remove_var("LLM_MAX_SESSIONS");
+    std::env::remove_var("LLM_SESSION_IDLE_TIMEOUT");
+    std::env::remove_var("LLM_SUPPORTS_IMAGE");
+    std::env::remove_var("LLM_MODEL_CONTEXT");
 }
 
 #[test]
@@ -22,7 +26,7 @@ fn config_defaults() {
     let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
 
-    let config = LlmConfig::from_env();
+    let config = LlmConfig::from_env().expect("defaults must parse");
 
     assert_eq!(config.base_url, "http://localhost:11434/v1");
     assert_eq!(config.model, "gemma4:26b");
@@ -46,7 +50,7 @@ fn config_from_llm_env_vars() {
     std::env::set_var("LLM_TIMEOUT", "120");
     std::env::set_var("LLM_MAX_HISTORY_TURNS", "20");
 
-    let config = LlmConfig::from_env();
+    let config = LlmConfig::from_env().expect("valid env must parse");
 
     assert_eq!(config.base_url, "http://gpu-server:8000/v1");
     assert_eq!(config.model, "llama3:8b");
@@ -68,7 +72,7 @@ fn config_ollama_fallback_vars() {
     std::env::set_var("OLLAMA_MODEL", "qwen2:7b");
     std::env::set_var("OLLAMA_API_KEY", "ollama-key");
 
-    let config = LlmConfig::from_env();
+    let config = LlmConfig::from_env().expect("valid env must parse");
 
     assert_eq!(config.base_url, "http://ollama:11434/v1");
     assert_eq!(config.model, "qwen2:7b");
@@ -78,13 +82,26 @@ fn config_ollama_fallback_vars() {
 }
 
 #[test]
-fn config_invalid_temperature_ignored() {
+fn config_invalid_temperature_is_an_error() {
     let _lock = ENV_LOCK.lock().unwrap();
     clear_env_vars();
 
     std::env::set_var("LLM_TEMPERATURE", "not-a-number");
-    let config = LlmConfig::from_env();
-    assert!(config.temperature.is_none());
+    let err = LlmConfig::from_env()
+        .err()
+        .expect("invalid value must fail startup");
+    assert!(err.to_string().contains("LLM_TEMPERATURE"));
+
+    clear_env_vars();
+}
+
+#[test]
+fn config_invalid_timeout_is_an_error() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    clear_env_vars();
+
+    std::env::set_var("LLM_TIMEOUT", "abc");
+    assert!(LlmConfig::from_env().is_err());
 
     clear_env_vars();
 }

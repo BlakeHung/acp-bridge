@@ -6,20 +6,27 @@
 
 use serde::Deserialize;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::llm::LlmConfig;
+use crate::llm::{env_parse, env_parse_bool, ConfigError, LlmConfig};
 use reqwest::Client;
 use std::time::Duration;
 
 /// On-disk config file structure.
+///
+/// `deny_unknown_fields` is deliberate: a config that names a section or
+/// field this binary doesn't understand (e.g. `[permissions]` written for
+/// a newer build) must fail loudly instead of running with the setting
+/// silently dropped — see review B7.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     #[serde(default)]
     pub llm: LlmSection,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LlmSection {
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -43,25 +50,24 @@ pub struct LlmSection {
 }
 
 impl ConfigFile {
-    /// Try to load from a TOML file path. Returns default if file doesn't exist.
-    pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(content) => match toml::from_str(&content) {
-                Ok(cfg) => {
-                    info!(path = %path.display(), "Loaded config file");
-                    cfg
-                }
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "Failed to parse config file, using defaults");
-                    Self::default()
-                }
-            },
-            Err(_) => Self::default(),
-        }
+    /// Load from a TOML file path. Any failure — unreadable file, invalid
+    /// TOML, unknown field — is a startup error, never a silent default.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let cfg: Self = toml::from_str(&content).map_err(|e| ConfigError::Parse {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        info!(path = %path.display(), "Loaded config file");
+        Ok(cfg)
     }
 
     /// Merge config file values into LlmConfig. Env vars always take precedence.
-    pub fn into_llm_config(self) -> LlmConfig {
+    /// A present-but-invalid env var is a startup error, not a fallback.
+    pub fn into_llm_config(self) -> Result<LlmConfig, ConfigError> {
         let file = self.llm;
 
         // Helper: env var wins, then config file, then default
@@ -87,50 +93,32 @@ impl ConfigFile {
             .ok()
             .or(file.system_prompt);
 
-        let temperature = std::env::var("LLM_TEMPERATURE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
+        let temperature = env_parse::<f64>("LLM_TEMPERATURE")?
             .or(file.temperature)
             .filter(|t| t.is_finite());
 
-        let max_tokens = std::env::var("LLM_MAX_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(file.max_tokens);
+        let max_tokens = env_parse("LLM_MAX_TOKENS")?.or(file.max_tokens);
 
-        let timeout_secs = std::env::var("LLM_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let timeout_secs = env_parse("LLM_TIMEOUT")?
             .or(file.timeout_secs)
             .unwrap_or(300);
 
-        let max_history_turns = std::env::var("LLM_MAX_HISTORY_TURNS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let max_history_turns = env_parse("LLM_MAX_HISTORY_TURNS")?
             .or(file.max_history_turns)
             .unwrap_or(50);
 
-        let max_sessions = std::env::var("LLM_MAX_SESSIONS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let max_sessions = env_parse("LLM_MAX_SESSIONS")?
             .or(file.max_sessions)
             .unwrap_or(0);
 
-        let session_idle_timeout_secs = std::env::var("LLM_SESSION_IDLE_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let session_idle_timeout_secs = env_parse("LLM_SESSION_IDLE_TIMEOUT")?
             .or(file.session_idle_timeout_secs)
             .unwrap_or(0);
 
-        let prompt_supports_image = match std::env::var("LLM_SUPPORTS_IMAGE").as_deref() {
-            Ok("1") | Ok("true") | Ok("yes") | Ok("on") => true,
-            Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
-            _ => file.supports_image.unwrap_or(false),
-        };
+        let prompt_supports_image =
+            env_parse_bool("LLM_SUPPORTS_IMAGE")?.or(file.supports_image).unwrap_or(false);
 
-        let context_size = std::env::var("LLM_MODEL_CONTEXT")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let context_size = env_parse("LLM_MODEL_CONTEXT")?
             .or(file.model_context)
             .unwrap_or(32768);
 
@@ -140,7 +128,7 @@ impl ConfigFile {
             .build()
             .expect("Failed to create HTTP client");
 
-        LlmConfig {
+        Ok(LlmConfig {
             base_url,
             model,
             api_key,
@@ -154,7 +142,7 @@ impl ConfigFile {
             prompt_supports_image,
             context_size,
             client,
-        }
+        })
     }
 }
 
@@ -173,7 +161,7 @@ mod tests {
             },
         };
 
-        let llm = cfg.into_llm_config();
+        let llm = cfg.into_llm_config().expect("config should merge");
         assert_eq!(llm.system_prompt.as_deref(), Some("from file"));
     }
 
@@ -188,9 +176,42 @@ mod tests {
             },
         };
 
-        let llm = cfg.into_llm_config();
+        let llm = cfg.into_llm_config().expect("config should merge");
         assert_eq!(llm.system_prompt.as_deref(), Some("from env"));
 
         std::env::remove_var("LLM_SYSTEM_PROMPT");
+    }
+
+    #[test]
+    fn invalid_numeric_env_var_is_an_error_not_a_fallback() {
+        std::env::set_var("LLM_TIMEOUT", "abc");
+
+        let cfg = ConfigFile::default();
+        let err = cfg
+            .into_llm_config()
+            .err()
+            .expect("unparseable LLM_TIMEOUT must fail startup");
+        assert!(err.to_string().contains("LLM_TIMEOUT"));
+
+        std::env::remove_var("LLM_TIMEOUT");
+    }
+
+    #[test]
+    fn invalid_bool_env_var_is_an_error() {
+        std::env::set_var("LLM_SUPPORTS_IMAGE", "2");
+
+        let cfg = ConfigFile::default();
+        assert!(cfg.into_llm_config().is_err());
+
+        std::env::remove_var("LLM_SUPPORTS_IMAGE");
+    }
+
+    #[test]
+    fn unknown_toml_fields_are_rejected() {
+        let bad = "[permissions]\nallow_all = true\n";
+        assert!(toml::from_str::<ConfigFile>(bad).is_err());
+
+        let bad_field = "[llm]\npermisssions = \"all\"\n";
+        assert!(toml::from_str::<ConfigFile>(bad_field).is_err());
     }
 }
