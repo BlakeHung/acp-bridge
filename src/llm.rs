@@ -655,6 +655,16 @@ pub struct LlmConfig {
     /// Requires `LLM_SESSION_DIR`; without persistence the old
     /// hard-truncation path runs. `LLM_ARTIFACT_CHARS`, default 8192.
     pub artifact_inline_chars: usize,
+    /// Global bound on concurrent in-flight turns across ALL sessions
+    /// (G1a-Q2 queue items). Over the limit the prompt is refused with
+    /// an identifiable `server_busy` status instead of queueing
+    /// silently. `LLM_MAX_INFLIGHT`, default 8; 0 = unlimited.
+    pub max_inflight_turns: usize,
+    /// Largest accepted prompt payload in serialized chars (G1a-Q2
+    /// oversized single item). Over the limit → `prompt_too_large`,
+    /// identifiable, nothing queued. `LLM_MAX_PROMPT_CHARS`, default
+    /// 200_000; 0 = unlimited.
+    pub max_prompt_chars: usize,
     /// Shared HTTP client for connection pooling.
     pub client: Client,
 }
@@ -732,6 +742,8 @@ impl LlmConfig {
             auto_summarize: env_parse_bool("LLM_AUTO_SUMMARIZE")?.unwrap_or(true),
             auto_summarize_at: summarize_threshold(None)?,
             artifact_inline_chars: env_parse("LLM_ARTIFACT_CHARS")?.unwrap_or(8192),
+            max_inflight_turns: env_parse("LLM_MAX_INFLIGHT")?.unwrap_or(8),
+            max_prompt_chars: env_parse("LLM_MAX_PROMPT_CHARS")?.unwrap_or(200_000),
             client,
         })
     }
@@ -1303,6 +1315,8 @@ mod tests {
             auto_summarize: true,
             auto_summarize_at: 0.6,
             artifact_inline_chars: 8192,
+            max_inflight_turns: 8,
+            max_prompt_chars: 200_000,
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()

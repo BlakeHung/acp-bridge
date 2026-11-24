@@ -297,10 +297,22 @@ impl AppState {
 
     /// Write the session's current snapshot if a store is configured.
     /// Snapshot failures are logged inside the store, never fatal.
+    /// On a quota refusal the store first evicts stale (non-active)
+    /// sessions then retries once — live data is never the eviction
+    /// candidate (G1a-Q3).
     pub fn persist_session(&self, session_id: &str) {
         if let Some(store) = &self.session_store {
             if let Some(session) = self.sessions_read().get(session_id) {
-                store.save(session_id, &session.working_dir, &session.messages);
+                if store.save(session_id, &session.working_dir, &session.messages) {
+                    return;
+                }
+                let active_ids: Vec<String> = self.sessions_read().keys().cloned().collect();
+                let active: std::collections::HashSet<&str> =
+                    active_ids.iter().map(String::as_str).collect();
+                let evicted = store.cleanup_stale(&active);
+                if !evicted.is_empty() {
+                    store.save(session_id, &session.working_dir, &session.messages);
+                }
             }
         }
     }
@@ -1542,6 +1554,12 @@ pub fn session_timed_out(state: &AppState, session_id: &str) {
 
 fn session_aborted(state: &AppState, session_id: &str, marker: &str) {
     if let Some(session) = state.sessions_write().get_mut(session_id) {
+        // G1a-C2: a turn aborted mid-dispatch can leave an assistant
+        // tool_calls message whose results never arrived. A dangling
+        // group poisons the NEXT turn (backends reject calls missing
+        // results) — close each missing id with an explicit aborted
+        // result so history stays well-formed and the loss is visible.
+        repair_dangling_tool_calls(&mut session.messages, marker);
         if session.messages.last().is_some_and(|m| m["role"] == "user") {
             session
                 .messages
@@ -1549,6 +1567,37 @@ fn session_aborted(state: &AppState, session_id: &str, marker: &str) {
         }
     }
     state.persist_session(session_id);
+}
+
+/// Append a synthetic `tool` result for every tool_call id in the last
+/// assistant message that has no result following it.
+fn repair_dangling_tool_calls(messages: &mut Vec<Value>, marker: &str) {
+    let Some(calls) = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .and_then(|m| m["tool_calls"].as_array())
+    else {
+        return;
+    };
+    let have: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["tool_call_id"].as_str())
+        .collect();
+    let missing: Vec<String> = calls
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .filter(|id| !have.contains(id))
+        .map(str::to_string)
+        .collect();
+    for id in missing {
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "content": format!("[tool call {id} produced no result — turn aborted {marker}]")
+        }));
+    }
 }
 
 /// Outcome of a `session/load` attempt — distinct enough that the wire
@@ -2009,6 +2058,8 @@ mod tests {
             auto_summarize: true,
             auto_summarize_at: 0.6,
             artifact_inline_chars: 8192,
+            max_inflight_turns: 8,
+            max_prompt_chars: 200_000,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
@@ -2292,6 +2343,39 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 2);
         server.abort();
     }
+    #[test]
+    fn aborted_turn_closes_dangling_tool_calls() {
+        let state = AppState::new(cfg_with_image(false));
+        let sid = "dangling";
+        {
+            let mut sessions = state.sessions_write();
+            let mut s = crate::protocol::Session::new(
+                json!({"role":"system","content":"s"}),
+                std::path::PathBuf::from("/tmp"),
+                crate::protocol::ProtocolVersion::V1,
+            );
+            s.messages = vec![
+                json!({"role":"system","content":"s"}),
+                json!({"role":"user","content":"do two things"}),
+                json!({"role":"assistant","tool_calls":[{"id":"a"},{"id":"b"}]}),
+                json!({"role":"tool","tool_call_id":"a","content":"done-a"}),
+            ];
+            sessions.insert(sid.to_string(), s);
+        }
+        session_cancelled(&state, sid);
+        let msgs = state.sessions_read()[sid].messages.clone();
+        // The missing 'b' result is closed — the next call stays
+        // well-formed instead of sending a dangling tool_calls group.
+        let results: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["tool_call_id"].as_str())
+            .collect();
+        assert!(results.contains(&"a") && results.contains(&"b"));
+        let closed = msgs.iter().find(|m| m["tool_call_id"] == "b").unwrap();
+        assert!(closed["content"].as_str().unwrap().contains("aborted"));
+    }
+
     #[test]
     fn offload_keeps_pointer_when_store_present_and_truncates_without() {
         let mut cfg = cfg_with_image(false);

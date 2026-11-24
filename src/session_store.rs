@@ -19,7 +19,7 @@
 use serde_json::{json, Value};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Guard holding a session's writer lock — the `.lock` file's
 /// existence is the lock; dropping removes it. A process crash leaves
@@ -242,15 +242,15 @@ impl SessionStore {
     /// lock → tmp+fsync → rename → `.done` commit marker → dir fsync.
     /// A crash anywhere before `.done` leaves a load() that answers
     /// corrupt (uncommitted), never a half-session.
-    pub fn save(&self, session_id: &str, working_dir: &Path, messages: &[Value]) {
+    pub fn save(&self, session_id: &str, working_dir: &Path, messages: &[Value]) -> bool {
         let Some(path) = self.path(session_id) else {
             warn!(session_id, "unsanitizable session id; snapshot skipped");
-            return;
+            return false;
         };
         // Single-writer: the lock exists before any side effect, and a
         // second live writer skips rather than racing the rename.
         let Some(_lock) = self.acquire_lock(session_id) else {
-            return;
+            return false;
         };
 
         let doc = json!({
@@ -270,7 +270,7 @@ impl SessionStore {
                 bytes = body.len(),
                 "snapshot exceeds per-file cap; save skipped"
             );
-            return;
+            return false;
         }
         let (files, bytes) = self.store_usage();
         if files >= Self::MAX_STORE_FILES {
@@ -278,11 +278,11 @@ impl SessionStore {
                 session_id,
                 files, "store file-count cap reached; save skipped"
             );
-            return;
+            return false;
         }
         if bytes + body.len() as u64 > Self::MAX_STORE_BYTES {
             warn!(session_id, bytes, "store byte cap reached; save skipped");
-            return;
+            return false;
         }
 
         let tmp = path.with_extension("json.tmp");
@@ -312,17 +312,68 @@ impl SessionStore {
         })();
 
         match committed {
-            Ok(()) => debug!(session_id, "session snapshot saved"),
+            Ok(()) => {
+                debug!(session_id, "session snapshot saved");
+                true
+            }
             Err(e) => {
                 warn!(error = %e, session_id, "session snapshot save failed");
-                // Uncommitted state must not be confused for a snapshot:
-                // remove a partial .done (create order puts it last, so
-                // on failure it shouldn't exist — belt and suspenders).
                 if let Some(done) = self.done_path(session_id) {
                     let _ = std::fs::remove_file(done);
                 }
+                false
             }
         }
+    }
+
+    /// G1a-Q3 quota-triggered cleanup: evict the OLDEST stored sessions
+    /// that are not in `active` — snapshots (.json/.done/.lock), any
+    /// `.tmp` stragglers, and that session's artifact dir — until the
+    /// store is back under quota or nothing removable remains. An
+    /// active session's data is never touched; a `.done` is not
+    /// required for eviction (an uncommitted snapshot is already
+    /// worthless). Returns evicted session ids.
+    pub fn cleanup_stale(&self, active: &std::collections::HashSet<&str>) -> Vec<String> {
+        let mut evicted = Vec::new();
+        // Oldest-first candidates: every session id with a .json file.
+        let mut candidates: Vec<(std::time::SystemTime, String)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let Some(id) = name.strip_suffix(".json") else {
+                    continue;
+                };
+                if Self::safe_name(id).is_none() || active.contains(id) {
+                    continue;
+                }
+                let mtime = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                candidates.push((mtime, id.to_string()));
+            }
+        }
+        candidates.sort();
+        for (_, id) in candidates {
+            let (files, bytes) = self.store_usage();
+            if files < Self::MAX_STORE_FILES && bytes < Self::MAX_STORE_BYTES * 3 / 4 {
+                break; // back under quota with headroom
+            }
+            for suffix in ["json", "done", "lock", "json.tmp"] {
+                let _ = std::fs::remove_file(self.dir.join(format!("{id}.{suffix}")));
+            }
+            if let Some(art) = self.artifact_dir(&id) {
+                let _ = std::fs::remove_dir_all(art);
+            }
+            evicted.push(id);
+        }
+        if !evicted.is_empty() {
+            info!(
+                count = evicted.len(),
+                "evicted stale sessions to relieve store quota"
+            );
+        }
+        evicted
     }
 
     /// Load a snapshot. Returns `Ok(None)` when none exists — that is
@@ -659,6 +710,29 @@ mod tests {
             .is_none());
         // Hostile call ids sanitize, hostile session ids refuse.
         assert!(store.write_artifact("../escape", "c", "x").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_stale_evicts_inactive_only() {
+        let (store, dir) = temp_store("cleanup");
+        let msgs = vec![json!({"role":"user","content":"hi"})];
+        for id in ["old-1", "old-2", "live"] {
+            store.save(id, Path::new("/tmp"), &msgs);
+        }
+        let mut active = std::collections::HashSet::new();
+        active.insert("live");
+        store.write_artifact("old-1", "c1", &"x".repeat(1_000_000));
+        store.write_artifact("old-2", "c1", &"x".repeat(1_000_000));
+        let evicted = store.cleanup_stale(&active);
+        // 'live' is never an eviction candidate, quota pressure or not.
+        assert!(dir.join("live.json").exists());
+        assert!(!evicted.contains(&"live".to_string()));
+        for id in &evicted {
+            assert_ne!(id, "live");
+            assert!(!dir.join(format!("{id}.json")).exists());
+            assert!(!dir.join("artifacts").join(id).exists());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

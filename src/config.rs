@@ -206,6 +206,8 @@ impl ConfigFile {
             artifact_inline_chars: env_parse("LLM_ARTIFACT_CHARS")?
                 .or(file.artifact_inline_chars)
                 .unwrap_or(8192),
+            max_inflight_turns: env_parse("LLM_MAX_INFLIGHT")?.unwrap_or(8),
+            max_prompt_chars: env_parse("LLM_MAX_PROMPT_CHARS")?.unwrap_or(200_000),
             client,
         };
         Ok((llm, policy))

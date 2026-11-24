@@ -20,6 +20,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Added
 - Tool-output artifacts: results past `LLM_ARTIFACT_CHARS` (default 8192) are written to `{LLM_SESSION_DIR}/artifacts/<session>/<call>.txt` (tmp+rename+fsync, inside the recursive store quota) and history keeps a head excerpt plus a re-readable `read_file` pointer. `read_file` accepts absolute paths only inside the session artifact root — every other absolute path stays denied. Without `LLM_SESSION_DIR` outputs truncate at the same budget.
 - `read_file` line pagination: optional `offset` (1-based) and `limit` parameters return a `[lines X-Y of N]` header plus the slice — the supported way to page through artifact files and large sources instead of pulling whole files into history.
+- Turn-boundary quotas (G1a-Q2): `LLM_MAX_INFLIGHT` (default 8) bounds concurrent turns globally — the excess prompt is refused `server_busy`; `LLM_MAX_PROMPT_CHARS` (default 200K) refuses oversized payloads as `prompt_too_large`. Both statuses are identifiable; cancel/completion frees the slot.
+- Quota-triggered store cleanup (G1a-Q3): when the cumulative store quota refuses a snapshot, the oldest non-active sessions' snapshots+artifacts are evicted and the save retried once — live sessions are never candidates.
+
+### Fixed
+- Terminal-state race (G1a-C1): a cancel arriving after the engine's result already committed now reports the completion — the turn no longer masquerades as `cancelled` while dropping a finished result.
+- Dangling tool calls (G1a-C2): an aborted turn closes any tool_call ids left without results with an explicit aborted marker — the next turn can't send a malformed tool_calls group.
 
 ## [0.10.0] - 2026-11-24
 

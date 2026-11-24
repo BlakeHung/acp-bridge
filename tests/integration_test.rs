@@ -1621,6 +1621,60 @@ async fn test_context_overflow_compacts_and_retries() {
     h.shutdown();
 }
 
+/// G1a-Q2: the in-flight turn bound and the oversized-item bound both
+/// refuse with identifiable statuses — nothing queues silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_inflight_bound_and_oversized_prompt() {
+    let port = free_port();
+    let mut h = TestHarness::start_with_router_and_env(
+        port,
+        mock_llm_slow_router(),
+        &[
+            ("LLM_BASE_URL", &format!("http://127.0.0.1:{port}/v1")),
+            ("LLM_MAX_INFLIGHT", "1"),
+            ("LLM_MAX_PROMPT_CHARS", "4000"),
+        ],
+    )
+    .await;
+
+    let mut sids = Vec::new();
+    for id in [1u64, 2] {
+        h.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/new","params":{"cwd":"/tmp"}}));
+        let r = h.read_line();
+        sids.push(r["result"]["sessionId"].as_str().unwrap().to_string());
+    }
+    let (s_a, s_b) = (sids[0].clone(), sids[1].clone());
+    // Session A occupies the only turn slot (mock sleeps 4s).
+    h.send(&json!({"jsonrpc":"2.0","id":10,"method":"session/prompt",
+        "params":{"sessionId":s_a,"prompt":[{"type":"text","text":"slow work"}]}}));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Session B's prompt must be refused server_busy, not queued.
+    h.send(&json!({"jsonrpc":"2.0","id":11,"method":"session/prompt",
+        "params":{"sessionId":s_b,"prompt":[{"type":"text","text":"second"}]}}));
+    let busy = h.read_line();
+    assert_eq!(busy["error"]["data"]["reason"], "server_busy", "{busy}");
+
+    // Oversized payload: refused as prompt_too_large regardless of slots.
+    let big = "x".repeat(9000);
+    h.send(&json!({"jsonrpc":"2.0","id":12,"method":"session/prompt",
+        "params":{"sessionId":s_b,"prompt":[{"type":"text","text":big}]}}));
+    let big_resp = h.read_line();
+    assert_eq!(
+        big_resp["error"]["data"]["reason"], "prompt_too_large",
+        "{big_resp}"
+    );
+
+    // A's turn completes → the slot frees; B's prompt now goes through.
+    let (_, r_a) = h.read_until_response(10);
+    assert_eq!(r_a["result"]["status"], "completed", "{r_a}");
+    h.send(&json!({"jsonrpc":"2.0","id":13,"method":"session/prompt",
+        "params":{"sessionId":s_b,"prompt":[{"type":"text","text":"now it fits"}]}}));
+    let (_, r_b) = h.read_until_response(13);
+    assert_eq!(r_b["result"]["status"], "completed", "{r_b}");
+    h.shutdown();
+}
+
 /// session/permit issues a single-use grant that rescues exactly one
 /// `confirm`-blocked tool call — ungranted stays denied, consumed stays
 /// consumed.

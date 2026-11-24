@@ -338,6 +338,8 @@ mod tests {
             auto_summarize: true,
             auto_summarize_at: 0.6,
             artifact_inline_chars: 8192,
+            max_inflight_turns: 8,
+            max_prompt_chars: 200_000,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()

@@ -374,6 +374,18 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                             "session/prompt" => {
                                 let sid = params.get("sessionId").and_then(Value::as_str)
                                     .unwrap_or("").to_string();
+                                // G1a-Q2 oversized single item: refuse up front with
+                                // an identifiable status instead of queueing it and
+                                // failing deep inside the context fitter.
+                                let max_prompt = state.config.max_prompt_chars;
+                                if max_prompt > 0
+                                    && params["prompt"].to_string().len() > max_prompt
+                                {
+                                    acp::send_error_with_data(&id, -32001,
+                                        "Prompt payload exceeds LLM_MAX_PROMPT_CHARS",
+                                        json!({"reason": "prompt_too_large", "max": max_prompt}));
+                                    continue;
+                                }
                                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                                 {
                                     let mut registry = state.turn_registry.lock().expect("turn registry lock");
@@ -381,6 +393,16 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                         acp::send_error_with_data(&id, -32001,
                                             "A turn is already in progress for this session; send session/cancel first",
                                             json!({"reason": "turn_in_progress"}));
+                                        continue;
+                                    }
+                                    // G1a-Q2 queue items: global in-flight bound.
+                                    // Two prompts racing for the last slot resolve
+                                    // under this same mutex — exactly one wins.
+                                    let cap = state.config.max_inflight_turns;
+                                    if cap > 0 && registry.len() >= cap {
+                                        acp::send_error_with_data(&id, -32001,
+                                            "All turn slots are busy; retry after a turn completes or send session/cancel",
+                                            json!({"reason": "server_busy", "max": cap}));
                                         continue;
                                     }
                                     // Register before spawning: an immediately following cancel must see this turn.
@@ -747,18 +769,34 @@ async fn handle_acp_prompt(
 
     let mut cancelled = false;
     let mut timed_out = false;
+    // G1a-C1: exactly one terminal state per accepted prompt. When a
+    // cancel races the engine's completion, whichever committed first
+    // wins — a turn that already produced its result reports the result,
+    // never a false "cancelled".
+    let mut completed_result: Option<engine::PromptResult> = None;
     loop {
         tokio::select! {
             // `changed` also fires for a cancel sent before this task first polls.
             _ = cancel_rx.changed() => {
                 handle.abort();
                 // Wait for the engine to release its session access before accepting another turn.
-                let _ = (&mut handle).await;
-                engine::session_cancelled(state, &session_id);
-                while let Ok(notif) = notify_rx.try_recv() {
-                    emit_prompt_notification(state.protocol_version, &session_id, notif);
+                match (&mut handle).await {
+                    // The JoinHandle already held the result — the abort
+                    // arrived after completion committed. Completion wins.
+                    Ok(result) => {
+                        while let Ok(notif) = notify_rx.try_recv() {
+                            emit_prompt_notification(state.protocol_version, &session_id, notif);
+                        }
+                        completed_result = Some(result);
+                    }
+                    Err(_) => {
+                        engine::session_cancelled(state, &session_id);
+                        while let Ok(notif) = notify_rx.try_recv() {
+                            emit_prompt_notification(state.protocol_version, &session_id, notif);
+                        }
+                        cancelled = true;
+                    }
                 }
-                cancelled = true;
                 break;
             }
             _ = &mut turn_deadline, if state.config.turn_timeout_secs > 0 => {
@@ -823,19 +861,22 @@ async fn handle_acp_prompt(
         return;
     }
 
-    let result = handle.await.unwrap_or_else(|_| engine::PromptResult {
-        status: "failed".into(),
-        text: "Internal error".into(),
-        error: None,
-        usage: engine::UsageReport {
-            used: 0,
-            size: state.config.context_size,
-        },
-        evidence: engine::TurnEvidence::default(),
-        error_class: Some(acp_bridge::llm::LlmErrorKind::Unknown),
-        error_retryable: false,
-        message_id: message_id.clone(),
-    });
+    let result = match completed_result {
+        Some(r) => r,
+        None => handle.await.unwrap_or_else(|_| engine::PromptResult {
+            status: "failed".into(),
+            text: "Internal error".into(),
+            error: None,
+            usage: engine::UsageReport {
+                used: 0,
+                size: state.config.context_size,
+            },
+            evidence: engine::TurnEvidence::default(),
+            error_class: Some(acp_bridge::llm::LlmErrorKind::Unknown),
+            error_retryable: false,
+            message_id: message_id.clone(),
+        }),
+    };
 
     drop(guard);
 

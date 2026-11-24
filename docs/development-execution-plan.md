@@ -182,3 +182,5 @@ P6 進入：有需跨 turn／跨重啟持續的真實流程；出口：節點 cr
 ## 狀態註記（2026-11-24 晚更新）
 
 本表底部原標「全部 pending」已過時。實際：E01 修復、P1 前半切片與 round-2/3 硬化、以及 P2 前段的 context manager（成組裁剪＋工作記憶摘要，`fix/g1a-round2@86f6a2b`，rc.5）已交付並通過本機測試；G0 因 golden trace/Strata 量測/Windows 環境缺失仍 blocked；G1a/G1b 部分交付但 gate 未驗（缺 C/Q 競態與 D/W fencing 案例）；G2 僅 E21/E22 主體落地；G3a/b/c、GB 未開始。細節以 `acp-agent-evidence/p0-gap-inventory.md` 總覽表為準。
+
+更新（同日晚，rc.7）：G1a C/Q 案例已實作——C1 終態單一贏家（cancel 晚於完成已提交時照完成發，不冒名 cancelled）；C2 abort 時補齊缺結果的 tool_call；Q2 `LLM_MAX_INFLIGHT`(8)/`LLM_MAX_PROMPT_CHARS`(200K) 拒絕可辨識（server_busy/prompt_too_large）；Q3 `cleanup_stale` 只清非活躍 session。工具輸出 artifact 化＋read_file offset/limit 分頁（Kiro/Devin 模式）。C3 殘留程序與 D/W fencing 仍未做——G1a/G1b gate 維持未驗。
