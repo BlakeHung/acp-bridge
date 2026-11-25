@@ -194,6 +194,9 @@ async fn cancel_and_follow_up_work_on_both_wire_versions() {
 /// the in-flight LLM request. Before async tool execution, a `bash`
 /// `sleep` blocked the turn until the command finished on its own —
 /// cancel had no effect for tens of seconds.
+/// Needs a real `bash` — on Windows the name resolves to the WSL stub,
+/// which exits instantly and makes this meaningless.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_kills_running_subprocess_tool() {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

@@ -72,7 +72,7 @@ fn v2_tool_call_uses_tool_call_update_not_tool_call() {
     a.request(1, "initialize", v2_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -131,7 +131,7 @@ fn v2_plan_uses_plan_update_with_plan_id() {
     a.request(1, "initialize", v2_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -168,7 +168,7 @@ fn v2_emits_state_update_at_end_of_turn() {
     a.request(1, "initialize", v2_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -219,7 +219,7 @@ fn v2_does_not_emit_state_update_for_v1_clients() {
     );
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -286,7 +286,7 @@ fn v2_session_prompt_response_carries_message_id() {
     a.request(1, "initialize", v2_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -334,7 +334,7 @@ fn v2_session_close_succeeds_and_v2_session_delete_gracefully_rejects() {
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
     // session/close on a known session must succeed.
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -369,7 +369,7 @@ fn v2_session_list_returns_session_info_with_cwd() {
     a.request(1, "initialize", v2_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, _) = a.recv_response(&Value::from(2), Duration::from_secs(5));
 
     a.request(3, "session/list", json!({}));
@@ -383,9 +383,15 @@ fn v2_session_list_returns_session_info_with_cwd() {
     );
     let first = &sessions[0];
     assert!(first["sessionId"].is_string());
+    // cwd is echoed CANONICALIZED.
+    let expected = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     assert_eq!(
-        first["cwd"], "/tmp",
-        "session_info.cwd must echo the working_dir passed to session/new: {first}"
+        first["cwd"].as_str().unwrap(),
+        expected,
+        "session_info.cwd must echo the canonicalized working_dir: {first}"
     );
     assert!(
         resp["result"]["nextCursor"].is_null(),

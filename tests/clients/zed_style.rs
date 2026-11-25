@@ -96,7 +96,7 @@ fn zed_style_session_new_ignores_mcp_servers_param() {
         2,
         "session/new",
         json!({
-            "cwd": "/tmp",
+            "cwd": env!("CARGO_MANIFEST_DIR"),
             "mcpServers": [
                 {"name": "filesystem", "command": "fs-mcp", "args": ["--stdio"]}
             ]
@@ -113,7 +113,7 @@ fn zed_style_session_prompt_streams_text_chunks_and_returns_stop_reason() {
     a.request(1, "initialize", zed_initialize_params());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -153,7 +153,7 @@ fn zed_style_session_load_returns_no_persistence_data_reason() {
     a.request(
         2,
         "session/load",
-        json!({"sessionId": "sess_does_not_exist", "cwd": "/tmp"}),
+        json!({"sessionId": "sess_does_not_exist", "cwd": env!("CARGO_MANIFEST_DIR")}),
     );
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     assert_eq!(resp["error"]["code"], -32001);

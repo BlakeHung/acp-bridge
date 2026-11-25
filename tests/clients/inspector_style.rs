@@ -127,7 +127,7 @@ fn inspector_style_session_prompt_accepts_resource_link_content_block() {
     a.request(1, "initialize", inspector_initialize_params());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -169,7 +169,7 @@ fn inspector_style_session_prompt_pure_resource_link_succeeds() {
     a.request(1, "initialize", inspector_initialize_params());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 

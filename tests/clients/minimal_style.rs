@@ -75,7 +75,7 @@ fn minimal_style_session_cancel_is_acknowledged_as_notification() {
     a.request(1, "initialize", minimal_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 

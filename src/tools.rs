@@ -2101,6 +2101,7 @@ mod tests {
     /// printing megabytes keeps ~1MB and says so, rather than the
     /// backend buffering the whole stream.
     #[tokio::test]
+    #[cfg(unix)]
     async fn bash_output_is_bounded() {
         let wd = tmpwd();
         // ~2MB of 'a' — well past the 1MB stream cap.
@@ -2310,6 +2311,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn bash_timeout_kills_process() {
         // A command that sleeps longer than the tool timeout must return
         // a Timeout error quickly, not block the turn.
@@ -2331,6 +2333,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn bash_nonzero_exit_reports_exit_code() {
         let wd = tmpwd();
         let result = execute_bash(&wd, "echo out; echo err >&2; exit 7", 30).await;
@@ -2344,6 +2347,7 @@ mod tests {
     /// `String::truncate` panics and would crash the tool loop (plan's
     /// 「巨量 UTF-8」 boundary case).
     #[tokio::test]
+    #[cfg(unix)]
     async fn bash_output_truncates_on_utf8_boundary() {
         let wd = tmpwd();
         // 30_000 CJK chars = 90_000 bytes — beyond the 50 KB cap, and the

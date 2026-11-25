@@ -346,7 +346,7 @@ async fn test_full_flow_string_id_session_update_and_stop_reason() {
     assert_eq!(resp["id"], "init-1");
 
     // session/new with a string id
-    h.send(&json!({"jsonrpc":"2.0","id":"new-1","method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":"new-1","method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     assert_eq!(resp["id"], "new-1");
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
@@ -433,7 +433,7 @@ async fn test_session_prompt_streaming() {
     let mut h = TestHarness::start(port).await;
 
     // Create session
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -554,7 +554,7 @@ async fn test_full_conversation_flow() {
     let _ = h.read_line();
 
     // New session
-    h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -597,7 +597,7 @@ async fn test_empty_prompt_rejected() {
     let port = free_port();
     let mut h = TestHarness::start(port).await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -681,7 +681,7 @@ async fn test_llm_error_returns_response() {
     let mut h = TestHarness::start_with_router(port, mock_llm_error_router()).await;
 
     // Create session
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -718,7 +718,7 @@ async fn test_sse_crlf_line_endings() {
     let port = free_port();
     let mut h = TestHarness::start_with_router(port, mock_llm_crlf_router()).await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -760,17 +760,17 @@ async fn test_max_sessions_limit() {
     .await;
 
     // Create session 1
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     assert!(resp["result"]["sessionId"].is_string());
 
     // Create session 2
-    h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     assert!(resp["result"]["sessionId"].is_string());
 
     // Create session 3 — should be rejected
-    h.send(&json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     assert_eq!(
         resp["error"]["code"], -32004,
@@ -931,7 +931,7 @@ async fn test_ollama_native_streaming() {
     )
     .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -991,7 +991,7 @@ async fn test_ollama_openai_compat_still_works() {
     )
     .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -1317,7 +1317,7 @@ async fn test_tool_round_limit_surfaces_failure() {
     )
     .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -1362,7 +1362,7 @@ async fn test_tool_round_limit_wraps_up_with_partial_answer() {
     )
     .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -1414,7 +1414,7 @@ async fn test_max_tool_rounds_env_override() {
     )
     .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -1450,7 +1450,7 @@ async fn test_tool_failure_streak_aborts_loop() {
     )
     .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -1534,7 +1534,7 @@ async fn test_policy_deny_reaches_model_as_tool_result() {
         .route("/api/tags", get(mock_ollama_tags));
 
     let mut h = TestHarness::start_with_router_and_env(port, app, &[]).await;
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
     h.send(&json!({
@@ -1594,7 +1594,7 @@ async fn test_context_overflow_compacts_and_retries() {
         .route("/api/tags", get(mock_ollama_tags));
     let mut h =
         TestHarness::start_with_router_and_env(port, app, &[("LLM_AUTO_SUMMARIZE", "false")]).await;
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let response = h.read_line();
     let sid = response["result"]["sessionId"]
         .as_str()
@@ -1639,7 +1639,7 @@ async fn test_inflight_bound_and_oversized_prompt() {
 
     let mut sids = Vec::new();
     for id in [1u64, 2] {
-        h.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/new","params":{"cwd":"/tmp"}}));
+        h.send(&json!({"jsonrpc":"2.0","id":id,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
         let r = h.read_line();
         sids.push(r["result"]["sessionId"].as_str().unwrap().to_string());
     }
@@ -1711,7 +1711,7 @@ async fn test_session_permit_rescues_one_confirm_call() {
         TestHarness::start_with_router_and_env(port, app, &[("LLM_POLICY_SHELL", "confirm")]).await;
 
     // Session A: no permit — the bash call must be denied (tool fails).
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sida = resp["result"]["sessionId"].as_str().unwrap().to_string();
     h.send(&json!({
@@ -1727,7 +1727,7 @@ async fn test_session_permit_rescues_one_confirm_call() {
     );
 
     // Session B: a shell permit rescues the same call once.
-    h.send(&json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sidb = resp["result"]["sessionId"].as_str().unwrap().to_string();
     h.send(&json!({
@@ -1828,7 +1828,7 @@ async fn test_session_load_restores_across_restart() {
         let resp = h.read_line();
         // The capability is only honest with a store configured.
         assert_eq!(resp["result"]["agentCapabilities"]["loadSession"], true);
-        h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}));
+        h.send(&json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
         sid = h.read_line()["result"]["sessionId"]
             .as_str()
             .unwrap()
@@ -1910,7 +1910,7 @@ async fn test_turn_timeout_fails_prompt() {
     )
     .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -1951,7 +1951,7 @@ async fn test_image_blocks_dropped_before_backend_when_unsupported() {
         TestHarness::start_with_router(port, mock_llm_image_inspector_router(inspect.clone()))
             .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -1993,7 +1993,7 @@ async fn test_image_only_prompt_completes_without_backend_call() {
         TestHarness::start_with_router(port, mock_llm_image_inspector_router(inspect.clone()))
             .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -2033,7 +2033,7 @@ async fn test_image_blocks_forwarded_when_supported() {
     )
     .await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -2067,7 +2067,7 @@ async fn test_tool_call_list_dir() {
     .await;
 
     // Create session with a real directory as cwd
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -2120,7 +2120,7 @@ async fn test_tool_sandbox_prevents_escape() {
     use std::path::Path;
 
     let result = tools::execute_tool(
-        Path::new("/tmp"),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
         "read_file",
         &json!({"path": "../../etc/passwd"}),
         30,
@@ -2196,7 +2196,7 @@ async fn test_tool_unknown() {
     use std::path::Path;
 
     let result = tools::execute_tool(
-        Path::new("/tmp"),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
         "hack_the_planet",
         &json!({}),
         30,
@@ -2249,7 +2249,7 @@ async fn test_tool_call_notification_carries_tool_call_id_and_kind() {
     let port = free_port();
     let mut h = TestHarness::start(port).await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -2336,7 +2336,7 @@ async fn test_thought_chunk_carries_content_block() {
     let port = free_port();
     let mut h = TestHarness::start(port).await;
 
-    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}));
+    h.send(&json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":env!("CARGO_MANIFEST_DIR")}}));
     let resp = h.read_line();
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 

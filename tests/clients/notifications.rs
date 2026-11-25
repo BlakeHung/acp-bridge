@@ -29,7 +29,7 @@ fn session_new_emits_available_commands_and_session_info() {
     a.request(1, "initialize", minimal_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (notifications, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -80,8 +80,12 @@ fn session_new_emits_available_commands_and_session_info() {
         !title.is_empty(),
         "session_info_update.title must be non-empty"
     );
-    // /tmp → basename "tmp"
-    assert_eq!(title, "tmp");
+    // title derives from the raw cwd basename.
+    let expected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    assert_eq!(title, expected);
 
     let _ = sid;
     a.shutdown();
@@ -93,7 +97,7 @@ fn session_prompt_emits_usage_update_and_derived_title() {
     a.request(1, "initialize", minimal_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -175,7 +179,7 @@ fn session_prompt_emits_plan_notification() {
     a.request(1, "initialize", minimal_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (_, resp) = a.recv_response(&Value::from(2), Duration::from_secs(5));
     let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -209,7 +213,7 @@ fn available_commands_update_round_trips_through_protocol() {
     a.request(1, "initialize", minimal_init());
     let _ = a.recv_response(&Value::from(1), Duration::from_secs(5));
 
-    a.request(2, "session/new", json!({"cwd": "/tmp"}));
+    a.request(2, "session/new", json!({"cwd": env!("CARGO_MANIFEST_DIR")}));
     let (notifications, _) = a.recv_response(&Value::from(2), Duration::from_secs(5));
 
     let commands_update = notifications

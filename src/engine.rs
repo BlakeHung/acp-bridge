@@ -2035,8 +2035,12 @@ mod tests {
     #[test]
     fn permits_are_single_use_and_scoped() {
         let state = AppState::new(cfg_with_image(false));
-        let sid = crate::engine::session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1)
-            .unwrap();
+        let sid = crate::engine::session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
 
         // Capability-scoped permit consumes once.
         let p1 = state.session_permit(&sid, "shell", None, 60).unwrap();
@@ -2067,8 +2071,12 @@ mod tests {
             .is_some());
 
         // Permits don't leak across sessions, and bad inputs fail clean.
-        let sid2 = crate::engine::session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1)
-            .unwrap();
+        let sid2 = crate::engine::session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
         state.session_permit(&sid2, "web", None, 60).unwrap();
         assert!(
             state
@@ -2420,7 +2428,12 @@ mod tests {
         let mut cfg = cfg_with_image(false);
         cfg.base_url = url;
         let state = AppState::new(cfg);
-        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let sid = session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
         state
             .sessions_write()
             .get_mut(&sid)
@@ -2489,7 +2502,12 @@ mod tests {
         let mut cfg = cfg_with_image(false);
         cfg.base_url = url;
         let state = AppState::new(cfg);
-        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let sid = session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
         let mut messages = vec![
             json!({"role":"system","content":"rules"}),
             json!({"role":"user","content":"task"}),
@@ -2528,7 +2546,12 @@ mod tests {
         cfg.base_url = url;
         cfg.auto_summarize = false;
         let state = AppState::new(cfg);
-        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let sid = session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
         let messages = vec![
             json!({"role":"system","content":"rules"}),
             json!({"role":"user","content":"task"}),
@@ -2626,7 +2649,12 @@ mod tests {
         cfg.base_url = url;
         cfg.context_size = 65536; // config claims 64K…
         let state = AppState::new(cfg);
-        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let sid = session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
         // …but the session already learned the backend's real 32K window.
         state
             .sessions_write()
@@ -2673,7 +2701,12 @@ mod tests {
         cfg.context_size = 262144;
         cfg.max_tokens = Some(40000);
         let state = AppState::new(cfg);
-        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let sid = session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
         // Small messages: actual prompt+40K output overflows the real 32K
         // window, while prompt alone does not — only the output budget
         // needs to shrink for the retry to pass.
@@ -2705,7 +2738,12 @@ mod tests {
         cfg.base_url = url;
         cfg.auto_summarize = false;
         let state = AppState::new(cfg);
-        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let sid = session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
         let messages = vec![
             json!({"role":"system","content":"rules"}),
             json!({"role":"user","content":"task"}),
@@ -2763,7 +2801,12 @@ mod tests {
         cfg.auto_summarize = false;
         cfg.context_size = 65536; // config claims double the backend's window
         let state = AppState::new(cfg);
-        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let sid = session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
         let messages = vec![
             json!({"role":"system","content":"rules"}),
             json!({"role":"user","content":"task"}),
@@ -2809,7 +2852,12 @@ mod tests {
             session_store: Some(std::sync::Arc::new(store)),
             ..(*base).clone()
         };
-        let sid = session_new(&state, "/tmp", crate::protocol::ProtocolVersion::V1).unwrap();
+        let sid = session_new(
+            &state,
+            env!("CARGO_MANIFEST_DIR"),
+            crate::protocol::ProtocolVersion::V1,
+        )
+        .unwrap();
 
         // ~60 KB ASCII ≈ 20K estimated tokens > half the usable window.
         let big_text = "使用者貼上的大量內容 ".repeat(4000);
