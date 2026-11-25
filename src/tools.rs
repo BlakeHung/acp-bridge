@@ -1283,6 +1283,22 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
         }
     }
 
+    // Pin the workspace inode FIRST: the capability dir fd anchors
+    // every later resolution. `canonical_wd` is still computed via
+    // std for the prefix checks below — if the path is swapped between
+    // open and canonicalize the checks may evaluate against the wrong
+    // tree, but the beneath-ops can never escape the pinned inode
+    // either way; the checks only gate the documented rejections.
+    let sandbox =
+        match cap_std::fs::Dir::open_ambient_dir(working_dir, cap_std::ambient_authority()) {
+            Ok(d) => d,
+            Err(e) => {
+                return ToolResult::err(
+                    ToolErrorKind::ExecFailed,
+                    format!("Error opening workspace: {e}"),
+                )
+            }
+        };
     let canonical_wd = match working_dir.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -1293,15 +1309,13 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
         }
     };
 
-    // Resolved write target — set to the canonical parent + basename so
-    // the open()/rename() path contains no symlink components at all.
-    let target_real;
+    // ── Static rejection contract (advisory, not the safety mechanism) ──
+    // These checks still produce the documented OutOfSandbox errors for
+    // symlinked escapes, but the actual guarantee below no longer
+    // depends on them being timed correctly.
     if let Some(parent) = target.parent() {
-        // Validate the deepest EXISTING ancestor before creating
-        // anything. A blind `create_dir_all` first would happily make
-        // real directories outside the sandbox through a symlinked
-        // component — the side effect must not happen even when the
-        // write is ultimately rejected (G1a-FS1).
+        // Validate the deepest EXISTING ancestor: a symlinked component
+        // resolving outside is rejected outright (G1a-FS1 contract).
         let mut ancestor = parent;
         let existing = loop {
             match ancestor.symlink_metadata() {
@@ -1330,42 +1344,11 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
                 );
             }
         }
-
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return ToolResult::err(
-                ToolErrorKind::ExecFailed,
-                format!("Error creating parent directory: {e}"),
-            );
-        }
-        // Re-verify after creation (TOCTOU-lite): a directory swapped
-        // in for a symlink between the checks above and now would
-        // still land the write outside the sandbox.
-        match parent.canonicalize() {
-            Ok(canon_parent) if canon_parent.starts_with(&canonical_wd) => {
-                // Write through the CANONICAL path — every component is
-                // a verified real directory, so no symlink component can
-                // be swapped in on the open() path.
-                target_real = canon_parent.join(target.file_name().unwrap());
-            }
-            _ => {
-                return ToolResult::err(
-                    ToolErrorKind::OutOfSandbox,
-                    format!(
-                        "Error: path '{}' escapes the working directory via a symlinked parent",
-                        relative_path
-                    ),
-                );
-            }
-        }
-    } else {
-        target_real = canonical_wd.join(target.file_name().unwrap());
     }
 
-    // An existing target that is itself a symlink: the tmp-write+rename
-    // below REPLACES the dentry instead of following it, so a swapped-in
-    // link at write time can no longer redirect bytes outside (G1a-FS2).
-    // Still refuse outright for a clear error — and refuse when it
-    // resolves inside but the model clearly meant to write through it.
+    // An existing target that is itself a symlink: refuse when it
+    // resolves outside (documented contract; the beneath-ops below
+    // would contain the damage anyway).
     if let Ok(meta) = target.symlink_metadata() {
         if meta.file_type().is_symlink() {
             match target.canonicalize() {
@@ -1383,55 +1366,61 @@ fn execute_write_file(working_dir: &Path, relative_path: &str, content: &str) ->
         }
     }
 
-    // Atomic publish: write the payload to a same-dir temp name, then
-    // rename() over the target. rename() replaces the dentry — it can
-    // never follow a swapped-in symlink — and readers see either the
-    // old file or the new one, never a partial write.
+    // ── Capability-bounded effects (G1a-FS2/FS3) ──────────────────────
+    // Every filesystem effect below resolves beneath the capability
+    // dir fd pinned above — openat2 where available, cap-std's
+    // component-wise fallback elsewhere. A parent directory swapped in
+    // at ANY point (before create, before write, before rename) lands
+    // inside the capability or fails; it cannot redirect effects
+    // outside. Absolute symlinks resolve inside the capability root.
+    // This replaces the check-then-use pattern that raced swaps
+    // between canonicalize and use.
+    let rel_target = Path::new(cleaned);
+    if let Some(parent) = rel_target.parent() {
+        if parent.as_os_str().is_empty() {
+            // top-level file — no dirs to create
+        } else if let Err(e) = sandbox.create_dir_all(parent) {
+            return ToolResult::err(
+                ToolErrorKind::ExecFailed,
+                format!("Error creating parent directory: {e}"),
+            );
+        }
+    }
+
+    // Atomic publish: tmp in the same dir then rename() over the
+    // target dentry — rename replaces the name itself, never follows
+    // a swapped-in symlink; readers see old or new, never partial.
     let tmp_name = format!(
         ".{}.acp-tmp-{}",
         target.file_name().unwrap().to_string_lossy(),
         std::process::id()
     );
-    let tmp_target = target_real
+    let tmp_rel = rel_target
         .parent()
         .map(|p| p.join(&tmp_name))
-        .unwrap_or_else(|| target_real.with_file_name(&tmp_name));
-    match std::fs::write(&tmp_target, content) {
-        Ok(()) => {
-            // Post-write re-verify: the parent must STILL be in-sandbox
-            // (a component swap between our checks and now is refused
-            // and its temp file cleaned up).
-            match target_real.parent().and_then(|p| p.canonicalize().ok()) {
-                Some(p) if p.starts_with(&canonical_wd) => {}
-                _ => {
-                    let _ = std::fs::remove_file(&tmp_target);
-                    return ToolResult::err(
-                        ToolErrorKind::OutOfSandbox,
-                        format!(
-                            "Error: path '{}' escaped the working directory during write",
-                            relative_path
-                        ),
-                    );
-                }
+        .unwrap_or_else(|| PathBuf::from(&tmp_name));
+    match sandbox.write(&tmp_rel, content) {
+        Ok(()) => match sandbox.rename(&tmp_rel, &sandbox, rel_target) {
+            Ok(()) => {
+                debug!(
+                    path = %relative_path,
+                    bytes = content.len(),
+                    "write_file"
+                );
+                ToolResult::ok(format!(
+                    "wrote {} bytes to {}",
+                    content.len(),
+                    relative_path
+                ))
             }
-            if let Err(e) = std::fs::rename(&tmp_target, &target_real) {
-                let _ = std::fs::remove_file(&tmp_target);
-                return ToolResult::err(
+            Err(e) => {
+                let _ = sandbox.remove_file(&tmp_rel);
+                ToolResult::err(
                     ToolErrorKind::ExecFailed,
                     format!("Error publishing file: {e}"),
-                );
+                )
             }
-            debug!(
-                path = %relative_path,
-                bytes = content.len(),
-                "write_file"
-            );
-            ToolResult::ok(format!(
-                "wrote {} bytes to {}",
-                content.len(),
-                relative_path
-            ))
-        }
+        },
         Err(e) => ToolResult::err(
             ToolErrorKind::ExecFailed,
             format!("Error writing file: {e}"),
@@ -1510,10 +1499,63 @@ fn execute_edit(
     }
 
     let patched = original.replacen(old_text, new_text, 1);
-    if let Err(e) = std::fs::write(&path, &patched) {
+    // Beneath-write (G1a-FS3): resolve the canonical target back to a
+    // workspace-relative path and write through a capability dir pinned
+    // on the workspace inode — a parent swap between resolve/read and
+    // this write lands inside the capability, never outside.
+    let sandbox =
+        match cap_std::fs::Dir::open_ambient_dir(working_dir, cap_std::ambient_authority()) {
+            Ok(d) => d,
+            Err(e) => {
+                return ToolResult::err(
+                    ToolErrorKind::ExecFailed,
+                    format!("Error opening workspace: {e}"),
+                )
+            }
+        };
+    let canonical_wd = match working_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return ToolResult::err(
+                ToolErrorKind::ExecFailed,
+                format!("Error resolving working directory: {e}"),
+            )
+        }
+    };
+    let Ok(rel) = path.strip_prefix(&canonical_wd) else {
+        return ToolResult::err(
+            ToolErrorKind::ExecFailed,
+            format!(
+                "Error: resolved path '{}' moved outside the pinned workspace",
+                relative_path
+            ),
+        );
+    };
+    // Same tmp+rename publish as write_file: a hardlinked target's
+    // dentry is REPLACED (new inode), so the outside alias keeps its
+    // old content — an in-place write would truncate the shared inode.
+    let tmp_name = format!(
+        ".{}.acp-tmp-{}",
+        rel.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "edit".to_string()),
+        std::process::id()
+    );
+    let tmp_rel = rel
+        .parent()
+        .map(|p| p.join(&tmp_name))
+        .unwrap_or_else(|| PathBuf::from(&tmp_name));
+    if let Err(e) = sandbox.write(&tmp_rel, &patched) {
         return ToolResult::err(
             ToolErrorKind::ExecFailed,
             format!("Error writing file: {e}"),
+        );
+    }
+    if let Err(e) = sandbox.rename(&tmp_rel, &sandbox, rel) {
+        let _ = sandbox.remove_file(&tmp_rel);
+        return ToolResult::err(
+            ToolErrorKind::ExecFailed,
+            format!("Error publishing file: {e}"),
         );
     }
     debug!(
@@ -1958,6 +2000,92 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&wd);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// G1a-FS2/FS3 mechanism test (deterministic): writes and renames
+    /// through a capability dir can NEVER land outside it — an
+    /// absolute symlink swapped in at any point resolves inside the
+    /// capability root or fails. This is the invariant the old
+    /// check-then-use path could only approximate (a swap between
+    /// canonicalize and use escaped it).
+    #[test]
+    #[cfg(unix)]
+    fn capability_writes_never_escape_via_absolute_link() {
+        let wd = tmpwd();
+        let outside = tmpwd();
+        // Attacker plants an absolute symlink inside the workspace —
+        // the exact artifact a parent-dir swap would leave behind.
+        std::os::unix::fs::symlink(&outside, wd.join("hook")).unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(&wd, cap_std::ambient_authority()).unwrap();
+        let _ = dir.create_dir_all("hook");
+        let _ = dir.write("hook/escape.txt", "x");
+        let _ = dir.rename("hook/escape.txt", &dir, "hook/moved.txt");
+        assert!(
+            !outside.join("escape.txt").exists() && !outside.join("moved.txt").exists(),
+            "beneath-operations produced files outside the capability"
+        );
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// R6 companion: the write_file path itself — writing into a
+    /// subdirectory that exists only inside the capability. Also
+    /// covers the tmp+rename publish path beneath the pinned inode.
+    #[test]
+    fn write_file_into_subdir_stays_beneath() {
+        let wd = tmpwd();
+        let result = execute_write_file(&wd, "deep/nested/f.txt", "payload");
+        assert!(result.error_kind.is_none(), "{}", result.text);
+        assert_eq!(
+            std::fs::read_to_string(wd.join("deep/nested/f.txt")).unwrap(),
+            "payload"
+        );
+        // tmp scratch must be cleaned up by the rename, not left behind.
+        assert!(std::fs::read_dir(wd.join("deep/nested"))
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().contains("acp-tmp")));
+        let _ = fs::remove_dir_all(&wd);
+    }
+
+    /// FS3/hardlink: editing a workspace file that is hardlinked to an
+    /// outside inode must NOT truncate the outside alias — the
+    /// tmp+rename publish replaces the dentry, breaking the link.
+    #[test]
+    #[cfg(unix)]
+    fn edit_breaks_hardlink_instead_of_truncating_shared_inode() {
+        let wd = tmpwd();
+        let outside = tmpwd();
+        std::fs::write(outside.join("victim.txt"), "original").unwrap();
+        std::fs::hard_link(outside.join("victim.txt"), wd.join("f.txt")).unwrap();
+        let result = execute_edit(&wd, "f.txt", "original", "patched");
+        assert!(result.error_kind.is_none(), "{}", result.text);
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim.txt")).unwrap(),
+            "original",
+            "hardlinked outside file was truncated through the edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wd.join("f.txt")).unwrap(),
+            "patched"
+        );
+        let _ = fs::remove_dir_all(&wd);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// R6: edit writes through the same pinned capability — a
+    /// subdirectory target exercises the strip_prefix path.
+    #[test]
+    fn edit_writes_beneath_pinned_workspace() {
+        let wd = tmpwd();
+        std::fs::create_dir_all(wd.join("sub")).unwrap();
+        std::fs::write(wd.join("sub/f.txt"), "hello").unwrap();
+        let result = execute_edit(&wd, "sub/f.txt", "hello", "world");
+        assert!(result.error_kind.is_none(), "{}", result.text);
+        assert_eq!(
+            std::fs::read_to_string(wd.join("sub/f.txt")).unwrap(),
+            "world"
+        );
+        let _ = fs::remove_dir_all(&wd);
     }
 
     /// G1a round-2: process output is memory-bounded — a command

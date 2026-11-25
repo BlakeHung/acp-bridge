@@ -71,6 +71,7 @@ toml = "0.8"
 url = "2"
 fs2 = "0.4.3"
 sha2 = "0.10"
+cap-std = "4.0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"

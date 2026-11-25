@@ -72,7 +72,7 @@ spec-shaped v2 payloads.
 | `read_file` | Read a file (sandboxed, max 1 MB) |
 | `list_dir` | List directory contents (max 4 levels, max 200 entries) |
 | `search_code` | Grep for a literal string in files under the working dir (max 50 matches). Symlinks are skipped; depth is bounded |
-| `write_file` | Create or overwrite a file (max 5 MB). Sandbox rejects `..` escapes, symlinked parents escaping the working dir, and symlink targets outside it |
+| `write_file` | Create or overwrite a file (max 5 MB). `..` escapes and symlinked escapes are rejected; all writes resolve beneath a capability-pinned workspace fd (`cap-std`), so a parent-dir swap mid-write cannot escape |
 | `edit` | Replace a unique substring in a file. Fails on missing / ambiguous / empty matches |
 | `web_fetch` | HTTP/HTTPS GET with HTML reduction. **Off by default** — requires `LLM_WEB_ALLOWLIST`. Redirects are limited to 5 hops and re-validated against the allowlist on every hop. Body capped at 5 MB enforced *while downloading* (oversized bodies stop feeding memory and return a truncated note) |
 | `bash` | Run a bash command with a real wall-clock timeout and process-group kill (`LLM_TOOL_TIMEOUT`, default 120 s). Cancellation kills the process group. Note: no OS-level sandbox (see "Things acp-bridge is not") |
