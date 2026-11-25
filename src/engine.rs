@@ -882,6 +882,12 @@ pub async fn session_prompt(
     let mut fail_key: Option<String> = None;
     let mut fail_count = 0usize;
     let mut streak_aborted = false;
+    // Total inline tool-output budget for THIS turn (`LLM_TURN_TOOL_CHARS`).
+    // `offload_tool_output` already caps each result; this caps their sum,
+    // degrading late results to pointer-only before the next fit_and_call
+    // dispatches a prompt that cannot fit.
+    let turn_tool_budget = state.config.turn_tool_chars;
+    let mut turn_tool_chars = 0usize;
 
     // Tool calls go through `fit_and_call`: fit the request into the
     // model's context window (drop oldest history + clamp max_tokens;
@@ -1113,8 +1119,20 @@ pub async fn session_prompt(
                     // Boundary optimization: file oversized outputs to a
                     // session artifact and keep a pointer instead of
                     // dragging the full payload through every later call.
-                    let result_text =
-                        offload_tool_output(state, session_id, tool_call_id, result.text);
+                    // The per-turn inline budget caps the WHOLE turn's
+                    // tool output, not just each result — without it,
+                    // N results × per-item cap can still overflow the
+                    // window inside one prompt turn (live failure:
+                    // 11 bash outputs ≈30k tokens in one turn).
+                    let remaining = turn_tool_budget.saturating_sub(turn_tool_chars);
+                    let result_text = offload_tool_output(
+                        state,
+                        session_id,
+                        tool_call_id,
+                        result.text,
+                        remaining,
+                    );
+                    turn_tool_chars += result_text.len();
 
                     {
                         let mut sessions = state.sessions_write();
@@ -1682,14 +1700,18 @@ fn offload_tool_output(
     session_id: &str,
     tool_call_id: &str,
     text: String,
+    remaining_inline: usize,
 ) -> String {
-    let inline = state.config.artifact_inline_chars;
-    if text.len() <= inline {
+    // `remaining_inline` is the unspent per-turn budget: the tighter of
+    // it and the per-item cap wins, shrinking heads toward pointer-only
+    // as the turn's cumulative tool output approaches the cap.
+    let cap = state.config.artifact_inline_chars.min(remaining_inline);
+    if text.len() <= cap {
         return text;
     }
     let Some(store) = &state.session_store else {
         let mut t = text;
-        crate::tools::truncate_utf8(&mut t, inline);
+        crate::tools::truncate_utf8(&mut t, cap);
         t.push_str(
             "\n\n[...truncated; set LLM_SESSION_DIR to keep full outputs as re-readable artifacts]",
         );
@@ -1697,13 +1719,13 @@ fn offload_tool_output(
     };
     let Some(path) = store.write_artifact(session_id, tool_call_id, &text) else {
         let mut t = text;
-        crate::tools::truncate_utf8(&mut t, inline);
+        crate::tools::truncate_utf8(&mut t, cap);
         t.push_str("\n\n[...truncated; artifact quota/storage refused the full output]");
         return t;
     };
     // Head excerpt: enough for the "what ran and what came back"
     // skeleton without paying the full price.
-    let head = inline / 4;
+    let head = (state.config.artifact_inline_chars / 4).min(remaining_inline);
     let mut t = text;
     let total = t.len();
     crate::tools::truncate_utf8(&mut t, head);
@@ -2269,6 +2291,7 @@ mod tests {
             auto_summarize: true,
             auto_summarize_at: 0.6,
             artifact_inline_chars: 8192,
+            turn_tool_chars: 16384,
             max_inflight_turns: 8,
             max_prompt_chars: 200_000,
             client: reqwest::Client::builder()
@@ -2611,7 +2634,7 @@ mod tests {
         let mut cfg = cfg_with_image(false);
         cfg.artifact_inline_chars = 200;
         let no_store = AppState::new(cfg.clone());
-        let out = offload_tool_output(&no_store, "s1", "c1", "x".repeat(1000));
+        let out = offload_tool_output(&no_store, "s1", "c1", "x".repeat(1000), usize::MAX);
         assert!(out.contains("[...truncated; set LLM_SESSION_DIR"));
         assert!(out.len() < 400);
 
@@ -2629,12 +2652,55 @@ mod tests {
             session_store: Some(std::sync::Arc::new(store)),
             ..(*base).clone()
         };
-        let out = offload_tool_output(&state, "sess-art", "call-9", "y".repeat(1000));
+        let out = offload_tool_output(&state, "sess-art", "call-9", "y".repeat(1000), usize::MAX);
         assert!(out.contains("[artifact: full output (1000 bytes) saved to"));
         assert!(out.contains("read_file"));
         // The artifact round-trips through the store path the pointer names.
         let saved = dir.join("artifacts").join("sess-art").join("call-9.txt");
         assert_eq!(std::fs::read_to_string(&saved).unwrap().len(), 1000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Per-turn budget: once the cumulative inline allowance is spent,
+    /// later results degrade to pointer-only — N results × per-item cap
+    /// cannot overflow the window inside one turn (live failure shape).
+    #[test]
+    fn turn_tool_budget_degrades_late_results_to_pointer() {
+        let mut cfg = cfg_with_image(false);
+        cfg.artifact_inline_chars = 200;
+        let dir = std::env::temp_dir().join(format!(
+            "acp-turnbudget-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = crate::session_store::SessionStore::new(dir.clone()).unwrap();
+        let base = AppState::new(cfg);
+        let state = AppState {
+            session_store: Some(std::sync::Arc::new(store)),
+            ..(*base).clone()
+        };
+        // First call with full budget behaves exactly as before.
+        let first = offload_tool_output(&state, "s", "c1", "y".repeat(1000), usize::MAX);
+        let head_len = first.len();
+        // Exhausted budget: still offloads + still names the path, but
+        // the head is bounded by what is left — not by the per-item cap.
+        // (artifact_inline_chars=200 → default head 50; remaining=10 must
+        // shrink below it.)
+        let late = offload_tool_output(&state, "s", "c2", "z".repeat(1000), 10);
+        assert!(late.contains("[artifact: full output (1000 bytes)"));
+        assert!(late.len() < head_len);
+        assert!(
+            late.len() < 10 + 220,
+            "pointer note only, was {}",
+            late.len()
+        );
+        // Zero remaining → pure pointer, no excerpt at all.
+        let broke = offload_tool_output(&state, "s", "c3", "w".repeat(1000), 0);
+        assert!(!broke.contains("wwww"));
+        assert!(broke.contains("call read_file"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

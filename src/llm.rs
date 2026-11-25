@@ -655,6 +655,11 @@ pub struct LlmConfig {
     /// Requires `LLM_SESSION_DIR`; without persistence the old
     /// hard-truncation path runs. `LLM_ARTIFACT_CHARS`, default 8192.
     pub artifact_inline_chars: usize,
+    /// Total inline tool-output budget across ONE prompt turn — the
+    /// whole turn's tool results share this cap and degrade to
+    /// pointer-only once exhausted (per-item cap alone cannot bound
+    ///// N results in one turn). `LLM_TURN_TOOL_CHARS`, default 16384.
+    pub turn_tool_chars: usize,
     /// Global bound on concurrent in-flight turns across ALL sessions
     /// (G1a-Q2 queue items). Over the limit the prompt is refused with
     /// an identifiable `server_busy` status instead of queueing
@@ -742,6 +747,7 @@ impl LlmConfig {
             auto_summarize: env_parse_bool("LLM_AUTO_SUMMARIZE")?.unwrap_or(true),
             auto_summarize_at: summarize_threshold(None)?,
             artifact_inline_chars: env_parse("LLM_ARTIFACT_CHARS")?.unwrap_or(8192),
+            turn_tool_chars: env_parse("LLM_TURN_TOOL_CHARS")?.unwrap_or(16384),
             max_inflight_turns: env_parse("LLM_MAX_INFLIGHT")?.unwrap_or(8),
             max_prompt_chars: env_parse("LLM_MAX_PROMPT_CHARS")?.unwrap_or(200_000),
             client,
@@ -1472,6 +1478,7 @@ mod tests {
             auto_summarize: true,
             auto_summarize_at: 0.6,
             artifact_inline_chars: 8192,
+            turn_tool_chars: 16384,
             max_inflight_turns: 8,
             max_prompt_chars: 200_000,
             client: Client::builder()

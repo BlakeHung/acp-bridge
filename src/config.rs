@@ -69,6 +69,10 @@ pub struct LlmSection {
     /// Inline budget per tool result. Mirrors `LLM_ARTIFACT_CHARS`.
     #[serde(default)]
     pub artifact_inline_chars: Option<usize>,
+    /// Total inline tool-output budget per prompt turn. Mirrors
+    /// `LLM_TURN_TOOL_CHARS`.
+    #[serde(default)]
+    pub turn_tool_chars: Option<usize>,
 }
 
 impl ConfigFile {
@@ -206,6 +210,9 @@ impl ConfigFile {
             artifact_inline_chars: env_parse("LLM_ARTIFACT_CHARS")?
                 .or(file.artifact_inline_chars)
                 .unwrap_or(8192),
+            turn_tool_chars: env_parse("LLM_TURN_TOOL_CHARS")?
+                .or(file.turn_tool_chars)
+                .unwrap_or(16384),
             max_inflight_turns: env_parse("LLM_MAX_INFLIGHT")?.unwrap_or(8),
             max_prompt_chars: env_parse("LLM_MAX_PROMPT_CHARS")?.unwrap_or(200_000),
             client,

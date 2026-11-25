@@ -263,6 +263,7 @@ acp-bridge supports three configuration methods (highest priority wins):
 | `LLM_AUTO_SUMMARIZE` | `true` | Summarize older history using the same backend without tools. Failure falls back to deterministic tool-output elision and group pruning; four calls elapse before another summary attempt. |
 | `LLM_SUMMARIZE_AT` | `0.6` | Summary trigger as a fraction of the available prompt budget (finite value from 0.1 to 0.95). TOML: `llm.summarize_at`. |
 | `LLM_ARTIFACT_CHARS` | `8192` | Inline budget per tool result. Larger outputs are written to `{LLM_SESSION_DIR}/artifacts/<session>/<call>.txt` and history keeps a head excerpt plus a `read_file` pointer. Without `LLM_SESSION_DIR` outputs truncate at this size. |
+| `LLM_TURN_TOOL_CHARS` | `16384` | Total inline budget for ALL tool results within one prompt turn. Once spent, later results degrade to pointer-only regardless of the per-item cap — bounds the worst-case prompt growth a single turn can cause. |
 | `LLM_MAX_INFLIGHT` | `8` | Global bound on concurrent in-flight turns across all sessions. Over the limit the prompt is refused with an identifiable `server_busy` status; a completing or cancelled turn frees the slot. 0 = unlimited. |
 | `LLM_MAX_PROMPT_CHARS` | `200000` | Largest accepted prompt payload (serialized chars). Over the limit → `prompt_too_large` error, nothing queued. 0 = unlimited. |
 | `LLM_MAX_TOOL_ROUNDS` | `50` | Max model↔tool round-trips per turn before the bounded wrap-up path runs (aligned with openab-agent's default) |
