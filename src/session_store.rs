@@ -64,15 +64,22 @@ impl SessionStore {
     /// Store is enabled only when `LLM_SESSION_DIR` is set. A set-but-
     /// unusable directory (unwritable, not a dir) disables the store
     /// rather than crashing startup — persistence is optional, but the
-    /// operator gets a loud warning.
+    /// operator gets a loud warning. An EMPTY value counts as unset:
+    /// `""` would otherwise resolve to the cwd and spray writes plus
+    /// warnings on every turn.
     pub fn from_env() -> Option<Self> {
-        let dir = std::env::var("LLM_SESSION_DIR").ok()?;
-        let dir = PathBuf::from(dir);
+        let dir = Self::parse_dir(std::env::var("LLM_SESSION_DIR").ok())?;
         if let Err(e) = std::fs::create_dir_all(&dir) {
             warn!(dir = %dir.display(), error = %e, "LLM_SESSION_DIR unusable; session persistence disabled");
             return None;
         }
         Some(Self { dir })
+    }
+
+    fn parse_dir(value: Option<String>) -> Option<PathBuf> {
+        let dir = value?;
+        let dir = dir.trim();
+        (!dir.is_empty()).then(|| PathBuf::from(dir))
     }
 
     /// Direct constructor — `from_env` is the production path; tests and
@@ -677,6 +684,16 @@ mod tests {
             format!("format_version=2\nsha256={}\n", sha256_hex(body.as_bytes())),
         )
         .unwrap();
+    }
+
+    /// Empty or whitespace LLM_SESSION_DIR counts as unset — otherwise
+    /// "" resolves to cwd and sprays snapshot writes + warnings.
+    #[test]
+    fn empty_dir_value_disables_store() {
+        assert!(SessionStore::parse_dir(None).is_none());
+        assert!(SessionStore::parse_dir(Some(String::new())).is_none());
+        assert!(SessionStore::parse_dir(Some("   ".into())).is_none());
+        assert!(SessionStore::parse_dir(Some("/tmp/x".into())).is_some());
     }
 
     #[test]
