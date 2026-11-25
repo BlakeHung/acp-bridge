@@ -22,6 +22,14 @@ pub fn estimate_request(messages: &[Value], tools: Option<&[Value]>) -> u64 {
         + 64
 }
 
+/// Prefix marking the folded working-memory summary the engine inserts.
+/// Once the summary replaced older user turns, this message may be the
+/// only live copy of their constraints — fallback must not drop it
+/// silently. Its size is bounded at insertion, so protecting it cannot
+/// create an unshrinkable floor; if it still cannot fit, the caller
+/// reports the failure instead of losing the constraints.
+pub const WORKING_MEMORY_PREFIX: &str = "[bridge working-memory summary";
+
 /// A tool-call assistant and every following tool result are one indivisible group.
 pub fn groups(messages: &[Value]) -> Vec<std::ops::Range<usize>> {
     let mut result = Vec::new();
@@ -45,9 +53,13 @@ pub fn groups(messages: &[Value]) -> Vec<std::ops::Range<usize>> {
 
 fn protected(messages: &[Value], group: &std::ops::Range<usize>) -> bool {
     group.end == messages.len()
-        || group
-            .clone()
-            .any(|i| messages[i]["role"] == "system" || messages[i]["role"] == "user")
+        || group.clone().any(|i| {
+            messages[i]["role"] == "system"
+                || messages[i]["role"] == "user"
+                || messages[i]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(WORKING_MEMORY_PREFIX))
+        })
 }
 
 /// Elision is idempotent and applies only to tool output, including the newest result.
@@ -214,6 +226,26 @@ mod tests {
         assert!(kept.iter().any(|m| m["content"] == "do not publish"));
         assert_eq!(groups(&kept).last().unwrap().len(), 1);
         assert!(groups(&kept).iter().any(|g| g.len() == 3));
+    }
+
+    /// After semantic folding, the summary may be the only live copy of
+    /// constraints from compacted-away user turns. Fallback must drop
+    /// other groups first — losing the summary silently loses task limits.
+    #[test]
+    fn fallback_keeps_working_memory_summary_constraints() {
+        let messages = vec![
+            json!({"role":"system","content":"rules"}),
+            json!({"role":"user","content":"task"}),
+            json!({"role":"assistant","content":"[bridge working-memory summary; verify details against original files]\nConstraints: do not publish"}),
+            json!({"role":"assistant","content":"x".repeat(6000)}),
+            json!({"role":"assistant","content":"y".repeat(6000)}),
+            json!({"role":"user","content":"continue"}),
+        ];
+        let (out, dropped, _) = compact_for_context(messages, 2500);
+        assert!(dropped > 0, "budget must force a real drop");
+        assert!(out.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("do not publish"))));
     }
 
     #[test]
