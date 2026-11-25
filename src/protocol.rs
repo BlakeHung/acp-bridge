@@ -106,6 +106,13 @@ pub struct Session {
     /// Strata fit_max_tokens). Only ever shrinks the budget, never
     /// grows it; runtime-only, not persisted in snapshots.
     pub effective_context: Option<u64>,
+    /// Cross-process execution ownership: the session's flock on
+    /// `{id}.lock`, held for the session's whole lifetime so a second
+    /// live process can never run the same session (ADR:
+    /// docs/session-store-ownership-adr.md). `None` when the store is
+    /// disabled or the claim failed at creation (warned there).
+    /// `Arc` so `#[derive(Clone)]` sessions share the one owner.
+    pub store_lock: Option<std::sync::Arc<crate::session_store::StoreLock>>,
 }
 
 impl Session {
@@ -122,6 +129,7 @@ impl Session {
             token_scale: 1.0,
             summary_cooldown: 0,
             effective_context: None,
+            store_lock: None,
         }
     }
 

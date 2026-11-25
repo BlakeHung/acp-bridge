@@ -1,8 +1,6 @@
-//! Session snapshot store (P1/E14 first slice).
+//! Session snapshot store (P1/E14).
 //!
-//! A JSON file per session under `LLM_SESSION_DIR`:
-//! `{dir}/{session_id}.json` containing the working directory and full
-//! message history, rewritten at turn boundaries. Enabling it is
+//! A JSON file per session under `LLM_SESSION_DIR`. Enabling it is
 //! explicit opt-in — transcripts hold whatever the model saw and said,
 //! so nothing is written to disk unless the operator chose a location.
 //!
@@ -11,27 +9,35 @@
 //! With it enabled, a load that finds no snapshot returns `-32002
 //! session_not_found`.
 //!
-//! This is a flat-file snapshot, not the durable session store the
-//! plan's P3 work wants (concurrency, markers, crash recovery). It is
-//! deliberately small: one process writes, reads are atomic-ish via
-//! write-to-temp + rename.
+//! Per-session files (`S` = sanitized session id):
+//! - `S.json`      current committed snapshot body
+//! - `S.json.prev` previous committed body — the last-good generation
+//! - `S.done`      commit manifest (`sha256=` of the committed body),
+//!   atomically swapped via `S.done.tmp` + rename — THE commit point
+//! - `S.lock`      permanent flock anchor; never deleted by anyone
+//! - `S.turn`      in-progress turn intent marker (R3)
+//! - `store.lock`  store-wide quota critical-section anchor (R5)
+//! - `artifacts/S/` offloaded tool outputs
+//!
+//! Ownership & durability protocol: docs/session-store-ownership-adr.md
 
+use fs2::FileExt;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-/// Guard holding a session's writer lock — the `.lock` file's
-/// existence is the lock; dropping removes it. A process crash leaves
-/// the file behind, reclaimed by age after `STALE_LOCK_SECS`.
-struct StoreLock {
-    path: PathBuf,
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+/// Guard holding a session's flock on `{id}.lock` — the kernel releases
+/// it when the fd closes (drop, or process death). The anchor file is
+/// never unlinked: deleting it would hand the next creator a different
+/// inode and split the lock domain. A paused holder keeps the lock —
+/// there is no age-based "stale" steal; a dead holder's lock is
+/// released by the kernel, so legitimate takeover is instant.
+/// `Session` wraps it in `Arc`, so cloned sessions share one owner.
+#[derive(Debug)]
+pub struct StoreLock {
+    _file: std::fs::File,
 }
 
 pub struct SessionStore {
@@ -42,6 +48,16 @@ pub struct SessionStore {
 pub struct LoadedSession {
     pub working_dir: PathBuf,
     pub messages: Vec<Value>,
+    /// A `.turn` marker survived — the last turn never reached durable
+    /// completion (crash mid-turn). Side effects from that turn are
+    /// unknown: mark, never replay (R3).
+    pub interrupted: bool,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl SessionStore {
@@ -95,12 +111,12 @@ impl SessionStore {
     /// Max total bytes across the store dir.
     const MAX_STORE_BYTES: u64 = 64_000_000;
 
-    /// Age after which a leftover `.lock` is considered stale — the
-    /// holder crashed mid-save. Fresh locks are honored.
-    const STALE_LOCK_SECS: u64 = 300;
-
     fn path(&self, session_id: &str) -> Option<PathBuf> {
         Self::safe_name(session_id).map(|n| self.dir.join(format!("{n}.json")))
+    }
+
+    fn prev_path(&self, session_id: &str) -> Option<PathBuf> {
+        Self::safe_name(session_id).map(|n| self.dir.join(format!("{n}.json.prev")))
     }
 
     fn lock_path(&self, session_id: &str) -> Option<PathBuf> {
@@ -111,44 +127,75 @@ impl SessionStore {
         Self::safe_name(session_id).map(|n| self.dir.join(format!("{n}.done")))
     }
 
-    /// Acquire the single-writer lock for a session: atomic
-    /// `create_new` — the file's existence IS the lock. A stale lock
-    /// (holder crashed over `STALE_LOCK_SECS` ago) is reclaimed once.
+    fn turn_path(&self, session_id: &str) -> Option<PathBuf> {
+        Self::safe_name(session_id).map(|n| self.dir.join(format!("{n}.turn")))
+    }
+
+    fn store_lock_path(&self) -> PathBuf {
+        self.dir.join("store.lock")
+    }
+
+    /// Flock `{id}.lock` and hold the fd. `None` means another live
+    /// process holds it — flock counts per open-file-description, so a
+    /// second fd in THIS process also contends, which is exactly what
+    /// keeps `save()` honest for unowned writes.
     fn acquire_lock(&self, session_id: &str) -> Option<StoreLock> {
         let path = self.lock_path(session_id)?;
-        match std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&path)
         {
-            Ok(mut f) => {
-                let _ = f.write_all(std::process::id().to_string().as_bytes());
-                Some(StoreLock { path })
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, session_id, "session lock open failed");
+                return None;
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .map(|age| age.as_secs() > Self::STALE_LOCK_SECS)
-                    .unwrap_or(false);
-                if stale {
-                    let _ = std::fs::remove_file(&path);
-                    return std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .ok()
-                        .map(|_| StoreLock { path });
-                }
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => Some(StoreLock { _file: file }),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 warn!(
                     session_id,
-                    "snapshot lock held by another writer; save skipped"
+                    "session lock held by another live owner; skipped"
                 );
                 None
             }
             Err(e) => {
-                warn!(error = %e, session_id, "snapshot lock acquisition failed");
+                warn!(error = %e, session_id, "session lock acquisition failed");
+                None
+            }
+        }
+    }
+
+    /// Claim execution ownership of a session for this process's
+    /// lifetime — the same flock the snapshot commit path uses, held in
+    /// `Session::store_lock` for the whole session (ADR §2). `None`
+    /// means owned elsewhere: the caller answers `session_busy`
+    /// honestly instead of running a second writer (R1).
+    pub fn try_claim(&self, session_id: &str) -> Option<StoreLock> {
+        self.acquire_lock(session_id)
+    }
+
+    /// Store-wide critical section for quota accounting: usage scan,
+    /// admission decision and the write itself serialize across
+    /// processes (R5) — two writers cannot both pass the check-then-
+    /// write window. Try-lock like every other save path: contention
+    /// is a skip, not a queue.
+    fn quota_section(&self) -> Option<StoreLock> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.store_lock_path())
+            .ok()?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Some(StoreLock { _file: file }),
+            Err(e) => {
+                warn!(error = %e, "store quota section busy or failed");
                 None
             }
         }
@@ -206,6 +253,8 @@ impl SessionStore {
             );
             return None;
         }
+        // Usage check + write are one serialized section (R5).
+        let _quota = self.quota_section()?;
         if let Err(e) = std::fs::create_dir_all(&dir) {
             warn!(session_id, error = %e, "artifact dir creation failed");
             return None;
@@ -239,17 +288,30 @@ impl SessionStore {
     }
 
     /// Rewrite the session's snapshot atomically and durably:
-    /// lock → tmp+fsync → rename → `.done` commit marker → dir fsync.
-    /// A crash anywhere before `.done` leaves a load() that answers
-    /// corrupt (uncommitted), never a half-session.
+    /// flock → quota section → rotate `.prev` → tmp+fsync+rename body →
+    /// tmp+fsync+rename manifest → dir fsync (errors propagate). A crash
+    /// anywhere before the manifest swap leaves load() serving `.prev`,
+    /// i.e. the last verifiable generation is never lost (R4).
     pub fn save(&self, session_id: &str, working_dir: &Path, messages: &[Value]) -> bool {
-        let Some(path) = self.path(session_id) else {
-            warn!(session_id, "unsanitizable session id; snapshot skipped");
+        let Some(lock) = self.acquire_lock(session_id) else {
             return false;
         };
-        // Single-writer: the lock exists before any side effect, and a
-        // second live writer skips rather than racing the rename.
-        let Some(_lock) = self.acquire_lock(session_id) else {
+        self.save_owned(session_id, working_dir, &lock, messages)
+    }
+
+    /// Save for a session whose ownership this process already holds
+    /// (`Session::store_lock`). Re-acquiring the same flock on a second
+    /// fd would false-conflict with ourselves — the token proves the
+    /// exclusion instead of re-checking it.
+    pub fn save_owned(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+        _owner: &StoreLock,
+        messages: &[Value],
+    ) -> bool {
+        let Some(path) = self.path(session_id) else {
+            warn!(session_id, "unsanitizable session id; snapshot skipped");
             return false;
         };
 
@@ -262,6 +324,7 @@ impl SessionStore {
             "writer_pid": std::process::id(),
         });
         let body = doc.to_string();
+        let hash = sha256_hex(body.as_bytes());
 
         // Cumulative quotas — before touching the filesystem.
         if body.len() as u64 > Self::MAX_SNAPSHOT_BYTES {
@@ -272,6 +335,14 @@ impl SessionStore {
             );
             return false;
         }
+        // Usage scan + admission + write are one serialized section
+        // across processes (R5): the rotated `.prev` means a re-save
+        // transiently counts both generations — accounted by checking
+        // `bytes + body` against the cap before any write.
+        let Some(_quota) = self.quota_section() else {
+            warn!(session_id, "store quota section busy; save skipped");
+            return false;
+        };
         let (files, bytes) = self.store_usage();
         if files >= Self::MAX_STORE_FILES {
             warn!(
@@ -285,8 +356,20 @@ impl SessionStore {
             return false;
         }
 
-        let tmp = path.with_extension("json.tmp");
+        let Some(safe) = Self::safe_name(session_id) else {
+            return false;
+        };
+        let tmp = self.dir.join(format!("{safe}.json.tmp"));
+        let done_tmp = self.dir.join(format!("{safe}.done.tmp"));
         let committed = (|| -> io::Result<()> {
+            // Rotate the currently committed body aside BEFORE replacing
+            // it: the manifest still binds `.prev` if we die mid-commit.
+            if path.exists() {
+                if let Some(prev) = self.prev_path(session_id) {
+                    let _ = std::fs::remove_file(&prev); // .prev is expendable
+                    std::fs::rename(&path, &prev)?;
+                }
+            }
             // tmp write + fsync BEFORE rename: a renamed-but-unflushed
             // file can still lose contents on a power cut.
             {
@@ -295,19 +378,26 @@ impl SessionStore {
                 f.sync_all()?;
             }
             std::fs::rename(&tmp, &path)?;
-            // Commit marker: the .done file existing means a save fully
-            // completed — its absence on load means the snapshot is an
-            // uncommitted leftover, i.e. corrupt.
+            // Commit marker binds THIS body: sha256 of the bytes just
+            // renamed. The manifest swap (single atomic rename) is the
+            // indivisible commit point.
             if let Some(done) = self.done_path(session_id) {
-                let mut d = std::fs::File::create(&done)?;
-                d.write_all(format!("format_version=1\npid={}\n", std::process::id()).as_bytes())?;
+                let mut d = std::fs::File::create(&done_tmp)?;
+                d.write_all(
+                    format!(
+                        "format_version=2\nsha256={hash}\npid={}\n",
+                        std::process::id()
+                    )
+                    .as_bytes(),
+                )?;
                 d.sync_all()?;
+                std::fs::rename(&done_tmp, &done)?;
             }
-            // Flush the directory so the rename + marker survive a crash.
+            // Flush the directory so the rename + marker survive a
+            // crash. A sync failure means durability was NOT achieved —
+            // report it, don't swallow it.
             #[cfg(unix)]
-            {
-                let _ = std::fs::File::open(&self.dir).and_then(|d| d.sync_all());
-            }
+            std::fs::File::open(&self.dir).and_then(|d| d.sync_all())?;
             Ok(())
         })();
 
@@ -318,21 +408,69 @@ impl SessionStore {
             }
             Err(e) => {
                 warn!(error = %e, session_id, "session snapshot save failed");
-                if let Some(done) = self.done_path(session_id) {
-                    let _ = std::fs::remove_file(done);
-                }
                 false
             }
         }
     }
 
+    /// Durable "turn in progress" intent marker — written BEFORE the
+    /// turn's first tool side effect (R3). `false` means the intent
+    /// could not be committed: the caller must refuse to dispatch —
+    /// otherwise a mid-turn kill is indistinguishable from a clean
+    /// pre-turn state.
+    pub fn begin_turn(&self, session_id: &str) -> bool {
+        let (Some(safe), Some(turn)) = (Self::safe_name(session_id), self.turn_path(session_id))
+        else {
+            return false;
+        };
+        let tmp = self.dir.join(format!("{safe}.turn.tmp"));
+        let result = (|| -> io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(
+                format!(
+                    "format_version=1\nstate=in_progress\npid={}\n",
+                    std::process::id()
+                )
+                .as_bytes(),
+            )?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &turn)?;
+            #[cfg(unix)]
+            std::fs::File::open(&self.dir).and_then(|d| d.sync_all())?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, session_id, "turn intent marker could not be committed");
+                false
+            }
+        }
+    }
+
+    /// The turn reached durable completion — clear the intent marker.
+    /// Callers invoke this only after a successful persist; a failed
+    /// save leaves the marker so the next load reports `interrupted`
+    /// rather than claiming a clean state it cannot prove.
+    pub fn end_turn(&self, session_id: &str) {
+        if let Some(turn) = self.turn_path(session_id) {
+            if let Err(e) = std::fs::remove_file(&turn) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    warn!(error = %e, session_id, "turn intent marker removal failed");
+                }
+            }
+        }
+    }
+
     /// G1a-Q3 quota-triggered cleanup: evict the OLDEST stored sessions
-    /// that are not in `active` — snapshots (.json/.done/.lock), any
-    /// `.tmp` stragglers, and that session's artifact dir — until the
-    /// store is back under quota or nothing removable remains. An
-    /// active session's data is never touched; a `.done` is not
-    /// required for eviction (an uncommitted snapshot is already
-    /// worthless). Returns evicted session ids.
+    /// that are provably not live — snapshots (.json/.done/.prev), tmp
+    /// stragglers, the turn marker and that session's artifact dir —
+    /// until the store is back under quota or nothing removable
+    /// remains. Liveness is the flock probe, not this process's memory:
+    /// a session owned by ANOTHER process keeps its lock, so it can
+    /// never be evicted from under a live owner (R2). The `.lock`
+    /// anchor itself is never deleted (inode identity is the lock).
+    /// Returns evicted session ids.
     pub fn cleanup_stale(&self, active: &std::collections::HashSet<&str>) -> Vec<String> {
         let mut evicted = Vec::new();
         // Oldest-first candidates: every session id with a .json file.
@@ -343,7 +481,11 @@ impl SessionStore {
                 let Some(id) = name.strip_suffix(".json") else {
                     continue;
                 };
-                if Self::safe_name(id).is_none() || active.contains(id) {
+                if id.ends_with(".tmp")
+                    || id.ends_with(".prev")
+                    || Self::safe_name(id).is_none()
+                    || active.contains(id)
+                {
                     continue;
                 }
                 let mtime = e
@@ -359,7 +501,12 @@ impl SessionStore {
             if files < Self::MAX_STORE_FILES && bytes < Self::MAX_STORE_BYTES * 3 / 4 {
                 break; // back under quota with headroom
             }
-            for suffix in ["json", "done", "lock", "json.tmp"] {
+            // Exclusive probe: fails while a live owner (this or any
+            // other process) holds the session's flock.
+            let Some(_probe) = self.acquire_lock(&id) else {
+                continue;
+            };
+            for suffix in ["json", "done", "json.prev", "json.tmp", "done.tmp", "turn"] {
                 let _ = std::fs::remove_file(self.dir.join(format!("{id}.{suffix}")));
             }
             if let Some(art) = self.artifact_dir(&id) {
@@ -386,25 +533,59 @@ impl SessionStore {
         if !path.exists() {
             return Ok(None);
         }
-        // The .done marker is the commit proof: a .json without one is
-        // either pre-marker format or an interrupted save — both corrupt.
+        // The manifest binds one specific body by hash. Missing or
+        // pre-v2 markers cannot prove which bytes were committed —
+        // both answer corrupt, never a guess.
         let done = self.done_path(session_id);
-        if done.map(|d| !d.exists()).unwrap_or(true) {
+        let manifest = match done.as_ref().map(std::fs::read_to_string) {
+            Some(Ok(m)) => m,
+            Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot lacks commit marker (uncommitted or interrupted save)",
+                ));
+            }
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsanitizable session id",
+                ));
+            }
+        };
+        let expected = manifest
+            .lines()
+            .find_map(|l| l.strip_prefix("sha256="))
+            .map(str::trim)
+            .map(str::to_string);
+        let Some(expected) = expected else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "snapshot lacks commit marker (uncommitted or pre-marker write)",
+                "commit marker has no bound body hash (pre-v2 manifest)",
             ));
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "marker exists but snapshot body missing",
-                )
-            } else {
-                e
+        };
+
+        // Verify the named generation — the live `.json` first, then
+        // the rotated `.prev`: a save killed between body rename and
+        // manifest swap leaves the manifest binding the PREVIOUS body,
+        // which is still a verifiable committed state (R4).
+        let mut body: Option<Vec<u8>> = None;
+        for candidate in [path.clone(), self.prev_path(session_id).unwrap_or_default()] {
+            let Ok(bytes) = std::fs::read(&candidate) else {
+                continue;
+            };
+            if sha256_hex(&bytes) == expected {
+                body = Some(bytes);
+                break;
             }
-        })?;
+        }
+        let Some(body) = body else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no snapshot body matches the commit manifest",
+            ));
+        };
+        let text = String::from_utf8_lossy(&body).into_owned();
         let doc: Value = serde_json::from_str(&text).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}"))
         })?;
@@ -452,25 +633,30 @@ impl SessionStore {
                 ),
             ));
         }
+        let interrupted = self
+            .turn_path(session_id)
+            .map(|t| t.exists())
+            .unwrap_or(false);
         Ok(Some(LoadedSession {
             working_dir,
             messages,
+            interrupted,
         }))
     }
 
-    /// Remove a session's snapshot + commit marker (session/end,
-    /// session/close). The lock is left alone — deleting someone
-    /// else's held lock would unlock their in-flight save.
+    /// Remove a session's snapshot + commit marker + turn intent
+    /// (session/end, session/close). The `.lock` anchor is left alone
+    /// by design — deleting it would split the lock domain for any
+    /// process still holding an fd on the old inode.
     pub fn delete(&self, session_id: &str) {
-        if let Some(done) = self.done_path(session_id) {
-            let _ = std::fs::remove_file(done);
-        }
-        if let Some(path) = self.path(session_id) {
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != io::ErrorKind::NotFound {
-                    warn!(error = %e, path = %path.display(), "session snapshot delete failed");
+        for suffix in ["done", "json", "json.prev", "turn"] {
+            let _ = std::fs::remove_file(self.dir.join(format!(
+                "{}.{suffix}",
+                match Self::safe_name(session_id) {
+                    Some(s) => s,
+                    None => return,
                 }
-            }
+            )));
         }
     }
 }
@@ -479,6 +665,19 @@ impl SessionStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Write a committed snapshot pair (body + v2 manifest) like save()
+    /// would — for fixtures that need a valid committed state without
+    /// going through the writer.
+    fn commit_body(dir: &Path, id: &str, doc: &Value) {
+        let body = doc.to_string();
+        std::fs::write(dir.join(format!("{id}.json")), &body).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.done")),
+            format!("format_version=2\nsha256={}\n", sha256_hex(body.as_bytes())),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn roundtrip_save_load_delete() {
@@ -502,6 +701,7 @@ mod tests {
         let loaded = store.load("sess-1").unwrap().expect("snapshot missing");
         assert_eq!(loaded.working_dir, PathBuf::from("/tmp/work"));
         assert_eq!(loaded.messages.len(), 2);
+        assert!(!loaded.interrupted);
 
         store.delete("sess-1");
         assert!(store.load("sess-1").unwrap().is_none());
@@ -556,7 +756,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A held `.lock` blocks a second writer; once released, saves resume.
+    /// A held flock blocks a second writer; once released, saves resume.
+    /// Dropping the guard must NOT unlink the anchor — the file is the
+    /// shared lock point for every later acquirer (R1).
     #[test]
     fn held_lock_blocks_second_writer() {
         let dir = fresh_dir("lock");
@@ -568,6 +770,10 @@ mod tests {
             "save must skip while lock held"
         );
         drop(lock);
+        assert!(
+            dir.join("s2.lock").exists(),
+            "dropping the guard must keep the lock anchor file"
+        );
         store.save("s2", Path::new("/tmp"), &[json!({"role":"x"})]);
         assert!(
             dir.join("s2.json").exists(),
@@ -576,15 +782,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A stale lock (older than STALE_LOCK_SECS) is reclaimed.
+    /// A `.lock` left by a dead process holds no lock — flock state
+    /// lives in the kernel, not in the file's age. Reuse is immediate:
+    /// there is no stale-window in which a paused holder could lose
+    /// ownership (R1).
     #[test]
-    fn stale_lock_is_reclaimed() {
+    fn leftover_lock_anchor_reacquires_instantly() {
         let dir = fresh_dir("stale");
         let store = SessionStore { dir: dir.clone() };
         let lock = dir.join("s3.lock");
         std::fs::write(&lock, "999999").unwrap();
-        let old = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(SessionStore::STALE_LOCK_SECS + 60);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         std::fs::File::options()
             .write(true)
             .open(&lock)
@@ -592,7 +800,10 @@ mod tests {
             .set_modified(old)
             .unwrap();
         store.save("s3", Path::new("/tmp"), &[json!({"role":"x"})]);
-        assert!(dir.join("s3.json").exists(), "stale lock must be reclaimed");
+        assert!(
+            dir.join("s3.json").exists(),
+            "an unheld anchor must be acquired regardless of file age"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -601,7 +812,6 @@ mod tests {
     #[test]
     fn load_rejects_schema_violations() {
         let dir = fresh_dir("schema");
-        std::fs::write(dir.join("s4.done"), "format_version=1\n").unwrap();
         for doc in [
             json!({"format_version":2,"session_id":"s4","working_dir":"/tmp",
                    "messages":[{"role":"x"}],"message_count":1}),
@@ -612,18 +822,17 @@ mod tests {
             json!({"format_version":1,"session_id":"s4","working_dir":"/tmp",
                    "messages":[{"role":"x"}]}),
         ] {
-            std::fs::write(dir.join("s4.json"), doc.to_string()).unwrap();
+            commit_body(&dir, "s4", &doc);
             let store = SessionStore { dir: dir.clone() };
             assert!(store.load("s4").is_err(), "must reject: {doc}");
         }
         // And a valid one still loads.
-        std::fs::write(
-            dir.join("s4.json"),
-            json!({"format_version":1,"session_id":"s4","working_dir":"/tmp",
-                   "messages":[{"role":"x"}],"message_count":1})
-            .to_string(),
-        )
-        .unwrap();
+        commit_body(
+            &dir,
+            "s4",
+            &json!({"format_version":1,"session_id":"s4","working_dir":"/tmp",
+                    "messages":[{"role":"x"}],"message_count":1}),
+        );
         let store = SessionStore { dir: dir.clone() };
         assert!(store.load("s4").unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
@@ -645,38 +854,139 @@ mod tests {
 
     #[test]
     fn corrupt_snapshot_count_is_an_error() {
-        let dir = std::env::temp_dir().join(format!(
-            "acp-store-corrupt-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fresh_dir("corrupt");
         // A parseable snapshot whose recorded count lies about its
-        // contents — truncated-but-valid-JSON write, or tampering.
-        // Committed marker is written too so this tests the COUNT
-        // check, not the missing-marker check.
-        std::fs::write(dir.join("sess-9.done"), "format_version=1\n").unwrap();
-        std::fs::write(
-            dir.join("sess-9.json"),
-            json!({
+        // contents — the committed manifest is valid, so this tests
+        // the COUNT check, not the commit check.
+        commit_body(
+            &dir,
+            "sess-9",
+            &json!({
                 "format_version": 1,
                 "session_id": "sess-9",
                 "working_dir": "/tmp",
                 "messages": [{"role": "system", "content": "sys"}],
                 "message_count": 7,
                 "writer_pid": 1,
-            })
-            .to_string(),
-        )
-        .unwrap();
+            }),
+        );
         let store = SessionStore { dir: dir.clone() };
         assert!(
             store.load("sess-9").is_err(),
             "count-mismatched snapshot must load as corrupt"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4: a save killed between the body rename and the manifest swap
+    /// leaves the manifest binding the PREVIOUS generation — load must
+    /// recover `.prev` (the last verifiable committed state), never
+    /// the unverifiable newest bytes.
+    #[test]
+    fn stale_manifest_recovers_previous_generation() {
+        let dir = fresh_dir("prevgen");
+        let store = SessionStore { dir: dir.clone() };
+        let v1 = vec![json!({"role":"user","content":"committed v1"})];
+        let v2 = vec![json!({"role":"user","content":"uncommitted v2"})];
+        store.save("s6", Path::new("/tmp"), &v1);
+
+        // Simulate a second save killed after .json rotation+rename but
+        // before the manifest swap: .prev holds v1, .json holds v2,
+        // .done still names v1's hash.
+        let prev = dir.join("s6.json.prev");
+        let json_v2 = json!({"format_version":1,"session_id":"s6","working_dir":"/tmp",
+                            "messages":v2,"message_count":1})
+        .to_string();
+        std::fs::remove_file(&prev).ok();
+        std::fs::rename(dir.join("s6.json"), &prev).unwrap();
+        std::fs::write(dir.join("s6.json"), &json_v2).unwrap();
+
+        let loaded = store.load("s6").unwrap().expect("must recover");
+        assert_eq!(loaded.messages[0]["content"], "committed v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4: a `.json` body that matches NO manifest hash and has no
+    /// valid `.prev` is unrecoverable — explicit corrupt, never served.
+    #[test]
+    fn tampered_body_is_rejected() {
+        let dir = fresh_dir("tamper");
+        let store = SessionStore { dir: dir.clone() };
+        store.save(
+            "s7",
+            Path::new("/tmp"),
+            &[json!({"role":"user","content":"ok"})],
+        );
+        std::fs::remove_file(dir.join("s7.json.prev")).ok();
+        std::fs::write(dir.join("s7.json"), "{\"tampered\":true}").unwrap();
+        assert!(store.load("s7").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3: the turn marker survives a mid-turn crash and marks the next
+    /// load as interrupted; clearing it after durable completion
+    /// restores a clean state.
+    #[test]
+    fn turn_marker_marks_interrupted_load() {
+        let dir = fresh_dir("turn");
+        let store = SessionStore { dir: dir.clone() };
+        let msgs = vec![json!({"role":"user","content":"task"})];
+        store.save("s8", Path::new("/tmp"), &msgs);
+
+        assert!(store.begin_turn("s8"));
+        let loaded = store.load("s8").unwrap().expect("snapshot missing");
+        assert!(loaded.interrupted, "pending turn marker must mark load");
+
+        store.end_turn("s8");
+        let loaded = store.load("s8").unwrap().expect("snapshot missing");
+        assert!(!loaded.interrupted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3: a store that cannot write must make begin_turn's refusal
+    /// explicit — the caller then refuses the turn with zero tool runs.
+    /// A store dir that is actually a FILE makes every write fail
+    /// deterministically.
+    #[test]
+    fn turn_marker_failure_is_explicit() {
+        let file = fresh_dir("turnfail").join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let store = SessionStore { dir: file.clone() };
+        assert!(!store.begin_turn("s1"));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// R2: cleanup must never delete a session whose lock a live owner
+    /// holds — even when the caller's `active` set (its own memory)
+    /// doesn't know about it.
+    #[test]
+    fn cleanup_skips_sessions_owned_elsewhere() {
+        let (store, dir) = temp_store("cleanup-owned");
+        let msgs = vec![json!({"role":"user","content":"hi"})];
+        for id in ["old-1", "old-2", "other-proc"] {
+            store.save(id, Path::new("/tmp"), &msgs);
+        }
+        // Another "process" owns this session — the caller's active set
+        // does NOT know about it.
+        let held = store.acquire_lock("other-proc").unwrap();
+        store.write_artifact("old-1", "c1", &"x".repeat(1_000_000));
+        store.write_artifact("old-2", "c1", &"x".repeat(1_000_000));
+        let evicted = store.cleanup_stale(&std::collections::HashSet::new());
+        assert!(!evicted.contains(&"other-proc".to_string()));
+        assert!(dir.join("other-proc.json").exists());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R5: while the store quota section is held (any process), new
+    /// writes are skipped rather than racing the check-then-write.
+    #[test]
+    fn held_quota_section_skips_writes() {
+        let (store, dir) = temp_store("quota-lock");
+        let quota = store.quota_section().unwrap();
+        assert!(!store.save("s9", Path::new("/tmp"), &[json!({"role":"x"})]));
+        drop(quota);
+        assert!(store.save("s9", Path::new("/tmp"), &[json!({"role":"x"})]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

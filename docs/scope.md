@@ -158,15 +158,23 @@ above are a safety net for Clients that don't.
 - **Not a session database.** Without `LLM_SESSION_DIR` there is no
   persistence at all. With it set, sessions snapshot to flat JSON files
   at turn boundaries and `session/load` can restore them across
-  restarts. Saves go through a per-session writer lock (`{id}.lock`,
-  stale after 5 min), fsync the body before rename, and only count as
-  committed when a `{id}.done` marker exists — a `.json` without its
-  marker loads as corrupt, not as a session. Schema is validated on
-  load (format_version, session_id match, message_count, required
-  fields). The store itself is bounded: 2 MB per snapshot, 500 files,
-  64 MB total — over-limit saves are skipped rather than truncated.
-  Still honest limits: no cross-machine coordination, no compaction,
-  no encryption at rest.
+  restarts. Session execution and snapshot writes are single-owner via
+  an OS flock on `{id}.lock` (held for the session's lifetime; the
+  kernel releases it on process death — a second live process gets
+  `session_busy`, not a race). Each turn writes a durable
+  `{id}.turn` intent marker before any tool runs; a marker that
+  survives to load marks the restored history `interrupted` — never
+  replayed. Commits are content-bound: the `{id}.done` manifest names
+  the body's sha256, swapped atomically after tmp+fsync+rename, and a
+  `{id}.json.prev` rotation keeps the last verifiable generation — a
+  save killed mid-commit loads the previous committed state, not a
+  guess. Schema is validated on load (format_version, session_id match,
+  message_count, required fields). The store itself is bounded: 2 MB
+  per snapshot, 500 files, 64 MB total, with quota check+write
+  serialized under `store.lock` — over-limit saves are skipped rather
+  than truncated. Still honest limits: advisory locks only (bypass
+  writers exist outside this API), no cross-machine coordination, no
+  compaction, no encryption at rest.
 - **Not an auth provider.** No login flow, no token storage, no user
   identity. If you need per-user sessions, route through a Client that
   gates on its own identity.

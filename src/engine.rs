@@ -300,20 +300,42 @@ impl AppState {
     /// On a quota refusal the store first evicts stale (non-active)
     /// sessions then retries once — live data is never the eviction
     /// candidate (G1a-Q3).
+    /// A successful save also clears the turn-intent marker: reaching
+    /// here means the turn's state is durable, so nothing stays
+    /// "in progress". A failed save keeps the marker — the next load
+    /// then honestly reports `interrupted` (R3).
     pub fn persist_session(&self, session_id: &str) {
-        if let Some(store) = &self.session_store {
-            if let Some(session) = self.sessions_read().get(session_id) {
-                if store.save(session_id, &session.working_dir, &session.messages) {
-                    return;
-                }
-                let active_ids: Vec<String> = self.sessions_read().keys().cloned().collect();
-                let active: std::collections::HashSet<&str> =
-                    active_ids.iter().map(String::as_str).collect();
-                let evicted = store.cleanup_stale(&active);
-                if !evicted.is_empty() {
-                    store.save(session_id, &session.working_dir, &session.messages);
-                }
+        let Some(store) = &self.session_store else {
+            return;
+        };
+        let save = |store: &crate::session_store::SessionStore, session: &Session| match &session
+            .store_lock
+        {
+            Some(owner) => {
+                store.save_owned(session_id, &session.working_dir, owner, &session.messages)
             }
+            None => store.save(session_id, &session.working_dir, &session.messages),
+        };
+        let saved = {
+            let sessions = self.sessions_read();
+            sessions
+                .get(session_id)
+                .is_some_and(|session| save(store, session))
+        };
+        let saved = saved || {
+            let active_ids: Vec<String> = self.sessions_read().keys().cloned().collect();
+            let active: std::collections::HashSet<&str> =
+                active_ids.iter().map(String::as_str).collect();
+            let evicted = store.cleanup_stale(&active);
+            !evicted.is_empty() && {
+                let sessions = self.sessions_read();
+                sessions
+                    .get(session_id)
+                    .is_some_and(|session| save(store, session))
+            }
+        };
+        if saved {
+            store.end_turn(session_id);
         }
     }
 
@@ -613,11 +635,24 @@ pub fn session_new(
         })
     });
 
-    let session = Session::new(
+    let mut session = Session::new(
         json!({"role": "system", "content": system_prompt}),
         working_dir,
         protocol_version,
     );
+    // Claim cross-process execution ownership for the session's
+    // lifetime (ADR §2). A fresh id claims trivially; failure is
+    // anomalous — degrade to per-save locking with a loud warning
+    // rather than refusing session creation.
+    if let Some(store) = &state.session_store {
+        match store.try_claim(&session_id) {
+            Some(lock) => session.store_lock = Some(std::sync::Arc::new(lock)),
+            None => warn!(
+                session_id,
+                "fresh session id could not claim its own lock; running unowned"
+            ),
+        }
+    }
     state.sessions_write().insert(session_id.clone(), session);
 
     // Initial snapshot so a brand-new session also survives a restart.
@@ -770,6 +805,30 @@ pub async fn session_prompt(
             user_msg
         };
         session.messages.push(user_msg);
+    }
+
+    // Durable turn-intent BEFORE the first side effect of this turn
+    // (R3): if the marker cannot be committed, the turn must not run —
+    // a mid-turn kill would otherwise be indistinguishable from a
+    // clean pre-turn state on the next load.
+    if let Some(store) = &state.session_store {
+        if !store.begin_turn(session_id) {
+            return PromptResult {
+                status: "failed".into(),
+                text: "snapshot store could not commit the turn intent marker; turn refused before any tool ran".into(),
+                error: Some(AcpError::LlmError {
+                    reason: "session store refused turn intent".into(),
+                }),
+                usage: UsageReport {
+                    used: 0,
+                    size: state.config.context_size,
+                },
+                evidence: TurnEvidence::default(),
+                error_class: None,
+                error_retryable: false,
+                message_id: message_id.to_string(),
+            };
+        }
     }
 
     let mut dropped_image_note: Option<String> = None;
@@ -1738,6 +1797,10 @@ pub enum SessionLoadOutcome {
     /// `load_failed` — corrupt state must not silently become an
     /// empty session.
     Corrupt,
+    /// Another live process holds the session's flock → `-32003`
+    /// `session_busy` — honest refusal instead of a second writer
+    /// racing the owner's tools and snapshots (R1).
+    Busy,
 }
 
 /// Handle `session/load` / `session/resume` (P1/E14).
@@ -1754,20 +1817,35 @@ pub fn session_load(state: &AppState, session_id: &str) -> SessionLoadOutcome {
     let Some(store) = &state.session_store else {
         return SessionLoadOutcome::NoStore;
     };
+    // Execution ownership first: while another process holds the
+    // session's flock, loading here would start a second writer on
+    // the same history — answer busy instead (R1).
+    let Some(ownership) = store.try_claim(session_id) else {
+        return SessionLoadOutcome::Busy;
+    };
     match store.load(session_id) {
         Ok(Some(loaded)) => {
             let working_dir = match loaded.working_dir.canonicalize() {
                 Ok(p) if p.is_dir() => p,
                 _ => return SessionLoadOutcome::NotFound,
             };
+            let mut messages = loaded.messages;
+            if loaded.interrupted {
+                // A `.turn` marker survived — the last turn never
+                // reached durable completion. Mark it in restored
+                // history so the model treats its side effects as
+                // unknown; never replayed (R3).
+                messages.push(json!({"role":"assistant","content":"[bridge: previous turn ended without durable completion — its tool side effects are unverified; do not assume they succeeded]"}));
+            }
             let session = Session {
-                messages: loaded.messages,
+                messages,
                 last_active: std::time::Instant::now(),
                 working_dir,
                 protocol_version: state.protocol_version,
                 token_scale: 1.0,
                 summary_cooldown: 0,
                 effective_context: None,
+                store_lock: Some(std::sync::Arc::new(ownership)),
             };
             state
                 .sessions_write()
@@ -2755,6 +2833,42 @@ mod tests {
             .format_user_message("short question", &[]);
         let out2 = maybe_offload_user_input(&state, &sid, small, "short question", 32768);
         assert_eq!(out2["content"], "short question");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1: a session whose flock a live owner holds must answer busy —
+    /// never start a second writer on the same history. Two stores on
+    /// one dir stand in for two processes (flock is per-fd).
+    #[test]
+    fn session_load_reports_busy_when_owned_elsewhere() {
+        let dir = std::env::temp_dir().join(format!(
+            "acp-busy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let other = crate::session_store::SessionStore::new(dir.clone()).unwrap();
+        let held = other.try_claim("owned-sess").unwrap();
+
+        let ours = crate::session_store::SessionStore::new(dir.clone()).unwrap();
+        let base = AppState::new(cfg_with_image(false));
+        let state = AppState {
+            session_store: Some(std::sync::Arc::new(ours)),
+            ..(*base).clone()
+        };
+        assert!(matches!(
+            session_load(&state, "owned-sess"),
+            SessionLoadOutcome::Busy
+        ));
+        drop(held);
+        // Once released, the id claims cleanly — though without a
+        // snapshot the outcome is NotFound, not Loaded.
+        assert!(matches!(
+            session_load(&state, "owned-sess"),
+            SessionLoadOutcome::NotFound
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

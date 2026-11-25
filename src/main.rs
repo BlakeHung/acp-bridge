@@ -504,6 +504,14 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                                     json!({ "reason": "load_failed" }),
                                                 );
                                             }
+                                            engine::SessionLoadOutcome::Busy => {
+                                                acp::send_error_with_data(
+                                                    &id,
+                                                    -32003,
+                                                    &format!("session {sid} is owned by another live process"),
+                                                    json!({ "reason": "session_busy" }),
+                                                );
+                                            }
                                         }
                                     }
                                 }
