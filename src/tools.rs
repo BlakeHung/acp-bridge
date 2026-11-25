@@ -1145,6 +1145,15 @@ async fn run_process(
     // forever on those pipes (the guard's drop-kill only runs after
     // this function returns — exactly the deadlock the wait was for).
     kill_process_group(_guard.pgid);
+    #[cfg(not(unix))]
+    {
+        // No process groups off Unix — kill the child directly so the
+        // grace/reader waits below don't burn ~11s on a live process
+        // (Windows acceptance C-report: timeout took 12s, all of it
+        // dead time). Grandchildren can still hold pipes open; the
+        // joins are deadline-bounded so nothing hangs.
+        let _ = child.start_kill();
+    }
     if timed_out {
         // Bounded wait: the group kill above is asynchronous, give the
         // child a short grace to reap rather than awaiting forever.
