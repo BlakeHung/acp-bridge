@@ -142,6 +142,11 @@ impl Agent {
     /// returned alongside. Panics on timeout or stdout close.
     pub fn recv_response(&self, target_id: &Value, timeout: Duration) -> (Vec<Value>, Value) {
         let mut notifications = Vec::new();
+        // Startup probes LLM_BASE_URL before serving stdin — an
+        // unreachable endpoint retried for ~4-5s makes a 5s caller
+        // timeout land exactly on the boundary and flake every test.
+        // Enforce a floor so call sites can't pick a too-tight budget.
+        let timeout = timeout.max(Duration::from_secs(20));
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
