@@ -420,9 +420,121 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 {
                                     let mut registry = state.turn_registry.lock().expect("turn registry lock");
                                     if registry.contains_key(&sid) {
-                                        acp::send_error_with_data(&id, -32001,
-                                            "A turn is already in progress for this session; send session/cancel first",
-                                            json!({"reason": "turn_in_progress"}));
+                                        // Mid-turn steer (P3): the prompt
+                                        // waits in the session's steer queue
+                                        // instead of a hard error. Text-only
+                                        // prompts may be injected into the
+                                        // running turn (`applied`); image
+                                        // prompts queue for a full turn
+                                        // (`queued`) — their payloads can't
+                                        // be injected mid-flight.
+                                        drop(registry);
+                                        let prompt_value =
+                                            params.get("prompt").cloned().unwrap_or(Value::Null);
+                                        let raw_text =
+                                            engine::extract_user_text_from_prompt(&prompt_value);
+                                        let (text, _ctx) = engine::strip_sender_context(&raw_text);
+                                        let images =
+                                            engine::extract_user_images_from_prompt(&prompt_value);
+                                        let steerable = images.is_empty() && !text.trim().is_empty();
+                                        if text.trim().is_empty() && images.is_empty() {
+                                            acp::send_error_with_data(&id, -32001,
+                                                "Prompt is empty",
+                                                json!({"reason": "empty_prompt"}));
+                                            continue;
+                                        }
+                                        let Some(item) =
+                                            state.push_steer(&sid, text.clone(), steerable)
+                                        else {
+                                            acp::send_error_with_data(&id, -32001,
+                                                "A turn is already in progress and the steer queue is full; retry after it completes or send session/cancel",
+                                                json!({"reason": "turn_in_progress"}));
+                                            continue;
+                                        };
+                                        // `received`: visible on the wire
+                                        // immediately via a session
+                                        // notification — the request itself
+                                        // stays open until the steer resolves
+                                        // (`applied` or its own turn ends).
+                                        acp::notify_text_for(
+                                            state.protocol_version,
+                                            &sid,
+                                            "\n\n*[steer] prompt queued — waiting for the running turn*",
+                                        );
+                                        let state_w = Arc::clone(&state);
+                                        let sid_w = sid.clone();
+                                        let params_w = params.clone();
+                                        prompts.spawn(async move {
+                                            // Wait for the turn slot to
+                                            // free — or for the running
+                                            // turn to adopt this steer.
+                                            loop {
+                                                if item.applied.load(
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                ) {
+                                                    break;
+                                                }
+                                                let busy = state_w
+                                                    .turn_registry
+                                                    .lock()
+                                                    .expect("turn registry lock")
+                                                    .contains_key(&sid_w);
+                                                if !busy {
+                                                    break;
+                                                }
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(120),
+                                                )
+                                                .await;
+                                            }
+                                            state_w.remove_steer(&sid_w, item.id);
+                                            if item.applied.load(
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            ) {
+                                                // `applied`: the running
+                                                // turn injected this prompt —
+                                                // its streamed answer covers
+                                                // the request.
+                                                acp::send_response(
+                                                    &id,
+                                                    json!({"status": "completed",
+                                                           "steered": true,
+                                                           "text": "[steered into the running turn]"}),
+                                                );
+                                                return;
+                                            }
+                                            // `queued`: claim the freed slot
+                                            // and run a full turn with the
+                                            // real request id.
+                                            let (cancel_tx, cancel_rx) =
+                                                tokio::sync::watch::channel(false);
+                                            {
+                                                let mut registry = state_w
+                                                    .turn_registry
+                                                    .lock()
+                                                    .expect("turn registry lock");
+                                                let cap = state_w.config.max_inflight_turns;
+                                                if registry.contains_key(&sid_w)
+                                                    || (cap > 0 && registry.len() >= cap)
+                                                {
+                                                    // Lost the slot race —
+                                                    // nothing to retry here.
+                                                    state_w.remove_steer(&sid_w, item.id);
+                                                    acp::send_error_with_data(&id, -32001,
+                                                        "Another prompt claimed the turn slot first",
+                                                        json!({"reason": "turn_in_progress"}));
+                                                    return;
+                                                }
+                                                registry.insert(sid_w.clone(), cancel_tx);
+                                            }
+                                            handle_acp_prompt(
+                                                id,
+                                                &params_w,
+                                                &state_w,
+                                                cancel_rx,
+                                            )
+                                            .await;
+                                        });
                                         continue;
                                     }
                                     // G1a-Q2 queue items: global in-flight bound.

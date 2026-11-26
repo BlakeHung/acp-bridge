@@ -296,7 +296,10 @@ impl SessionStore {
             if r.get("k").and_then(serde_json::Value::as_str) != Some("start") {
                 continue;
             }
-            let id = r.get("call_id").and_then(serde_json::Value::as_str).unwrap_or("");
+            let id = r
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             let closed = records[i + 1..].iter().any(|d| {
                 matches!(
                     d.get("k").and_then(serde_json::Value::as_str),
@@ -1253,9 +1256,19 @@ mod tests {
         // Recycled call_id: after call-1's done, a `start` for the
         // same id but a DIFFERENT tool is a new call — it must not
         // dedup against call-1's outcome and it must appear unclosed.
-        store.journal_tool_start("s1", "call-1", "write_file", &serde_json::json!({"path":"y"}));
+        store.journal_tool_start(
+            "s1",
+            "call-1",
+            "write_file",
+            &serde_json::json!({"path":"y"}),
+        );
         assert!(store
-            .journal_lookup_done("s1", "call-1", "write_file", &serde_json::json!({"path":"y"}))
+            .journal_lookup_done(
+                "s1",
+                "call-1",
+                "write_file",
+                &serde_json::json!({"path":"y"})
+            )
             .is_none());
         let unclosed = store.journal_unclosed("s1");
         assert_eq!(unclosed.len(), 2);

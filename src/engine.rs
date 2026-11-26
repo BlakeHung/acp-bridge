@@ -237,6 +237,27 @@ pub struct AppState {
     /// call. Deployment-scope `Policy::grants` stay as the coarse knob;
     /// a permit is the per-operation grant the confirm action wants.
     permits: std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<Permit>>>>,
+    /// Mid-turn steer queue (P3): a `session/prompt` arriving while
+    /// this session's turn is still running waits here instead of a
+    /// hard `turn_in_progress` error. Text-only items can be injected
+    /// into the running turn between rounds (`applied`); everything
+    /// else stays queued and runs as a follow-up turn when the slot
+    /// frees (`queued`).
+    pub steer_queues: std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<SteerItem>>>>,
+}
+
+/// One prompt waiting on a running turn. `steerable` = text-only —
+/// a prompt carrying images can't be injected mid-turn (the image
+/// payload would be silently lost), so it queues for a full turn.
+#[derive(Clone)]
+pub struct SteerItem {
+    pub id: u64,
+    pub text: String,
+    /// Set by the running turn when the text was injected into its
+    /// message flow — the queued request then answers "steered"
+    /// instead of running a second turn.
+    pub applied: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub steerable: bool,
 }
 
 /// A single-use, TTL-bound authorization for one `confirm`-gated
@@ -262,6 +283,7 @@ impl Clone for AppState {
             policy: self.policy.clone(),
             session_store: self.session_store.clone(),
             permits: Arc::clone(&self.permits),
+            steer_queues: Arc::clone(&self.steer_queues),
         }
     }
 }
@@ -280,6 +302,7 @@ impl AppState {
             policy: crate::policy::Policy::default_policy(),
             session_store: None,
             permits: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            steer_queues: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -339,6 +362,70 @@ impl AppState {
         };
         if saved {
             store.end_turn(session_id);
+        }
+    }
+
+    // ── Mid-turn steer (P3) ──────────────────────────────────────────
+    /// Max queued steers per session — beyond this the requester gets
+    /// the honest `turn_in_progress` error rather than an unbounded
+    /// pile-up it would wait a long time for.
+    const MAX_STEER_QUEUE: usize = 8;
+
+    /// Enqueue a prompt that arrived mid-turn. `steerable` = text-only
+    /// (image prompts must wait for a full turn). `None` when the
+    /// queue is already full.
+    pub fn push_steer(
+        &self,
+        session_id: &str,
+        text: String,
+        steerable: bool,
+    ) -> Option<SteerItem> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut queues = self.steer_queues.lock().expect("steer queue lock");
+        let q = queues.entry(session_id.to_string()).or_default();
+        if q.len() >= Self::MAX_STEER_QUEUE {
+            return None;
+        }
+        let item = SteerItem {
+            id: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            text,
+            applied: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            steerable,
+        };
+        q.push(item.clone());
+        Some(item)
+    }
+
+    /// Take the queue's steerable items for injection into the running
+    /// turn — they are removed and marked `applied` so their waiting
+    /// requests know they were adopted.
+    pub fn drain_steerable(&self, session_id: &str) -> Vec<SteerItem> {
+        let mut queues = self.steer_queues.lock().expect("steer queue lock");
+        let Some(q) = queues.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let mut taken = Vec::new();
+        let mut rest = Vec::with_capacity(q.len());
+        for item in std::mem::take(q).into_iter() {
+            if item.steerable {
+                taken.push(item);
+            } else {
+                rest.push(item);
+            }
+        }
+        *q = rest;
+        taken
+    }
+
+    /// Drop a steer item by id — the waiter finished one way or the
+    /// other (applied, or ran its own turn).
+    pub fn remove_steer(&self, session_id: &str, id: u64) {
+        let mut queues = self.steer_queues.lock().expect("steer queue lock");
+        if let Some(q) = queues.get_mut(session_id) {
+            q.retain(|i| i.id != id);
+            if q.is_empty() {
+                queues.remove(session_id);
+            }
         }
     }
 
@@ -949,6 +1036,31 @@ pub async fn session_prompt(
     // Tool call loop
     for round in 0..max_tool_rounds {
         evidence.rounds = round as u32 + 1;
+        // Mid-turn steer (P3): prompts that arrived while this turn
+        // runs wait in the steer queue — steerable ones are injected
+        // here as user messages so the model sees them this round and
+        // their waiting requests mark `applied`.
+        let steers = state.drain_steerable(session_id);
+        if !steers.is_empty() {
+            let mut sessions = state.sessions_write();
+            if let Some(session) = sessions.get_mut(session_id) {
+                for steer in &steers {
+                    session.messages.push(json!({
+                        "role": "user",
+                        "content": format!("[steer mid-turn] {}", steer.text)
+                    }));
+                    steer
+                        .applied
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    evidence.steers_applied += 1;
+                }
+            }
+            notify(Notification::TextChunk(format!(
+                "\n\n*[steer] {} queued input(s) applied mid-turn*",
+                steers.len()
+            )));
+            info!(session_id, count = steers.len(), "mid-turn steer applied");
+        }
         let (messages, working_dir) = {
             let sessions = state.sessions_read();
             match sessions.get(session_id) {
@@ -2240,6 +2352,9 @@ pub struct TurnEvidence {
     /// Which budget forced the wrap-up, if any: "rounds" |
     /// "failure_streak". `None` = the model finished inside budget.
     pub budget_hit: Option<String>,
+    /// Queued prompts injected mid-turn via the steer queue.
+    #[serde(default)]
+    pub steers_applied: u32,
     /// Backend-reported phase timings summed across rounds. Only
     /// populated when the backend reports them (Ollama native carries
     /// `load`/`prompt_eval`/`eval` durations in the response; OpenAI-
@@ -3244,6 +3359,27 @@ mod tests {
         assert!(text.contains("unloaded") && text.contains("artifact unavailable"));
         assert!(message_has_images(&session.messages[2]));
         assert!(message_has_images(&session.messages[4]));
+    }
+
+    #[test]
+    fn steer_queue_filters_steerable_and_bounds_capacity() {
+        let state = AppState::new(cfg_with_image(false));
+        let steerable = state.push_steer("s", "text steer".into(), true).unwrap();
+        let image_prompt = state.push_steer("s", "with image".into(), false).unwrap();
+
+        // drain takes steerable items only; image prompts stay queued.
+        let drained = state.drain_steerable("s");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].id, steerable.id);
+        assert!(state.drain_steerable("s").is_empty());
+
+        // The unsteerable item survives until its waiter removes it.
+        state.remove_steer("s", image_prompt.id);
+        // Capacity bound: the 9th steer is refused.
+        for _ in 0..8 {
+            state.push_steer("s2", "x".into(), true).unwrap();
+        }
+        assert!(state.push_steer("s2", "overflow".into(), true).is_none());
     }
 
     #[test]
