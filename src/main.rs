@@ -194,12 +194,32 @@ async fn probe_backend(config: &llm::LlmConfig) {
         }
     }
 
-    // Query model info (Ollama native only)
+    // Query model info (Ollama native only). Reachable-but-mismatched
+    // is surfaced as warnings; unreachable stays silent — a backend
+    // that is merely down must not block startup (retry on request).
     if let Some(info) = llm::query_model_info(config).await {
         info!(
             context_length = info.context_length,
+            num_ctx = ?info.num_ctx,
+            capabilities = ?info.capabilities,
             "Model info from /api/show"
         );
+        if let Some(num_ctx) = info.num_ctx {
+            if num_ctx < config.context_size {
+                warn!(
+                    configured = config.context_size,
+                    served_num_ctx = num_ctx,
+                    "LLM_MODEL_CONTEXT exceeds the model's served num_ctx — oversized prompts will be rejected"
+                );
+            }
+        }
+        if config.prompt_supports_image && !info.capabilities.iter().any(|c| c == "vision") {
+            warn!(
+                model = %config.model,
+                capabilities = ?info.capabilities,
+                "LLM_SUPPORTS_IMAGE enabled but the model does not report vision capability"
+            );
+        }
     }
 
     // Check running models (Ollama)

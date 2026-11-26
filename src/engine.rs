@@ -917,6 +917,7 @@ pub async fn session_prompt(
 
         match chat_result {
             Ok(response) => {
+                evidence.record_backend_response(&response);
                 let mut tool_calls = backend.extract_tool_calls(&response);
                 // When tool calls were recovered from the content channel
                 // (thinking-mode workaround), this carries the cleaned text
@@ -1951,8 +1952,60 @@ pub struct TurnEvidence {
     /// Which budget forced the wrap-up, if any: "rounds" |
     /// "failure_streak". `None` = the model finished inside budget.
     pub budget_hit: Option<String>,
+    /// Backend-reported phase timings summed across rounds. Only
+    /// populated when the backend reports them (Ollama native carries
+    /// `load`/`prompt_eval`/`eval` durations in the response; OpenAI-
+    /// compatible bodies carry no timing fields). Absent means "not
+    /// measured" — distinguishable from measured-zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_timing: Option<BackendTiming>,
     /// Whole-turn wall-clock time.
     pub wall_ms: u128,
+}
+
+/// Backend-reported per-phase costs, aggregated over the turn's rounds.
+/// Fields come from Ollama's native `/api/chat` response; values are
+/// converted to milliseconds for readability.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendTiming {
+    /// `load_duration` — model (re)load time, nonzero on cold start.
+    pub load_ms: u64,
+    /// `prompt_eval_duration` — prompt processing across rounds.
+    pub prefill_ms: u64,
+    /// `eval_duration` — token generation across rounds.
+    pub decode_ms: u64,
+    /// `eval_count` — generated tokens across rounds.
+    pub decode_tokens: u64,
+    /// `prompt_eval_count` — prompt tokens across rounds.
+    pub prompt_tokens: u64,
+    /// `prompt_eval_cached_count` — prompt tokens served from cache.
+    pub cached_prompt_tokens: u64,
+}
+
+impl TurnEvidence {
+    /// Fold one backend response's phase timings into the turn totals.
+    /// Ollama native reports durations in nanoseconds; bodies that carry
+    /// none (OpenAI-compatible) are a no-op, leaving `backend_timing`
+    /// absent so "not measured" stays distinguishable from zero.
+    pub fn record_backend_response(&mut self, response: &Value) {
+        let get = |k: &str| response.get(k).and_then(Value::as_u64);
+        let (ld, pd, ed) = (
+            get("load_duration"),
+            get("prompt_eval_duration"),
+            get("eval_duration"),
+        );
+        if ld.is_none() && pd.is_none() && ed.is_none() {
+            return;
+        }
+        let t = self.backend_timing.get_or_insert_with(Default::default);
+        t.load_ms += ld.unwrap_or(0) / 1_000_000;
+        t.prefill_ms += pd.unwrap_or(0) / 1_000_000;
+        t.decode_ms += ed.unwrap_or(0) / 1_000_000;
+        t.decode_tokens += get("eval_count").unwrap_or(0);
+        t.prompt_tokens += get("prompt_eval_count").unwrap_or(0);
+        t.cached_prompt_tokens += get("prompt_eval_cached_count").unwrap_or(0);
+    }
 }
 
 pub struct PromptResult {
@@ -2819,6 +2872,45 @@ mod tests {
         assert_eq!(error.status, Some(400));
         assert_eq!(calls.lock().unwrap().len(), 1);
         server.abort();
+    }
+
+    #[test]
+    fn evidence_records_backend_timing_only_when_reported() {
+        let mut ev = TurnEvidence::default();
+        // Ollama native body — ns durations + counts.
+        ev.record_backend_response(&json!({
+            "load_duration": 3_313_000,
+            "prompt_eval_duration": 111_630_000,
+            "prompt_eval_count": 12,
+            "prompt_eval_cached_count": 8,
+            "eval_duration": 72_251_000,
+            "eval_count": 8
+        }));
+        let t = ev.backend_timing.as_ref().expect("timing recorded");
+        assert_eq!(t.load_ms, 3);
+        assert_eq!(t.prefill_ms, 111);
+        assert_eq!(t.decode_ms, 72);
+        assert_eq!(t.decode_tokens, 8);
+        assert_eq!(t.prompt_tokens, 12);
+        assert_eq!(t.cached_prompt_tokens, 8);
+        // A second round accumulates.
+        ev.record_backend_response(&json!({
+            "prompt_eval_duration": 50_000_000,
+            "eval_duration": 100_000_000,
+            "eval_count": 40,
+            "prompt_eval_count": 200
+        }));
+        let t = ev.backend_timing.as_ref().unwrap();
+        assert_eq!(t.prefill_ms, 161);
+        assert_eq!(t.decode_ms, 172);
+        assert_eq!(t.decode_tokens, 48);
+        // OpenAI-compat body: no timing fields → stays absent.
+        let mut ev2 = TurnEvidence::default();
+        ev2.record_backend_response(&json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        }));
+        assert!(ev2.backend_timing.is_none());
     }
 
     #[test]

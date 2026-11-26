@@ -1,13 +1,57 @@
 //! Bounded working context. All counts are conservative estimates, not tokenizer counts.
 use serde_json::{json, Value};
 
+/// Flat per-image charge for context estimation. The vision projector
+/// converts an image into a few hundred to ~1k tokens depending on
+/// resolution; the exact count lives server-side, so this carries
+/// margin instead of pretending precision. Transport size is NOT
+/// context cost: a 1 MB photo ships ~1.4 MB of base64 on the wire but
+/// only its projected tokens count against the window — estimating
+/// from the serialized payload overestimates by ~1000x and locally
+/// rejects every image prompt as "protected and oversized".
+pub const IMAGE_CONTEXT_ESTIMATE_TOKENS: u64 = 1536;
+
+/// Clone `v` with image payloads removed, counting how many were
+/// stripped. Covers the three encodings this bridge produces or
+/// receives: Ollama `images: [b64, …]`, OpenAI `{"type":"image_url",
+/// "image_url":{"url":"data:…"}}` parts, and inbound ACP `{"type":
+/// "image","data":…}` blocks.
+fn strip_image_payloads(v: &Value, count: &mut u64) -> Value {
+    match v {
+        Value::Object(map) => {
+            let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if t == "image_url" || (t == "image" && v.get("data").is_some()) {
+                *count += 1;
+                return Value::Null;
+            }
+            let mut m = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                if k == "images" {
+                    if let Some(arr) = val.as_array() {
+                        *count += arr.len() as u64;
+                    }
+                    continue;
+                }
+                m.insert(k.clone(), strip_image_payloads(val, count));
+            }
+            Value::Object(m)
+        }
+        Value::Array(arr) => {
+            Value::Array(arr.iter().map(|e| strip_image_payloads(e, count)).collect())
+        }
+        _ => v.clone(),
+    }
+}
+
 /// Include serialized metadata, tool arguments, roles and a template allowance.
 /// Non-ASCII gets a larger allowance than prose in ASCII. Provider usage calibrates this.
 pub fn estimate_value(value: &Value) -> u64 {
-    let text = value.to_string();
+    let mut images = 0u64;
+    let stripped = strip_image_payloads(value, &mut images);
+    let text = stripped.to_string();
     let ascii = text.bytes().filter(u8::is_ascii).count() as u64;
     let unicode = text.chars().filter(|c| !c.is_ascii()).count() as u64;
-    ascii.div_ceil(3) + unicode * 2 + 16
+    ascii.div_ceil(3) + unicode * 2 + 16 + images * IMAGE_CONTEXT_ESTIMATE_TOKENS
 }
 
 pub fn estimate_tokens(messages: &[Value]) -> u64 {
@@ -257,5 +301,59 @@ mod tests {
         let (out, _, _) = compact_for_context(messages.clone(), 1000);
         assert_eq!(out, messages);
         assert!(estimate_tokens(&out) > 1000);
+    }
+
+    // Image payloads are transport, not context. A photo's base64 must
+    // not meter as prompt text — every image counts a flat projected-
+    // token estimate instead. Regression for "image prompt rejected
+    // locally as protected/oversized" with a real photo-sized payload.
+    #[test]
+    fn image_payloads_estimate_by_count_not_bytes() {
+        let big_b64 = "A".repeat(1_400_000); // ~1 MB photo in base64
+                                             // Ollama shape: `images` array on the user message.
+        let single = json!({"role":"user","content":"描述這張圖","images":[big_b64]});
+        let est = estimate_value(&single);
+        assert!(
+            est < IMAGE_CONTEXT_ESTIMATE_TOKENS * 2,
+            "one image must not exceed ~2x the flat rate, got {est}"
+        );
+        // Multi-image scales linearly, not by payload size.
+        let three = json!({"role":"user","content":"t","images":[big_b64, big_b64, big_b64]});
+        let est3 = estimate_value(&three);
+        assert!(est3 > IMAGE_CONTEXT_ESTIMATE_TOKENS * 3);
+        assert!(est3 < IMAGE_CONTEXT_ESTIMATE_TOKENS * 4);
+        // OpenAI shape: `image_url` part with a data URI.
+        let openai = json!({"role":"user","content":[
+            {"type":"text","text":"描述"},
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{big_b64}")}}
+        ]});
+        let est_o = estimate_value(&openai);
+        assert!(est_o > IMAGE_CONTEXT_ESTIMATE_TOKENS);
+        assert!(est_o < IMAGE_CONTEXT_ESTIMATE_TOKENS * 2);
+    }
+
+    #[test]
+    fn image_history_stays_shrinkable_under_budget() {
+        // Image + tool history: estimates must stay bounded so the
+        // tool results can still be compacted, instead of the whole
+        // history looking unshrinkable from the image's base64.
+        let b64 = "B".repeat(700_000);
+        let messages = vec![
+            json!({"role":"system","content":"s"}),
+            json!({"role":"user","content":"看圖","images":[b64]}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"c1"}]}),
+            json!({"role":"tool","tool_call_id":"c1","content":"x".repeat(20_000)}),
+        ];
+        let est = estimate_tokens(&messages);
+        assert!(
+            est < 20_000,
+            "history with one image + tool output must stay bounded, got {est}"
+        );
+        // Tight budget → elision trims the tool output while the
+        // (protected) image turn stays present.
+        let (out, _, elided) = compact_for_context(messages, 3000);
+        assert!(elided > 0, "oversized tool output must still be elidable");
+        assert!(estimate_tokens(&out) <= 3000);
+        assert!(out.iter().any(|m| m.get("images").is_some()));
     }
 }

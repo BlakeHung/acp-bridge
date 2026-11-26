@@ -476,7 +476,10 @@ pub async fn query_model_info(config: &LlmConfig) -> Option<ModelInfo> {
     if !config.is_ollama_native() {
         return None;
     }
-    let url = format!("{}/api/show", config.base_url);
+    // Native endpoints live at the server root — a `…/v1` suffix in
+    // base_url would 404 here (matching `query_running_models`, which
+    // already uses `ollama_base`).
+    let url = format!("{}/api/show", config.ollama_base());
     let resp = config
         .client
         .post(&url)
@@ -498,7 +501,37 @@ pub async fn query_model_info(config: &LlmConfig) -> Option<ModelInfo> {
         .and_then(|(_, v)| v.as_u64())
         .unwrap_or(0);
 
-    Some(ModelInfo { context_length })
+    // `parameters` is the rendered Modelfile blob — a whitespace-aligned
+    // text like `num_ctx                        32768\nnum_gpu  99` —
+    // not JSON. num_ctx is the served cap; arch context_length is the
+    // ceiling, but a Modelfile may sit below it.
+    let num_ctx = val.get("parameters").and_then(Value::as_str).and_then(|p| {
+        p.lines()
+            .filter_map(|line| {
+                let mut it = line.split_whitespace();
+                match (it.next(), it.next()) {
+                    (Some("num_ctx"), Some(v)) => v.parse::<u64>().ok(),
+                    _ => None,
+                }
+            })
+            .next()
+    });
+
+    let capabilities = val
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(ModelInfo {
+        context_length,
+        num_ctx,
+        capabilities,
+    })
 }
 
 /// Query Ollama /api/ps to check if a model is loaded in VRAM.
@@ -513,7 +546,13 @@ pub async fn query_running_models(config: &LlmConfig) -> Option<Vec<String>> {
 }
 
 pub struct ModelInfo {
+    /// Architecture ceiling from GGUF `*.context_length`.
     pub context_length: u64,
+    /// Served window from the Modelfile (`parameters` blob) — the value
+    /// Ollama actually enforces, which may sit below `context_length`.
+    pub num_ctx: Option<u64>,
+    /// e.g. `["completion","tools","thinking","vision"]`.
+    pub capabilities: Vec<String>,
 }
 
 /// Maximum number of retry attempts for transient LLM HTTP errors.
@@ -1656,6 +1695,25 @@ mod tests {
         let cfg = test_config(&url);
         let info = query_model_info(&cfg).await.expect("model info");
         assert_eq!(info.context_length, 8192);
+    }
+
+    #[tokio::test]
+    async fn query_model_info_reads_served_num_ctx_and_capabilities() {
+        // Real /api/show shape (observed 2026-11-26): `parameters` is a
+        // whitespace-aligned Modelfile blob, `capabilities` a string list.
+        async fn show() -> impl IntoResponse {
+            Json(json!({
+                "model_info": {"qwen35moe.context_length": 262144},
+                "parameters": "num_ctx                        32768\nnum_gpu                        99",
+                "capabilities": ["tools", "thinking", "completion", "vision"],
+            }))
+        }
+        let url = serve(Router::new().route("/api/show", post(show))).await;
+        let cfg = test_config(&url);
+        let info = query_model_info(&cfg).await.expect("model info");
+        assert_eq!(info.context_length, 262144);
+        assert_eq!(info.num_ctx, Some(32768));
+        assert!(info.capabilities.iter().any(|c| c == "vision"));
     }
 
     #[tokio::test]
