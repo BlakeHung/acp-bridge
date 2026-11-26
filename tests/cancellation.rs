@@ -145,10 +145,10 @@ async fn cancel_and_follow_up_work_on_both_wire_versions() {
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
                 .await
                 .expect("request did not reach backend");
-            // A second prompt cannot race the current turn's history.
+            // Mid-turn text prompts are STEERED now — queued against the
+            // running turn rather than hard-rejected. The steer note
+            // must hit the wire before the cancel lands.
             client.prompt(&sid, id + 1);
-            let (_, blocked) = client.response(id + 1);
-            assert_eq!(blocked["error"]["data"]["reason"], "turn_in_progress");
             let started = Instant::now();
             client.send(
                 json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}}),
@@ -156,6 +156,14 @@ async fn cancel_and_follow_up_work_on_both_wire_versions() {
             let (updates, response) = client.response(id);
             assert!(started.elapsed() < Duration::from_secs(5));
             assert!(response.get("error").is_none(), "{response}");
+            assert!(
+                updates.iter().any(|u| {
+                    serde_json::to_string(u)
+                        .unwrap_or_default()
+                        .contains("steer")
+                }),
+                "steer notification expected before turn end: {updates:?}"
+            );
             if version == 1 {
                 assert_eq!(response["result"]["stopReason"], "cancelled");
             } else {
@@ -166,6 +174,28 @@ async fn cancel_and_follow_up_work_on_both_wire_versions() {
                         .any(|u| u["params"]["update"]["sessionUpdate"] == "state_update"
                             && u["params"]["update"]["stopReason"] == "cancelled"),
                     "{updates:?}"
+                );
+            }
+            // The queued steer claims the freed slot and runs a real
+            // turn — which hits the (hanging) backend again; cancel it.
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .expect("steered prompt did not reach backend");
+            client.send(
+                json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}}),
+            );
+            let (updates2, response2) = client.response(id + 1);
+            assert!(response2.get("error").is_none(), "{response2}");
+            if version == 1 {
+                assert_eq!(response2["result"]["stopReason"], "cancelled");
+            } else {
+                assert!(response2["result"]["messageId"].as_str().is_some());
+                assert!(
+                    updates2
+                        .iter()
+                        .any(|u| u["params"]["update"]["sessionUpdate"] == "state_update"
+                            && u["params"]["update"]["stopReason"] == "cancelled"),
+                    "{updates2:?}"
                 );
             }
         }

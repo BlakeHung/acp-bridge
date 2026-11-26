@@ -491,13 +491,35 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                                 // `applied`: the running
                                                 // turn injected this prompt —
                                                 // its streamed answer covers
-                                                // the request.
-                                                acp::send_response(
-                                                    &id,
-                                                    json!({"status": "completed",
-                                                           "steered": true,
-                                                           "text": "[steered into the running turn]"}),
-                                                );
+                                                // the request. Respond in
+                                                // the negotiated wire shape
+                                                // (v1 stopReason / v2
+                                                // state_update + messageId) —
+                                                // a bespoke envelope leaves
+                                                // strict Clients unable to
+                                                // close the request.
+                                                if state_w.protocol_version
+                                                    == ProtocolVersion::V2
+                                                {
+                                                    acp::notify_state_idle_for(
+                                                        state_w.protocol_version,
+                                                        &sid_w,
+                                                        Some("end_turn"),
+                                                        Some(json!({"steered": true})),
+                                                    );
+                                                    acp::send_response(
+                                                        &id,
+                                                        json!({"messageId": uuid::Uuid::new_v4().to_string()}),
+                                                    );
+                                                } else {
+                                                    acp::send_response(
+                                                        &id,
+                                                        json!({"stopReason": "end_turn",
+                                                               "status": "completed",
+                                                               "steered": true,
+                                                               "text": "[steered into the running turn]"}),
+                                                    );
+                                                }
                                                 return;
                                             }
                                             // `queued`: claim the freed slot

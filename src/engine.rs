@@ -941,12 +941,20 @@ pub async fn session_prompt(
         }
     }
 
-    // Tool-journal reconciliation (P3): `start` records with no
-    // `done`/`interrupted` are calls that were in flight when the
-    // process or turn died. Mark them interrupted and put a note in
-    // history naming exactly which calls' side effects are
-    // unverifiable — never silently replayed or claimed complete.
+    // Turn boundary BEFORE reconciliation: dedup is scoped to records
+    // after the latest boundary — a call from the previous turn can
+    // never be mistaken for a redelivery of this turn's dispatch. If the
+    // boundary itself cannot persist, dedup is unsafe this turn (the
+    // lookup window leaks into the previous turn) — disable it rather
+    // than risk replaying a stale outcome for a call that never ran.
+    let mut dedup_safe = true;
     if let Some(store) = state.session_store.as_deref() {
+        dedup_safe = store.journal_turn_boundary(session_id);
+        // Tool-journal reconciliation (P3): `start` records with no
+        // `done`/`interrupted` are calls that were in flight when the
+        // process or turn died. Mark them interrupted and put a note in
+        // history naming exactly which calls' side effects are
+        // unverifiable — never silently replayed or claimed complete.
         let unclosed = store.journal_unclosed(session_id);
         if !unclosed.is_empty() {
             let mut names = Vec::with_capacity(unclosed.len());
@@ -1224,11 +1232,18 @@ pub async fn session_prompt(
                     // already journaled as done → replay the recorded
                     // outcome; the side effects already happened and
                     // must not re-run. All three fields must match —
-                    // models recycle call ids across turns.
-                    let prior_done = state
-                        .session_store
-                        .as_deref()
-                        .and_then(|s| s.journal_lookup_done(session_id, tool_call_id, name, &args));
+                    // models recycle call ids across turns. Skipped when
+                    // this turn's boundary record failed to persist:
+                    // the lookup window would then cover the previous
+                    // turn too, and a stale done could replay for a call
+                    // that never ran this turn.
+                    let prior_done = if dedup_safe {
+                        state.session_store.as_deref().and_then(|s| {
+                            s.journal_lookup_done(session_id, tool_call_id, name, &args)
+                        })
+                    } else {
+                        None
+                    };
                     let result = if let Some(prev) = &prior_done {
                         let ok = prev.get("ok").and_then(Value::as_bool).unwrap_or(false);
                         let head = prev
@@ -1997,6 +2012,12 @@ fn offload_tool_output(
 /// Execute a tool with journal records around it (P3): `start` before
 /// dispatch, `done` after — so a process/turn dying mid-tool leaves a
 /// provable "was in flight" mark instead of an unknowable gap.
+///
+/// Fail-closed on journal write failure for side-effect tools
+/// (Write/Shell capabilities): if the start record cannot persist,
+/// the mutation must not run — an unjournaled side effect is exactly
+/// what crash reconciliation cannot see. Read/Web tools proceed with
+/// a note: their result cannot mutate state.
 #[allow(clippy::too_many_arguments)]
 async fn journaled_execute(
     store: Option<&crate::session_store::SessionStore>,
@@ -2009,10 +2030,22 @@ async fn journaled_execute(
     deny_globs: &[String],
     artifact_root: Option<&std::path::Path>,
 ) -> tools::ToolResult {
-    if let Some(s) = store {
-        s.journal_tool_start(session_id, call_id, name, args);
+    let journaled = store
+        .map(|s| s.journal_tool_start(session_id, call_id, name, args))
+        .unwrap_or(false);
+    if store.is_some() && !journaled {
+        use crate::policy::{Capability, Policy};
+        if matches!(
+            Policy::capability_of(name),
+            Some(Capability::Write) | Some(Capability::Shell)
+        ) {
+            return tools::ToolResult::err(
+                tools::ToolErrorKind::ExecFailed,
+                "Error: tool journal could not persist the start record — side-effect call refused (a mutation without a durable record is unrecoverable)".into(),
+            );
+        }
     }
-    let r = tools::execute_tool(
+    let mut r = tools::execute_tool(
         working_dir,
         name,
         args,
@@ -2023,6 +2056,11 @@ async fn journaled_execute(
     .await;
     if let Some(s) = store {
         s.journal_tool_done(session_id, call_id, r.error_kind.is_none(), &r.text);
+        if !journaled {
+            r.text.push_str(
+                "\n\n[journal: this call's records could not be persisted — it will not appear in reconciliation]",
+            );
+        }
     }
     r
 }
@@ -2033,64 +2071,161 @@ async fn journaled_execute(
 /// `max` image-bearing messages, payloads move to a session artifact
 /// and the message keeps an explicit "image unloaded" marker naming
 /// the re-readable path, never a silent deletion.
+/// Offload a set of image payloads from one message: each payload
+/// becomes a session artifact and the message gets an explicit
+/// unload marker naming the re-readable path — never a silent drop.
+fn offload_image_payloads(
+    store: Option<&crate::session_store::SessionStore>,
+    session_id: &str,
+    msg: &mut Value,
+    msg_idx: usize,
+    payloads: Vec<String>,
+) {
+    if payloads.is_empty() {
+        return;
+    }
+    let mut refs = Vec::with_capacity(payloads.len());
+    for (j, data) in payloads.iter().enumerate() {
+        let name = format!("image-m{msg_idx}-{j}");
+        refs.push(
+            store
+                .and_then(|s| s.write_artifact(session_id, &name, data))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<artifact unavailable>".to_string()),
+        );
+    }
+    append_image_marker(
+        msg,
+        &format!(
+            "[{} previous image(s) unloaded from context; original(s): {}]",
+            payloads.len(),
+            refs.join(", ")
+        ),
+    );
+    info!(
+        session_id,
+        index = msg_idx,
+        count = payloads.len(),
+        "image payload(s) offloaded to artifact marker"
+    );
+}
+
 fn cap_image_history(
     session: &mut Session,
     store: Option<&crate::session_store::SessionStore>,
     session_id: &str,
     max: usize,
 ) {
+    // The bound is on live image PAYLOADS, not on image-bearing
+    // messages — one message can carry many images and would
+    // otherwise stay fully resident while the cap looks satisfied.
+    let mut total: usize = session.messages.iter().map(count_image_payloads).sum();
+    if total <= max {
+        return;
+    }
     let bearing: Vec<usize> = session
         .messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| message_has_images(m))
+        .filter(|(_, m)| count_image_payloads(m) > 0)
         .map(|(i, _)| i)
         .collect();
-    let excess = bearing.len().saturating_sub(max);
-    for idx in bearing.into_iter().take(excess) {
-        let payloads = take_image_payloads(&mut session.messages[idx]);
-        if payloads.is_empty() {
-            continue;
+    let Some(&last_idx) = bearing.last() else {
+        return;
+    };
+    // Phase 1: whole oldest image-bearing messages lose their payloads.
+    for idx in &bearing {
+        if total <= max || *idx == last_idx {
+            break;
         }
-        let mut refs = Vec::with_capacity(payloads.len());
-        for (j, data) in payloads.iter().enumerate() {
-            let name = format!("image-m{idx}-{j}");
-            refs.push(
-                store
-                    .and_then(|s| s.write_artifact(session_id, &name, data))
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<artifact unavailable>".to_string()),
-            );
-        }
-        append_image_marker(
-            &mut session.messages[idx],
-            &format!(
-                "[{} previous image(s) unloaded from context; original(s): {}]",
-                payloads.len(),
-                refs.join(", ")
-            ),
-        );
-        info!(
+        let n = count_image_payloads(&session.messages[*idx]);
+        let payloads = take_image_payloads(&mut session.messages[*idx]);
+        debug_assert_eq!(n, payloads.len());
+        total = total.saturating_sub(payloads.len());
+        offload_image_payloads(
+            store,
             session_id,
-            index = idx,
-            count = payloads.len(),
-            "image payload(s) offloaded to artifact marker"
+            &mut session.messages[*idx],
+            *idx,
+            payloads,
+        );
+    }
+    // Phase 2: the newest image-bearing message alone can still exceed
+    // the bound — offload its OLDEST excess parts in place, keeping
+    // the newest `max` live.
+    if total > max {
+        let over = total - max;
+        let payloads = take_image_payloads_n(&mut session.messages[last_idx], over);
+        offload_image_payloads(
+            store,
+            session_id,
+            &mut session.messages[last_idx],
+            last_idx,
+            payloads,
         );
     }
 }
 
-/// True when a history message carries live image payloads — Ollama
-/// `images[]` or OpenAI-style `content[].type == "image_url"` parts.
-fn message_has_images(m: &Value) -> bool {
+/// Count live image payloads on a history message — the unit the
+/// history cap actually bounds (one message can hold many).
+fn count_image_payloads(m: &Value) -> usize {
     m.get("images")
         .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-        || m.get("content")
+        .map(|a| a.len())
+        .unwrap_or(0)
+        + m.get("content")
             .and_then(Value::as_array)
-            .is_some_and(|arr| {
+            .map(|arr| {
                 arr.iter()
-                    .any(|p| p.get("type").and_then(Value::as_str) == Some("image_url"))
+                    .filter(|p| p.get("type").and_then(Value::as_str) == Some("image_url"))
+                    .count()
             })
+            .unwrap_or(0)
+}
+
+/// Take ONLY the oldest `n` image payloads out of a message — for a
+/// single message that alone exceeds the payload bound: its oldest
+/// images offload while the newest stay live. `images[]` payloads
+/// drain first (they serialize before content parts anyway).
+fn take_image_payloads_n(m: &mut Value, n: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(images) = m.get_mut("images").and_then(Value::as_array_mut) {
+        let take = n.min(images.len());
+        out.extend(images.drain(..take).map(|i| {
+            i.as_str()
+                .map(String::from)
+                .unwrap_or_else(|| i.to_string())
+        }));
+        if images.is_empty() {
+            if let Some(obj) = m.as_object_mut() {
+                obj.remove("images");
+            }
+        }
+    }
+    let remaining = n - out.len();
+    if remaining > 0 {
+        if let Some(arr) = m.get_mut("content").and_then(Value::as_array_mut) {
+            let positions: std::collections::HashSet<usize> = arr
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.get("type").and_then(Value::as_str) == Some("image_url"))
+                .map(|(i, _)| i)
+                .take(remaining)
+                .collect();
+            let mut kept = Vec::with_capacity(arr.len());
+            for (i, part) in std::mem::take(arr).into_iter().enumerate() {
+                if positions.contains(&i) {
+                    if let Some(url) = part.pointer("/image_url/url").and_then(Value::as_str) {
+                        out.push(url.to_string());
+                    }
+                } else {
+                    kept.push(part);
+                }
+            }
+            *arr = kept;
+        }
+    }
+    out
 }
 
 /// Remove live image payloads from a history message and return the
@@ -3355,11 +3490,105 @@ mod tests {
             .iter()
             .any(|p| p["text"].as_str().is_some_and(|t| t.contains("unloaded"))));
         // Newest three keep live payloads.
-        assert!(message_has_images(&session.messages[3]));
-        assert!(message_has_images(&session.messages[4]));
+        assert!(count_image_payloads(&session.messages[3]) > 0);
+        assert!(count_image_payloads(&session.messages[4]) > 0);
         // Artifact actually on disk and re-readable.
         let artifact = store.artifact_dir("s1").unwrap().join("image-m1-0.txt");
         assert!(artifact.exists(), "artifact must exist at {artifact:?}");
+    }
+
+    #[test]
+    fn image_history_cap_counts_payloads_not_messages() {
+        use crate::session_store::SessionStore;
+        let dir = std::env::temp_dir().join(format!(
+            "acp-imgcap2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SessionStore::new(dir).unwrap();
+        let mut session = crate::protocol::Session::new(
+            json!({"role":"system","content":"s"}),
+            std::path::PathBuf::from("/tmp"),
+            crate::protocol::ProtocolVersion::V1,
+        );
+        // ONE message carrying five image payloads — a per-message cap
+        // would call this "1 ≤ 3" and keep all five resident.
+        let imgs: Vec<Value> = (0..5).map(|i| json!(format!("img{i}"))).collect();
+        session
+            .messages
+            .push(json!({"role":"user","content":"many","images":imgs}));
+        cap_image_history(&mut session, Some(&store), "s1", 3);
+        let kept = session.messages[1]["images"].as_array().unwrap().len();
+        assert_eq!(kept, 3, "newest three payloads stay live");
+        assert_eq!(
+            session.messages[1]["images"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap(),
+            "img2",
+            "oldest payloads offloaded first"
+        );
+        let text = session.messages[1]["content"].as_str().unwrap();
+        assert!(
+            text.contains("2 previous image(s) unloaded"),
+            "marker: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn journaled_execute_refuses_side_effect_on_journal_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "acp-jfail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = crate::session_store::SessionStore::new(dir.clone()).unwrap();
+        // Journal path is a DIRECTORY — appends fail deterministically.
+        std::fs::create_dir_all(dir.join("s.tools.jsonl")).unwrap();
+        let wd = dir.clone();
+        let r = journaled_execute(
+            Some(&store),
+            "s",
+            "c1",
+            &wd,
+            "write_file",
+            &json!({"path": "f.txt", "content": "x"}),
+            10,
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(r.error_kind, Some(tools::ToolErrorKind::ExecFailed));
+        assert!(
+            r.text.contains("tool journal"),
+            "refusal must name the cause: {}",
+            r.text
+        );
+        // Read-only tools proceed — they cannot mutate — but carry an
+        // explicit note that they went unrecorded.
+        let rr = journaled_execute(
+            Some(&store),
+            "s",
+            "c2",
+            &wd,
+            "list_dir",
+            &json!({"path": "."}),
+            10,
+            &[],
+            None,
+        )
+        .await;
+        assert!(
+            rr.text.contains("journal"),
+            "unrecorded call must be marked: {}",
+            rr.text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3379,8 +3608,8 @@ mod tests {
         assert!(first.get("images").is_none());
         let text = first["content"].as_str().unwrap();
         assert!(text.contains("unloaded") && text.contains("artifact unavailable"));
-        assert!(message_has_images(&session.messages[2]));
-        assert!(message_has_images(&session.messages[4]));
+        assert!(count_image_payloads(&session.messages[2]) > 0);
+        assert!(count_image_payloads(&session.messages[4]) > 0);
     }
 
     #[test]

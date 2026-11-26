@@ -154,40 +154,53 @@ impl SessionStore {
     /// Records kept on compaction.
     const JOURNAL_KEEP: usize = 256;
 
-    fn journal_append(&self, session_id: &str, record: &serde_json::Value) {
+    /// Append a record with an fsync so "written" means durable —
+    /// returns false on any IO failure. A journal that cannot persist
+    /// is a correctness signal, not log noise.
+    fn journal_append(&self, session_id: &str, record: &serde_json::Value) -> bool {
         let Some(path) = self.journal_path(session_id) else {
-            return;
+            return false;
         };
         use std::io::Write;
-        // Compaction check before append — bounded reads, and if the
-        // read itself fails we just append (a bloated journal is a
-        // disk-space issue, never a correctness one).
+        // Compaction goes through a tmp file + rename so a crash
+        // mid-rewrite can never leave a truncated journal — the old
+        // file stays whole until the swap.
         if let Ok(meta) = std::fs::metadata(&path) {
             if meta.len() > Self::MAX_JOURNAL_BYTES {
                 if let Ok(text) = std::fs::read_to_string(&path) {
                     let lines: Vec<&str> = text.lines().collect();
                     let keep_from = lines.len().saturating_sub(Self::JOURNAL_KEEP);
-                    if let Ok(mut f) = std::fs::File::create(&path) {
+                    let tmp = path.with_extension("jsonl.tmp");
+                    let compacted = (|| -> io::Result<()> {
+                        let mut f = std::fs::File::create(&tmp)?;
                         for l in &lines[keep_from..] {
-                            let _ = writeln!(f, "{l}");
+                            writeln!(f, "{l}")?;
                         }
+                        f.sync_all()?;
+                        std::fs::rename(&tmp, &path)
+                    })();
+                    if let Err(e) = compacted {
+                        warn!(session_id, error = %e, "tool journal compaction failed");
                     }
                 }
             }
         }
         let mut line = record.to_string();
         line.push('\n');
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(line.as_bytes()) {
-                    warn!(session_id, error = %e, "tool journal append failed");
-                }
+        let written = (|| -> io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            f.write_all(line.as_bytes())?;
+            f.sync_data()
+        })();
+        match written {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(session_id, error = %e, "tool journal append failed");
+                false
             }
-            Err(e) => warn!(session_id, error = %e, "tool journal open failed"),
         }
     }
 
@@ -203,25 +216,37 @@ impl SessionStore {
             .collect()
     }
 
-    /// Record a tool dispatch BEFORE it executes. `args_head` is a
-    /// bounded dump of the arguments for post-mortem identification —
-    /// never the full args (paths, snippets only).
+    /// Hash of the complete serialized args — the dedup key. Comparing
+    /// a truncated args head (240B) would collide two calls that share
+    /// a prefix but differ at the tail (e.g. two write_file bodies
+    /// opening the same way), replaying the wrong outcome.
+    fn args_hash(args: &serde_json::Value) -> String {
+        sha256_hex(args.to_string().as_bytes())
+    }
+
+    /// Record a tool dispatch BEFORE it executes — with fsync, and the
+    /// return value tells the caller whether the record is durable. A
+    /// side-effect tool must refuse to run when this returns false:
+    /// an unjournaled mutation is exactly what reconciliation cannot
+    /// see. `args` stays a bounded display head — the dedup key is the
+    /// full-args hash.
     pub fn journal_tool_start(
         &self,
         session_id: &str,
         call_id: &str,
         name: &str,
         args: &serde_json::Value,
-    ) {
+    ) -> bool {
         let mut head = args.to_string();
         crate::tools::truncate_utf8(&mut head, 240);
         self.journal_append(
             session_id,
             &serde_json::json!({
-                "k": "start", "call_id": call_id, "name": name, "args": head,
+                "k": "start", "call_id": call_id, "name": name,
+                "args": head, "args_hash": Self::args_hash(args),
                 "ts": Self::now_secs()
             }),
-        );
+        )
     }
 
     /// Record completion. `result_head` lets a deduplicated replay
@@ -249,12 +274,30 @@ impl SessionStore {
         );
     }
 
-    /// The completed record for a call whose LATEST `start` matches
-    /// `call_id` + `name` + args head, closed by a `done` recorded
-    /// AFTER it. Name/args live on the `start` record; matching all
-    /// three plus positional pairing matters because models recycle
-    /// call ids (`call_0` every round) — an id-only match would
-    /// replay a completely different call's outcome.
+    /// Write the turn-boundary record at prompt start. Dedup lookups
+    /// only consider records AFTER the latest boundary — a new turn
+    /// re-issuing an identical call is a fresh decision to execute,
+    /// not a redelivery of the previous turn's dispatch. Returns false
+    /// when the boundary could not persist: the caller must disable
+    /// dedup for that turn, because the lookup window would silently
+    /// extend into the previous turn's records and replay stale
+    /// outcomes for calls this turn never dispatched.
+    pub fn journal_turn_boundary(&self, session_id: &str) -> bool {
+        self.journal_append(
+            session_id,
+            &serde_json::json!({"k": "turn", "ts": Self::now_secs()}),
+        )
+    }
+
+    /// The completed record for a same-turn redelivery: the latest
+    /// `start` for `call_id` must match `name` + the FULL-args hash,
+    /// and a `done` must follow it — with the search scoped to records
+    /// after the latest `turn` boundary. Turn-scoping is the
+    /// distinction between "this dispatch was redelivered" (dedup) and
+    /// "a new turn decided to run the same call again" (execute):
+    /// models recycle call ids and repeat calls across turns, so an
+    /// unscoped match would replay stale outcomes — a re-read of a
+    /// changed file must actually re-read.
     pub fn journal_lookup_done(
         &self,
         session_id: &str,
@@ -262,22 +305,27 @@ impl SessionStore {
         name: &str,
         args: &serde_json::Value,
     ) -> Option<serde_json::Value> {
-        let mut head = args.to_string();
-        crate::tools::truncate_utf8(&mut head, 240);
         let records = self.journal_records(session_id);
+        let since = records
+            .iter()
+            .rposition(|r| r.get("k").and_then(serde_json::Value::as_str) == Some("turn"))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let window = &records[since..];
+        let hash = Self::args_hash(args);
         // The LAST start for this id defines what the current call is —
         // if it doesn't match, the id was recycled for another tool.
-        let last_start = records.iter().rposition(|r| {
+        let last_start = window.iter().rposition(|r| {
             r.get("k").and_then(serde_json::Value::as_str) == Some("start")
                 && r.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
         })?;
-        let s = &records[last_start];
+        let s = &window[last_start];
         let matches = s.get("name").and_then(serde_json::Value::as_str) == Some(name)
-            && s.get("args").and_then(serde_json::Value::as_str) == Some(head.as_str());
+            && s.get("args_hash").and_then(serde_json::Value::as_str) == Some(hash.as_str());
         if !matches {
             return None;
         }
-        records[last_start + 1..]
+        window[last_start + 1..]
             .iter()
             .find(|r| {
                 r.get("k").and_then(serde_json::Value::as_str) == Some("done")
@@ -286,31 +334,36 @@ impl SessionStore {
             .cloned()
     }
 
-    /// Starts with no matching `done`/`interrupted` AFTER them — calls
-    /// that were in flight when the process or turn died. Positional
-    /// pairing: a `done` only closes the start records that precede it.
+    /// Starts with no matching `done`/`interrupted` — calls that were
+    /// in flight when the process or turn died. Pairing is LIFO per
+    /// call_id: a `done` closes the nearest preceding unpaired `start`
+    /// with the same id, so a recycled id in a later turn can never
+    /// retroactively close an older lost call.
     pub fn journal_unclosed(&self, session_id: &str) -> Vec<serde_json::Value> {
         let records = self.journal_records(session_id);
-        let mut unclosed = Vec::new();
+        // call_id → stack of record indices still unpaired.
+        let mut pending: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
         for (i, r) in records.iter().enumerate() {
-            if r.get("k").and_then(serde_json::Value::as_str) != Some("start") {
-                continue;
-            }
+            let k = r.get("k").and_then(serde_json::Value::as_str);
             let id = r
                 .get("call_id")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let closed = records[i + 1..].iter().any(|d| {
-                matches!(
-                    d.get("k").and_then(serde_json::Value::as_str),
-                    Some("done") | Some("interrupted")
-                ) && d.get("call_id").and_then(serde_json::Value::as_str) == Some(id)
-            });
-            if !closed {
-                unclosed.push(r.clone());
+                .unwrap_or("")
+                .to_string();
+            match k {
+                Some("start") => pending.entry(id).or_default().push(i),
+                Some("done") | Some("interrupted") => {
+                    pending.get_mut(&id).and_then(|v| v.pop());
+                }
+                _ => {}
             }
         }
-        unclosed
+        pending
+            .into_values()
+            .flatten()
+            .map(|i| records[i].clone())
+            .collect()
     }
 
     fn now_secs() -> u64 {
@@ -1283,6 +1336,71 @@ mod tests {
         store.journal_mark_interrupted("s1", "call-2");
         store.journal_mark_interrupted("s1", "call-1");
         assert!(store.journal_unclosed("s1").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_journal_turn_boundary_resets_dedup_scope() {
+        let (store, dir) = temp_store("journal-turn");
+        let args = serde_json::json!({"path": "src/main.rs"});
+        // Turn 1: call completes.
+        store.journal_turn_boundary("s1");
+        store.journal_tool_start("s1", "call_0", "read_file", &args);
+        store.journal_tool_done("s1", "call_0", true, "old contents");
+        // Turn 2: model re-issues the SAME call — a new decision to
+        // execute, NOT a redelivery: dedup must not replay turn 1.
+        store.journal_turn_boundary("s1");
+        assert!(
+            store
+                .journal_lookup_done("s1", "call_0", "read_file", &args)
+                .is_none(),
+            "a previous turn's done must not dedup a new turn's call"
+        );
+        // Within-turn redelivery still dedups: the same dispatch
+        // completing twice inside one turn is the replay case.
+        store.journal_tool_start("s1", "call_0", "read_file", &args);
+        store.journal_tool_done("s1", "call_0", true, "fresh contents");
+        assert!(store
+            .journal_lookup_done("s1", "call_0", "read_file", &args)
+            .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_journal_args_hash_defeats_prefix_collision() {
+        let (store, dir) = temp_store("journal-hash");
+        // Two write_file calls whose args share a >240-char prefix but
+        // differ at the tail — a truncated-head comparison would
+        // wrongly dedup the second, skipping its write.
+        let prefix = "x".repeat(400);
+        let args_a = serde_json::json!({"path": "f", "content": format!("{prefix}AAA")});
+        let args_b = serde_json::json!({"path": "f", "content": format!("{prefix}BBB")});
+        store.journal_tool_start("s1", "c", "write_file", &args_a);
+        store.journal_tool_done("s1", "c", true, "written");
+        // Same call_id+name, different args tail → NOT a replay.
+        store.journal_tool_start("s1", "c", "write_file", &args_b);
+        assert!(store
+            .journal_lookup_done("s1", "c", "write_file", &args_b)
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_journal_unclosed_lifo_pairing() {
+        let (store, dir) = temp_store("journal-lifo");
+        // call-9's turn-1 start is lost (no done); the recycled id in
+        // a later turn must not let its done retroactively close it.
+        store.journal_tool_start("s1", "call-9", "bash", &serde_json::json!({"cmd":"a"}));
+        store.journal_turn_boundary("s1");
+        store.journal_tool_start("s1", "call-9", "bash", &serde_json::json!({"cmd":"b"}));
+        store.journal_tool_done("s1", "call-9", true, "b done");
+        let unclosed = store.journal_unclosed("s1");
+        assert_eq!(unclosed.len(), 1, "lost turn-1 start must stay unclosed");
+        assert_eq!(
+            unclosed[0]["args"].as_str().unwrap(),
+            "{\"cmd\":\"a\"}",
+            "the unclosed entry is the FIRST call's start"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

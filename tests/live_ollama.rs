@@ -177,6 +177,13 @@ fn live_native_stream_timing_journal_steer() {
     let (n31, r31) = agent.recv_response(&json!(31), LONG);
     assert!(r30.get("error").is_none(), "first prompt failed: {r30}");
     assert!(r31.get("error").is_none(), "steered prompt failed: {r31}");
+    // Whichever way the steer resolved, the response is in the
+    // negotiated v1 shape — a bespoke envelope would leave strict
+    // Clients unable to close the request.
+    assert!(
+        r31["result"]["stopReason"].as_str().is_some(),
+        "steered prompt must close with a stopReason: {r31}"
+    );
     let wire = format!("{}{}", notif_text(&json!(n30)), notif_text(&json!(n31)));
     assert!(
         wire.contains("steer"),
