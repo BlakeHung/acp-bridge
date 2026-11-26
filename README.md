@@ -24,7 +24,7 @@ ACP Agent is actively maintained, with a focus on local inference and ACP-compat
 
 For Clients on the v1 wire (the common case today) the v0.9.x release is a strict additive change — same wire as v0.8.x plus more tools.
 
-For air-gapped, self-hosted, and audit-sensitive deployments the design constraints are unchanged: single ~5 MB static Rust binary, zero runtime dependencies beyond the configured LLM endpoint, sandboxed tool calls within the session working directory, opt-in network access via `LLM_WEB_ALLOWLIST`. See `docs/scope.md` for the capability matrix.
+For air-gapped, self-hosted, and audit-sensitive deployments the design constraints are unchanged: single ~5 MB Rust executable, no service dependencies beyond the configured LLM endpoint, file tools resolved beneath the session working directory (shell runs as your user — gate it with tool policy), opt-in network access via `LLM_WEB_ALLOWLIST`. Model requests go only to the endpoint you configure; note that `bash` can itself reach the network, so a fully offline deployment also needs OS-level egress limits. See `docs/scope.md` for the capability matrix.
 
 Roadmap:
 
@@ -48,8 +48,8 @@ acp-bridge targets the same protocol but a narrower scope: **air-gap clean, loca
 | Concern | OpenCode | acp-bridge |
 |---------|----------|-----------|
 | Provider breadth | 75+ via AI SDK (cloud-leaning) | OpenAI-compatible + Ollama native |
-| Network footprint | models.dev, LSP, update, ripgrep fetches | Outbound only to configured LLM endpoint |
-| Runtime | Node.js + npm | Single 5MB static Rust binary |
+| Network footprint | models.dev, LSP, update, ripgrep fetches | Model requests only to the configured endpoint; `bash` can reach the network — full offline needs OS egress limits |
+| Runtime | Node.js + npm | Single ~5 MB Rust executable |
 | Tool surface | Full agent (edit, shell, web) | 11 tools: `read_file`, `list_dir`, `search_code`, `write_file`, `edit`, `web_fetch`, `bash`, `git_status` / `git_diff` / `git_log` / `git_commit`. `web_fetch` is opt-in (`LLM_WEB_ALLOWLIST`); `bash` runs unconstrained in the session working dir |
 | Air-gap audit | Per-release verification | Binary small enough to audit once |
 | ACP server stability | Active issues on `newSession`, `--port` | ACP v1: `initialize` + `session/{new, list, close, end, prompt, cancel}`; v2 negotiated wire shapes (baseline gaps listed in `docs/scope.md`); `load`/`resume`/`delete` return graceful rejections |
