@@ -1373,21 +1373,28 @@ fn is_context_overflow(e: &crate::llm::LlmError) -> bool {
             && (m.contains("exceed") || m.contains("too long") || m.contains("too many tokens")))
 }
 
-/// Extract the real prompt-token count from a context-overflow error —
-/// backends phrase it as `prompt (30314 tokens)`; the sanitized
-/// diagnostic keeps that figure verbatim. Knowing the REAL count lets
-/// the retry scale the estimate by the measured ratio.
-fn reported_prompt_tokens(message: &str) -> Option<u64> {
+/// Extract `N` from `needle N tokens)` inside an error message; tries
+/// each needle in order so backend-specific phrasings share one parser.
+fn tokens_after(message: &str, needles: &[&str]) -> Option<u64> {
     let m = message.to_ascii_lowercase();
-    let start = m.find("prompt (")? + "prompt (".len();
-    let digits: String = m[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    if digits.is_empty() || !m[start..].starts_with(&format!("{digits} tokens")) {
-        return None;
-    }
-    digits.parse().ok()
+    needles.iter().find_map(|needle| {
+        let start = m.find(needle)? + needle.len();
+        let digits: String = m[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.is_empty() || !m[start..].starts_with(&format!("{digits} tokens")) {
+            return None;
+        }
+        digits.parse().ok()
+    })
+}
+/// Extract the real prompt-token count from a context-overflow error —
+/// Strata phrases it `prompt (N tokens)`, Ollama `request (N tokens)`;
+/// the sanitized diagnostic keeps that figure verbatim. Knowing the
+/// REAL count lets the retry scale the estimate by the measured ratio.
+fn reported_prompt_tokens(message: &str) -> Option<u64> {
+    tokens_after(message, &["prompt (", "request ("])
 }
 
 /// The window the backend actually enforced, when it reported one —
@@ -1397,16 +1404,8 @@ fn reported_prompt_tokens(message: &str) -> Option<u64> {
 /// real `fit_max_tokens` budget) shrink its own budget instead of
 /// repeating the same rejection.
 fn reported_context_tokens(message: &str) -> Option<u64> {
-    let m = message.to_ascii_lowercase();
-    let start = m.find("context (")? + "context (".len();
-    let digits: String = m[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    if digits.is_empty() || !m[start..].starts_with(&format!("{digits} tokens")) {
-        return None;
-    }
-    digits.parse().ok()
+    // Strata: "context (N tokens)"; Ollama: "available context size (N tokens)"
+    tokens_after(message, &["context (", "context size ("])
 }
 
 /// Local rejection before dispatch: no prompt contents or credentials in diagnostics.
@@ -2835,6 +2834,21 @@ mod tests {
         assert!(is_context_overflow(&strata));
         assert_eq!(reported_prompt_tokens(&strata.message), Some(32848));
         assert_eq!(reported_context_tokens(&strata.message), Some(32768));
+
+        // Ollama phrases the same rejection differently — the parser must
+        // still recover both numbers or the learned-window retry budgets
+        // blind (observed live: `request (45012) exceeds the available
+        // context size (32768)`).
+        let ollama = LlmError {
+            kind: LlmErrorKind::BadRequest,
+            message:
+                "request (45012 tokens) exceeds the available context size (32768 tokens), try increasing it"
+                    .into(),
+            status: Some(400),
+        };
+        assert!(is_context_overflow(&ollama));
+        assert_eq!(reported_prompt_tokens(&ollama.message), Some(45012));
+        assert_eq!(reported_context_tokens(&ollama.message), Some(32768));
 
         let big = LlmError {
             kind: LlmErrorKind::PayloadTooLarge,
