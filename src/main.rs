@@ -333,8 +333,7 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                             .get("sessionId")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
-                                        if let Some(cancel) = state.turn_registry.lock()
-                                            .expect("turn registry lock").get(sid) {
+                                        if let Some(cancel) = state.lock_turn_registry().get(sid) {
                                             let _ = cancel.send(true);
                                         }
                                     }
@@ -418,7 +417,7 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                 }
                                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                                 {
-                                    let mut registry = state.turn_registry.lock().expect("turn registry lock");
+                                    let mut registry = state.lock_turn_registry();
                                     if registry.contains_key(&sid) {
                                         // Mid-turn steer (P3): the prompt
                                         // waits in the session's steer queue
@@ -475,9 +474,7 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                                     break;
                                                 }
                                                 let busy = state_w
-                                                    .turn_registry
-                                                    .lock()
-                                                    .expect("turn registry lock")
+                                                    .lock_turn_registry()
                                                     .contains_key(&sid_w);
                                                 if !busy {
                                                     break;
@@ -509,10 +506,8 @@ async fn run_acp_loop(mut state: Arc<AppState>) {
                                             let (cancel_tx, cancel_rx) =
                                                 tokio::sync::watch::channel(false);
                                             {
-                                                let mut registry = state_w
-                                                    .turn_registry
-                                                    .lock()
-                                                    .expect("turn registry lock");
+                                                let mut registry =
+                                                    state_w.lock_turn_registry();
                                                 let cap = state_w.config.max_inflight_turns;
                                                 if registry.contains_key(&sid_w)
                                                     || (cap > 0 && registry.len() >= cap)
@@ -825,11 +820,15 @@ async fn handle_acp_prompt(
     }
     impl Drop for TurnGuard<'_> {
         fn drop(&mut self) {
-            self.state
-                .turn_registry
-                .lock()
-                .expect("turn registry lock")
-                .remove(self.session_id);
+            // Poisoned-mutex recovery instead of `.expect()` — a panic
+            // inside Drop during unwinding aborts the whole process and
+            // silently drops every in-flight response; recovering the
+            // map only loses nothing.
+            let mut registry = match self.state.turn_registry.lock() {
+                Ok(r) => r,
+                Err(p) => p.into_inner(),
+            };
+            registry.remove(self.session_id);
         }
     }
     let guard = TurnGuard {

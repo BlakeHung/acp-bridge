@@ -365,6 +365,21 @@ impl AppState {
         }
     }
 
+    // ── Mutex locks with poison recovery ─────────────────────────────
+    // A panic while a guard is held poisons the mutex; unrecovered
+    // `.expect()` calls then cascade — killing the main loop and every
+    // in-flight request. The sessions RwLock already recovers the same
+    // way; these do too.
+    pub fn lock_turn_registry(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::watch::Sender<bool>>> {
+        self.turn_registry.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn lock_steer_queues(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<SteerItem>>> {
+        self.steer_queues.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     // ── Mid-turn steer (P3) ──────────────────────────────────────────
     /// Max queued steers per session — beyond this the requester gets
     /// the honest `turn_in_progress` error rather than an unbounded
@@ -376,7 +391,7 @@ impl AppState {
     /// queue is already full.
     pub fn push_steer(&self, session_id: &str, text: String, steerable: bool) -> Option<SteerItem> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let mut queues = self.steer_queues.lock().expect("steer queue lock");
+        let mut queues = self.lock_steer_queues();
         let q = queues.entry(session_id.to_string()).or_default();
         if q.len() >= Self::MAX_STEER_QUEUE {
             return None;
@@ -395,7 +410,7 @@ impl AppState {
     /// turn — they are removed and marked `applied` so their waiting
     /// requests know they were adopted.
     pub fn drain_steerable(&self, session_id: &str) -> Vec<SteerItem> {
-        let mut queues = self.steer_queues.lock().expect("steer queue lock");
+        let mut queues = self.lock_steer_queues();
         let Some(q) = queues.get_mut(session_id) else {
             return Vec::new();
         };
@@ -415,7 +430,7 @@ impl AppState {
     /// Drop a steer item by id — the waiter finished one way or the
     /// other (applied, or ran its own turn).
     pub fn remove_steer(&self, session_id: &str, id: u64) {
-        let mut queues = self.steer_queues.lock().expect("steer queue lock");
+        let mut queues = self.lock_steer_queues();
         if let Some(q) = queues.get_mut(session_id) {
             q.retain(|i| i.id != id);
             if q.is_empty() {
