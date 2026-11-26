@@ -699,6 +699,11 @@ pub struct LlmConfig {
     /// pointer-only once exhausted (per-item cap alone cannot bound
     ///// N results in one turn). `LLM_TURN_TOOL_CHARS`, default 16384.
     pub turn_tool_chars: usize,
+    /// How many image-bearing messages keep live payloads in history —
+    /// beyond this, older payloads are offloaded to an artifact pointer
+    /// so each turn doesn't reship megabytes of stale base64.
+    /// `LLM_IMAGE_HISTORY_MAX`, default 3.
+    pub image_history_max: usize,
     /// Global bound on concurrent in-flight turns across ALL sessions
     /// (G1a-Q2 queue items). Over the limit the prompt is refused with
     /// an identifiable `server_busy` status instead of queueing
@@ -787,6 +792,7 @@ impl LlmConfig {
             auto_summarize_at: summarize_threshold(None)?,
             artifact_inline_chars: env_parse("LLM_ARTIFACT_CHARS")?.unwrap_or(8192),
             turn_tool_chars: env_parse("LLM_TURN_TOOL_CHARS")?.unwrap_or(16384),
+            image_history_max: env_parse("LLM_IMAGE_HISTORY_MAX")?.unwrap_or(3),
             max_inflight_turns: env_parse("LLM_MAX_INFLIGHT")?.unwrap_or(8),
             max_prompt_chars: env_parse("LLM_MAX_PROMPT_CHARS")?.unwrap_or(200_000),
             client,
@@ -796,7 +802,18 @@ impl LlmConfig {
 
 #[derive(Debug)]
 pub enum StreamChunk {
+    /// Assistant text delta (display-live).
     Content(String),
+    /// Reasoning delta — Ollama `message.thinking`, OpenAI-compat
+    /// `delta.reasoning_content`. Clients render it separately from
+    /// `Content` so thought doesn't pollute the answer text.
+    Thought(String),
+    /// Terminal body shaped like the non-streaming response —
+    /// for Ollama the `done:true` object verbatim; for SSE a body
+    /// synthesized from accumulated deltas (content + tool_calls +
+    /// finish_reason + usage). Exactly one per stream; the first one
+    /// wins, everything after is ignored.
+    Final(Box<Value>),
     Error(String),
     Done,
 }
@@ -1245,15 +1262,52 @@ pub async fn stream_chat(
     config: &LlmConfig,
     messages: &[Value],
     model_override: Option<&str>,
+    tools: Option<&[Value]>,
 ) -> Result<mpsc::Receiver<StreamChunk>, LlmError> {
     let url = config.chat_url();
     let model = model_override.unwrap_or(&config.model);
     let is_native = config.is_ollama_native();
 
-    let body = build_body(config, messages, model, true, None);
+    let body = build_body(config, messages, model, true, tools);
     let response = send_with_retry(config, &url, &body, "stream_chat").await?;
 
     let (tx, rx) = mpsc::channel(256);
+
+    // Some servers ignore `stream:true` and answer with a plain JSON
+    // body (content-type application/json). Honor the interface anyway:
+    // parse it as the terminal body and emit it as a single Final —
+    // the consumer sees one terminal event, just without live deltas.
+    // Match `application/json` exactly — `application/x-ndjson` (Ollama
+    // native) and `text/event-stream` (SSE) are real streams.
+    let is_json = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("application/json"))
+        .unwrap_or(false);
+    if is_json {
+        tokio::spawn(async move {
+            match read_body_capped(response, MAX_RESPONSE_BODY_BYTES).await {
+                Ok((bytes, false)) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(body) => {
+                        let _ = tx.send(StreamChunk::Final(Box::new(body))).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(StreamChunk::Error(format!("JSON body parse failed: {e}")))
+                            .await;
+                    }
+                },
+                _ => {
+                    let _ = tx
+                        .send(StreamChunk::Error("JSON body read failed".into()))
+                        .await;
+                }
+            }
+            let _ = tx.send(StreamChunk::Done).await;
+        });
+        return Ok(rx);
+    }
 
     if is_native {
         tokio::spawn(parse_ollama_native_stream(response, tx));
@@ -1291,8 +1345,11 @@ async fn parse_ollama_native_stream(
                     }
 
                     if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
-                        // Check if done
+                        // The `done:true` line carries the terminal body
+                        // — full message (content/thinking/tool_calls) plus
+                        // duration and token counters — verbatim.
                         if parsed.get("done").and_then(|d| d.as_bool()) == Some(true) {
+                            let _ = tx.send(StreamChunk::Final(Box::new(parsed))).await;
                             let _ = tx.send(StreamChunk::Done).await;
                             return;
                         }
@@ -1305,6 +1362,18 @@ async fn parse_ollama_native_stream(
                         {
                             if !text.is_empty() {
                                 let _ = tx.send(StreamChunk::Content(text.to_string())).await;
+                            }
+                        }
+                        // Reasoning models stream `message.thinking`
+                        // alongside — separate from content so it can be
+                        // rendered as thought, not answer text.
+                        if let Some(thinking) = parsed
+                            .get("message")
+                            .and_then(|m| m.get("thinking"))
+                            .and_then(|c| c.as_str())
+                        {
+                            if !thinking.is_empty() {
+                                let _ = tx.send(StreamChunk::Thought(thinking.to_string())).await;
                             }
                         }
                     }
@@ -1329,6 +1398,13 @@ async fn parse_ollama_native_stream(
 /// Each line: "data: {json}" or "data: [DONE]"
 async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Sender<StreamChunk>) {
     let mut buffer = LineBuffer::default();
+    // OpenAI streams tool_calls as fragments keyed by `index`; `id` and
+    // `function.name` arrive once, `arguments` is a JSON text sliced
+    // across deltas — concatenate per index, never parse the fragment.
+    let mut content = String::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage: Option<Value> = None;
+    let mut tool_calls: std::collections::BTreeMap<u64, Value> = Default::default();
 
     loop {
         let chunk_result: Result<Option<bytes::Bytes>, reqwest::Error> = response.chunk().await;
@@ -1349,20 +1425,85 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
 
                     let data = &line[6..];
                     if data == "[DONE]" {
+                        // Synthesize the non-streaming body shape so the
+                        // caller's extract_* helpers work unchanged.
+                        let mut message = json!({"role": "assistant", "content": content});
+                        if !tool_calls.is_empty() {
+                            message["tool_calls"] =
+                                Value::Array(tool_calls.values().cloned().collect());
+                        }
+                        let mut body = json!({
+                            "choices": [{"index": 0, "message": message,
+                                         "finish_reason": finish_reason}]
+                        });
+                        if let Some(u) = usage.take() {
+                            body["usage"] = u;
+                        }
+                        let _ = tx.send(StreamChunk::Final(Box::new(body))).await;
                         let _ = tx.send(StreamChunk::Done).await;
                         return;
                     }
 
                     if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                        if let Some(text) = parsed
-                            .get("choices")
-                            .and_then(|c| c.get(0))
-                            .and_then(|c| c.get("delta"))
-                            .and_then(|d| d.get("content"))
-                            .and_then(|t| t.as_str())
+                        if let Some(u) = parsed.get("usage") {
+                            usage = Some(u.clone());
+                        }
+                        let choice = parsed.get("choices").and_then(|c| c.get(0));
+                        if let Some(fr) = choice
+                            .and_then(|c| c.get("finish_reason"))
+                            .and_then(|f| f.as_str())
                         {
-                            if !text.is_empty() {
-                                let _ = tx.send(StreamChunk::Content(text.to_string())).await;
+                            finish_reason = Some(fr.to_string());
+                        }
+                        let delta = choice.and_then(|c| c.get("delta"));
+                        if let Some(d) = delta {
+                            if let Some(text) = d.get("content").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    content.push_str(text);
+                                    let _ = tx.send(StreamChunk::Content(text.to_string())).await;
+                                }
+                            }
+                            // OpenAI-compat reasoning deltas — field name
+                            // varies by server (`reasoning_content`,
+                            // `reasoning`); accept both.
+                            let thought = d
+                                .get("reasoning_content")
+                                .or_else(|| d.get("reasoning"))
+                                .and_then(|t| t.as_str());
+                            if let Some(t) = thought {
+                                if !t.is_empty() {
+                                    let _ = tx.send(StreamChunk::Thought(t.to_string())).await;
+                                }
+                            }
+                            if let Some(tcs) = d.get("tool_calls").and_then(|t| t.as_array()) {
+                                for tc in tcs {
+                                    let index =
+                                        tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                                    let slot = tool_calls.entry(index).or_insert_with(|| {
+                                        json!({
+                                            "id": Value::Null, "type": "function",
+                                            "function": {"name": "", "arguments": ""}
+                                        })
+                                    });
+                                    if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                                        slot["id"] = Value::String(id.to_string());
+                                    }
+                                    if let Some(ty) = tc.get("type").and_then(|t| t.as_str()) {
+                                        slot["type"] = Value::String(ty.to_string());
+                                    }
+                                    if let Some(f) = tc.get("function") {
+                                        for key in ["name", "arguments"] {
+                                            if let Some(frag) = f.get(key).and_then(|v| v.as_str())
+                                            {
+                                                let cur = slot["function"][key]
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                slot["function"][key] = Value::String(cur + frag);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1381,6 +1522,54 @@ async fn parse_openai_sse_stream(mut response: reqwest::Response, tx: mpsc::Send
     }
 
     let _ = tx.send(StreamChunk::Done).await;
+}
+
+/// Drain a stream into the same `Value` shape `chat` returns, forwarding
+/// deltas to `on_delta` as they arrive (`is_thought` distinguishes
+/// reasoning from answer text). Terminal rules: the first `Final` wins;
+/// `Error` without a `Final` fails; a channel that closes without a
+/// terminal chunk is a truncated stream, never a silent success.
+pub async fn chat_streamed(
+    config: &LlmConfig,
+    messages: &[Value],
+    model_override: Option<&str>,
+    tools: Option<&[Value]>,
+    on_delta: &mut (dyn FnMut(&str, bool) + Send),
+) -> Result<Value, LlmError> {
+    let mut rx = stream_chat(config, messages, model_override, tools).await?;
+    let mut final_body: Option<Value> = None;
+    let mut stream_err: Option<String> = None;
+    let mut saw_done = false;
+    while let Some(chunk) = rx.recv().await {
+        match chunk {
+            StreamChunk::Content(t) => on_delta(&t, false),
+            StreamChunk::Thought(t) => on_delta(&t, true),
+            StreamChunk::Final(body) => {
+                final_body = Some(*body);
+            }
+            StreamChunk::Error(e) => {
+                stream_err = Some(e);
+            }
+            StreamChunk::Done => {
+                saw_done = true;
+                break;
+            }
+        }
+    }
+    match final_body {
+        Some(body) => Ok(body),
+        None => Err(LlmError {
+            kind: LlmErrorKind::ParseError,
+            message: stream_err.unwrap_or_else(|| {
+                if saw_done {
+                    "stream ended without a terminal body".into()
+                } else {
+                    "stream closed mid-response without a terminal body".into()
+                }
+            }),
+            status: None,
+        }),
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1518,6 +1707,7 @@ mod tests {
             auto_summarize_at: 0.6,
             artifact_inline_chars: 8192,
             turn_tool_chars: 16384,
+            image_history_max: 3,
             max_inflight_turns: 8,
             max_prompt_chars: 200_000,
             client: Client::builder()
@@ -1786,6 +1976,7 @@ mod tests {
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 StreamChunk::Content(c) => text.push_str(&c),
+                StreamChunk::Thought(_) | StreamChunk::Final(_) => {}
                 StreamChunk::Done => {
                     done = true;
                     break;
@@ -1820,7 +2011,7 @@ mod tests {
         }
         let url = serve(Router::new().route("/v1/chat/completions", post(sse))).await;
         let cfg = test_config(&format!("{url}/v1"));
-        let rx = stream_chat(&cfg, &[], None).await.unwrap();
+        let rx = stream_chat(&cfg, &[], None, None).await.unwrap();
         let (text, done) = collect_stream(rx).await;
         assert_eq!(text, "Hello world");
         assert!(done);
@@ -1848,7 +2039,7 @@ mod tests {
         // No /v1 suffix → Ollama native NDJSON parser.
         let url = serve(Router::new().route("/api/chat", post(ndjson))).await;
         let cfg = test_config(&url);
-        let rx = stream_chat(&cfg, &[], None).await.unwrap();
+        let rx = stream_chat(&cfg, &[], None, None).await.unwrap();
         let (text, done) = collect_stream(rx).await;
         assert_eq!(text, "foobar");
         assert!(done);
@@ -1893,7 +2084,7 @@ mod tests {
         }
         let url = serve(Router::new().route("/v1/chat/completions", post(bad))).await;
         let cfg = test_config(&format!("{url}/v1"));
-        let err = stream_chat(&cfg, &[], None).await.unwrap_err();
+        let err = stream_chat(&cfg, &[], None, None).await.unwrap_err();
         assert_eq!(err.kind, crate::llm::LlmErrorKind::Auth, "err was: {err}");
         assert!(err.message.contains("401"), "err was: {err}");
     }

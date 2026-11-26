@@ -339,6 +339,7 @@ mod tests {
             auto_summarize_at: 0.6,
             artifact_inline_chars: 8192,
             turn_tool_chars: 16384,
+            image_history_max: 3,
             max_inflight_turns: 8,
             max_prompt_chars: 200_000,
             client: reqwest::Client::builder()

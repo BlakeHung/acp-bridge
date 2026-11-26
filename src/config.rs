@@ -73,6 +73,12 @@ pub struct LlmSection {
     /// `LLM_TURN_TOOL_CHARS`.
     #[serde(default)]
     pub turn_tool_chars: Option<usize>,
+    /// How many image-bearing messages keep live payloads in history.
+    /// Older payloads are swapped for an artifact pointer so the
+    /// model knows the image isn't loaded. Mirrors
+    /// `LLM_IMAGE_HISTORY_MAX`.
+    #[serde(default)]
+    pub image_history_max: Option<usize>,
 }
 
 impl ConfigFile {
@@ -213,6 +219,9 @@ impl ConfigFile {
             turn_tool_chars: env_parse("LLM_TURN_TOOL_CHARS")?
                 .or(file.turn_tool_chars)
                 .unwrap_or(16384),
+            image_history_max: env_parse("LLM_IMAGE_HISTORY_MAX")?
+                .or(file.image_history_max)
+                .unwrap_or(3),
             max_inflight_turns: env_parse("LLM_MAX_INFLIGHT")?.unwrap_or(8),
             max_prompt_chars: env_parse("LLM_MAX_PROMPT_CHARS")?.unwrap_or(200_000),
             client,

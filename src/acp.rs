@@ -351,6 +351,20 @@ fn notify_thinking_v2(session_id: &str) {
     );
 }
 
+/// Dispatch a thought chunk carrying actual reasoning text — streamed
+/// deltas from reasoning-capable backends land here instead of in
+/// `agent_message_chunk`, so clients can render them as thought.
+pub fn notify_thought_for(version: ProtocolVersion, session_id: &str, text: &str) {
+    send_session_update(
+        session_id,
+        json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": text}
+        }),
+    );
+    let _ = version;
+}
+
 /// Dispatch a tool-call start notification.
 ///
 /// ACP v2 removed the `tool_call` sessionUpdate entirely. v2 Clients

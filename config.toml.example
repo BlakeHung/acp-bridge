@@ -41,6 +41,12 @@ summarize_at = 0.6
 # per-item cap (env LLM_TURN_TOOL_CHARS).
 # turn_tool_chars = 16384
 
+# How many image-bearing messages keep live payloads in history.
+# Older payloads are offloaded to a session artifact and replaced by
+# an explicit "image unloaded" marker, so the model knows the image
+# is no longer in context (env LLM_IMAGE_HISTORY_MAX).
+# image_history_max = 3
+
 # Maximum model↔tool round-trips in one prompt turn before the bounded
 # wrap-up path runs (env LLM_MAX_TOOL_ROUNDS, default 50)
 # max_tool_rounds = 50

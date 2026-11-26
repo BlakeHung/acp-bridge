@@ -201,6 +201,9 @@ pub enum Notification {
         status: String,
     },
     TextChunk(String),
+    /// Reasoning text delta — rendered by clients as agent_thought_chunk
+    /// with real content, not the empty `Thinking` marker.
+    ThoughtChunk(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +808,16 @@ pub async fn session_prompt(
             user_msg
         };
         session.messages.push(user_msg);
+        // Live image payloads cost an estimate AND a base64 reship on
+        // every backend call — keep only the newest N loaded and move
+        // older payloads to artifacts so the model keeps an explicit
+        // re-readable pointer instead of a silently dropped image.
+        cap_image_history(
+            session,
+            state.session_store.as_deref(),
+            session_id,
+            state.config.image_history_max,
+        );
     }
 
     // Durable turn-intent BEFORE the first side effect of this turn
@@ -916,7 +929,9 @@ pub async fn session_prompt(
             fit_and_call(state, session_id, messages, Some(&tool_defs), &notify).await;
 
         match chat_result {
-            Ok(response) => {
+            Ok(outcome) => {
+                let response = outcome.body;
+                let text_streamed = outcome.text_streamed;
                 evidence.record_backend_response(&response);
                 let mut tool_calls = backend.extract_tool_calls(&response);
                 // When tool calls were recovered from the content channel
@@ -952,7 +967,12 @@ pub async fn session_prompt(
                                         .push(json!({"role": "assistant", "content": &text}));
                                 }
                             }
-                            notify(Notification::TextChunk(text));
+                            // The streamed content already reached the
+                            // client delta-by-delta — re-notifying the
+                            // assembled text would show it twice.
+                            if !text_streamed {
+                                notify(Notification::TextChunk(text));
+                            }
                         }
                         break;
                     }
@@ -1228,7 +1248,8 @@ pub async fn session_prompt(
         };
         if let Some(messages) = messages {
             match fit_and_call(state, session_id, messages, None, &notify).await {
-                Ok(response) => {
+                Ok(outcome) => {
+                    let response = outcome.body;
                     let raw_text = state.config.backend().extract_response_text(&response);
                     let (clean_text, _) = llm::recover_tool_calls_from_content(&raw_text);
                     if !clean_text.trim().is_empty() {
@@ -1243,7 +1264,9 @@ pub async fn session_prompt(
                                     .push(json!({"role": "assistant", "content": &text}));
                             }
                         }
-                        notify(Notification::TextChunk(text.clone()));
+                        if !outcome.text_streamed {
+                            notify(Notification::TextChunk(text.clone()));
+                        }
                         final_text = text;
                         got_final_response = true;
                         truncated_by_budget = true;
@@ -1476,13 +1499,23 @@ async fn summarize_context(
     Some(kept)
 }
 
+/// Outcome of a fitted backend call. `text_streamed` marks whether the
+/// assistant's answer text was already forwarded to the client as live
+/// deltas — callers must not re-notify the same text post-hoc, or the
+/// user sees the reply twice (once streamed, once whole).
+#[derive(Debug)]
+pub struct FitOutcome {
+    pub body: Value,
+    pub text_streamed: bool,
+}
+
 async fn fit_and_call(
     state: &AppState,
     session_id: &str,
     messages: Vec<Value>,
     tools: Option<&[Value]>,
-    notify: &impl Fn(Notification),
-) -> Result<Value, crate::llm::LlmError> {
+    notify: &(impl Fn(Notification) + Sync),
+) -> Result<FitOutcome, crate::llm::LlmError> {
     let (scale, learned_window) = {
         let sessions = state.sessions_read();
         sessions
@@ -1588,7 +1621,29 @@ async fn fit_and_call(
         // `out_want` before `rejected` is stored below.
         let sent_out = out_want;
         config.max_tokens = Some(sent_out);
-        let result = crate::llm::chat(&config, &msgs, None, tools).await;
+        // Streamed call: reasoning deltas surface as thought chunks and
+        // answer text as live message chunks; the terminal body has the
+        // same shape `chat` returned, so the rest of the pipeline
+        // (extract_tool_calls, usage calibration, evidence) is unchanged.
+        // `content_streamed` suppresses the caller's post-hoc text notify
+        // only for the content channel — thought deltas never carry the
+        // final answer.
+        let content_streamed = std::sync::atomic::AtomicBool::new(false);
+        let result = crate::llm::chat_streamed(
+            &config,
+            &msgs,
+            None,
+            tools,
+            &mut |text: &str, is_thought: bool| {
+                if is_thought {
+                    notify(Notification::ThoughtChunk(text.to_string()));
+                } else {
+                    content_streamed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    notify(Notification::TextChunk(text.to_string()));
+                }
+            },
+        )
+        .await;
         match result {
             Ok(response) => {
                 let actual = response
@@ -1602,7 +1657,10 @@ async fn fit_and_call(
                     }
                     info!(session_id, estimated, actual, "context usage calibration");
                 }
-                return Ok(response);
+                return Ok(FitOutcome {
+                    body: response,
+                    text_streamed: content_streamed.load(std::sync::atomic::Ordering::Relaxed),
+                });
             }
             Err(error) => {
                 let overflow = is_context_overflow(&error);
@@ -1734,6 +1792,131 @@ fn offload_tool_output(
         path.display()
     ));
     t
+}
+
+/// Cap how many image payloads stay live in history. Every live image
+/// is re-sent to the backend on every request AND costs
+/// `IMAGE_CONTEXT_ESTIMATE_TOKENS` in the estimator — beyond the newest
+/// `max` image-bearing messages, payloads move to a session artifact
+/// and the message keeps an explicit "image unloaded" marker naming
+/// the re-readable path, never a silent deletion.
+fn cap_image_history(
+    session: &mut Session,
+    store: Option<&crate::session_store::SessionStore>,
+    session_id: &str,
+    max: usize,
+) {
+    let bearing: Vec<usize> = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| message_has_images(m))
+        .map(|(i, _)| i)
+        .collect();
+    let excess = bearing.len().saturating_sub(max);
+    for idx in bearing.into_iter().take(excess) {
+        let payloads = take_image_payloads(&mut session.messages[idx]);
+        if payloads.is_empty() {
+            continue;
+        }
+        let mut refs = Vec::with_capacity(payloads.len());
+        for (j, data) in payloads.iter().enumerate() {
+            let name = format!("image-m{idx}-{j}");
+            refs.push(
+                store
+                    .and_then(|s| s.write_artifact(session_id, &name, data))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<artifact unavailable>".to_string()),
+            );
+        }
+        append_image_marker(
+            &mut session.messages[idx],
+            &format!(
+                "[{} previous image(s) unloaded from context; original(s): {}]",
+                payloads.len(),
+                refs.join(", ")
+            ),
+        );
+        info!(
+            session_id,
+            index = idx,
+            count = payloads.len(),
+            "image payload(s) offloaded to artifact marker"
+        );
+    }
+}
+
+/// True when a history message carries live image payloads — Ollama
+/// `images[]` or OpenAI-style `content[].type == "image_url"` parts.
+fn message_has_images(m: &Value) -> bool {
+    m.get("images")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+        || m.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|p| p.get("type").and_then(Value::as_str) == Some("image_url"))
+            })
+}
+
+/// Remove live image payloads from a history message and return the
+/// base64 strings (Ollama `images[]`) or data URLs (OpenAI `image_url`
+/// parts) for artifacting. The message keeps its text content; the
+/// caller appends an unload marker so the model knows the image is
+/// no longer in context.
+fn take_image_payloads(m: &mut Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if m.get("images")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+    {
+        if let Some(images) = m
+            .get_mut("images")
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+        {
+            // Non-string entry (shouldn't happen) — serialize it so
+            // the artifact keeps the payload rather than losing it.
+            out.extend(images.into_iter().map(|i| {
+                i.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| i.to_string())
+            }));
+        }
+        if let Some(obj) = m.as_object_mut() {
+            obj.remove("images");
+        }
+    }
+    if let Some(arr) = m.get_mut("content").and_then(Value::as_array_mut) {
+        let mut kept = Vec::with_capacity(arr.len());
+        for part in std::mem::take(arr).into_iter() {
+            if part.get("type").and_then(Value::as_str) == Some("image_url") {
+                if let Some(url) = part.pointer("/image_url/url").and_then(Value::as_str) {
+                    out.push(url.to_string());
+                }
+            } else {
+                kept.push(part);
+            }
+        }
+        *arr = kept;
+    }
+    out
+}
+
+/// Attach an unload-marker to a message's text so the model is told
+/// the image is no longer loaded (both string and array content shapes).
+fn append_image_marker(m: &mut Value, marker: &str) {
+    match m.get_mut("content") {
+        Some(Value::String(s)) => {
+            s.push('\n');
+            s.push_str(marker);
+        }
+        Some(Value::Array(arr)) => arr.push(json!({"type": "text", "text": marker})),
+        _ => {
+            m["content"] = Value::String(marker.to_string());
+        }
+    }
 }
 
 /// Response budget for the next call: configured `LLM_MAX_TOKENS` or
@@ -2344,6 +2527,7 @@ mod tests {
             auto_summarize_at: 0.6,
             artifact_inline_chars: 8192,
             turn_tool_chars: 16384,
+            image_history_max: 3,
             max_inflight_turns: 8,
             max_prompt_chars: 200_000,
             client: reqwest::Client::builder()
@@ -2872,6 +3056,89 @@ mod tests {
         assert_eq!(error.status, Some(400));
         assert_eq!(calls.lock().unwrap().len(), 1);
         server.abort();
+    }
+
+    #[test]
+    fn image_history_cap_offloads_payloads_to_artifact_marker() {
+        use crate::session_store::SessionStore;
+        let dir = std::env::temp_dir().join(format!(
+            "acp-imgcap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SessionStore::new(dir).unwrap();
+        let mut session = crate::protocol::Session::new(
+            json!({"role":"system","content":"s"}),
+            std::path::PathBuf::from("/tmp"),
+            crate::protocol::ProtocolVersion::V1,
+        );
+        // Four image-bearing user messages (Ollama shape + one OpenAI
+        // shape) — cap is 2, so the two oldest lose their payloads.
+        let b64 = "QUJD".repeat(50_000);
+        session
+            .messages
+            .push(json!({"role":"user","content":"first","images":[b64.clone()]}));
+        session.messages.push(json!({"role":"user","content":[
+            {"type":"text","text":"second"},
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{b64}")}}
+        ]}));
+        session
+            .messages
+            .push(json!({"role":"user","content":"third","images":[b64.clone()]}));
+        session
+            .messages
+            .push(json!({"role":"user","content":"fourth","images":[b64]}));
+
+        cap_image_history(&mut session, Some(&store), "s1", 2);
+
+        // Oldest message: payload gone, marker names the artifact path.
+        let first = &session.messages[1];
+        assert!(first.get("images").is_none(), "payload must be removed");
+        let text = first["content"].as_str().unwrap();
+        assert!(text.contains("first"), "text content preserved");
+        assert!(
+            text.contains("unloaded") && text.contains(".txt"),
+            "marker must say the image is unloaded and name the path: {text}"
+        );
+        // The OpenAI-shape message also loses its image part but keeps text.
+        let second = &session.messages[2];
+        let parts = second["content"].as_array().unwrap();
+        assert!(!parts
+            .iter()
+            .any(|p| p["type"].as_str() == Some("image_url")));
+        assert!(parts
+            .iter()
+            .any(|p| p["text"].as_str().is_some_and(|t| t.contains("unloaded"))));
+        // Newest three keep live payloads.
+        assert!(message_has_images(&session.messages[3]));
+        assert!(message_has_images(&session.messages[4]));
+        // Artifact actually on disk and re-readable.
+        let artifact = store.artifact_dir("s1").unwrap().join("image-m1-0.txt");
+        assert!(artifact.exists(), "artifact must exist at {artifact:?}");
+    }
+
+    #[test]
+    fn image_history_cap_without_store_still_marks_unload() {
+        let mut session = crate::protocol::Session::new(
+            json!({"role":"system","content":"s"}),
+            std::path::PathBuf::from("/tmp"),
+            crate::protocol::ProtocolVersion::V1,
+        );
+        for n in 0..4 {
+            session
+                .messages
+                .push(json!({"role":"user","content":format!("img {n}"),"images":["QUJD"]}));
+        }
+        cap_image_history(&mut session, None, "s1", 3);
+        let first = &session.messages[1];
+        assert!(first.get("images").is_none());
+        let text = first["content"].as_str().unwrap();
+        assert!(text.contains("unloaded") && text.contains("artifact unavailable"));
+        assert!(message_has_images(&session.messages[2]));
+        assert!(message_has_images(&session.messages[4]));
     }
 
     #[test]

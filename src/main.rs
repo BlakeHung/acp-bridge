@@ -696,6 +696,7 @@ fn emit_prompt_notification(version: ProtocolVersion, session_id: &str, notif: N
             acp::notify_tool_done_for(version, session_id, &id, &name, &status)
         }
         Notification::TextChunk(text) => acp::notify_text_for(version, session_id, &text),
+        Notification::ThoughtChunk(text) => acp::notify_thought_for(version, session_id, &text),
     }
 }
 
