@@ -138,6 +138,185 @@ impl SessionStore {
         Self::safe_name(session_id).map(|n| self.dir.join(format!("{n}.turn")))
     }
 
+    fn journal_path(&self, session_id: &str) -> Option<PathBuf> {
+        Self::safe_name(session_id).map(|n| self.dir.join(format!("{n}.tools.jsonl")))
+    }
+
+    // ── Tool journal (P3) ────────────────────────────────────────────
+    // Append-only JSONL: one `start` record before dispatch, one `done`
+    // record after. A `start` without a matching `done`/`interrupted`
+    // means the process died (or the turn was aborted) mid-tool — the
+    // caller surfaces those as unknown side effects rather than
+    // guessing whether they ran.
+    /// Journal file is compacted when it grows past this many bytes:
+    /// the newest records survive, oldest drop off.
+    const MAX_JOURNAL_BYTES: u64 = 256_000;
+    /// Records kept on compaction.
+    const JOURNAL_KEEP: usize = 256;
+
+    fn journal_append(&self, session_id: &str, record: &serde_json::Value) {
+        let Some(path) = self.journal_path(session_id) else {
+            return;
+        };
+        use std::io::Write;
+        // Compaction check before append — bounded reads, and if the
+        // read itself fails we just append (a bloated journal is a
+        // disk-space issue, never a correctness one).
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > Self::MAX_JOURNAL_BYTES {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let lines: Vec<&str> = text.lines().collect();
+                    let keep_from = lines.len().saturating_sub(Self::JOURNAL_KEEP);
+                    if let Ok(mut f) = std::fs::File::create(&path) {
+                        for l in &lines[keep_from..] {
+                            let _ = writeln!(f, "{l}");
+                        }
+                    }
+                }
+            }
+        }
+        let mut line = record.to_string();
+        line.push('\n');
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(line.as_bytes()) {
+                    warn!(session_id, error = %e, "tool journal append failed");
+                }
+            }
+            Err(e) => warn!(session_id, error = %e, "tool journal open failed"),
+        }
+    }
+
+    fn journal_records(&self, session_id: &str) -> Vec<serde_json::Value> {
+        let Some(path) = self.journal_path(session_id) else {
+            return Vec::new();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// Record a tool dispatch BEFORE it executes. `args_head` is a
+    /// bounded dump of the arguments for post-mortem identification —
+    /// never the full args (paths, snippets only).
+    pub fn journal_tool_start(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        name: &str,
+        args: &serde_json::Value,
+    ) {
+        let mut head = args.to_string();
+        crate::tools::truncate_utf8(&mut head, 240);
+        self.journal_append(
+            session_id,
+            &serde_json::json!({
+                "k": "start", "call_id": call_id, "name": name, "args": head,
+                "ts": Self::now_secs()
+            }),
+        );
+    }
+
+    /// Record completion. `result_head` lets a deduplicated replay
+    /// return *something* without re-executing side effects.
+    pub fn journal_tool_done(&self, session_id: &str, call_id: &str, ok: bool, result_text: &str) {
+        let mut head = result_text.to_string();
+        crate::tools::truncate_utf8(&mut head, 400);
+        self.journal_append(
+            session_id,
+            &serde_json::json!({
+                "k": "done", "call_id": call_id, "ok": ok, "result_head": head,
+                "ts": Self::now_secs()
+            }),
+        );
+    }
+
+    /// Mark a call `interrupted` at reconciliation — the start record
+    /// stays but is no longer "unclosed", so reconciliation is once-only.
+    pub fn journal_mark_interrupted(&self, session_id: &str, call_id: &str) {
+        self.journal_append(
+            session_id,
+            &serde_json::json!({
+                "k": "interrupted", "call_id": call_id, "ts": Self::now_secs()
+            }),
+        );
+    }
+
+    /// The completed record for a call whose LATEST `start` matches
+    /// `call_id` + `name` + args head, closed by a `done` recorded
+    /// AFTER it. Name/args live on the `start` record; matching all
+    /// three plus positional pairing matters because models recycle
+    /// call ids (`call_0` every round) — an id-only match would
+    /// replay a completely different call's outcome.
+    pub fn journal_lookup_done(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let mut head = args.to_string();
+        crate::tools::truncate_utf8(&mut head, 240);
+        let records = self.journal_records(session_id);
+        // The LAST start for this id defines what the current call is —
+        // if it doesn't match, the id was recycled for another tool.
+        let last_start = records.iter().rposition(|r| {
+            r.get("k").and_then(serde_json::Value::as_str) == Some("start")
+                && r.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
+        })?;
+        let s = &records[last_start];
+        let matches = s.get("name").and_then(serde_json::Value::as_str) == Some(name)
+            && s.get("args").and_then(serde_json::Value::as_str) == Some(head.as_str());
+        if !matches {
+            return None;
+        }
+        records[last_start + 1..]
+            .iter()
+            .find(|r| {
+                r.get("k").and_then(serde_json::Value::as_str) == Some("done")
+                    && r.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
+            })
+            .cloned()
+    }
+
+    /// Starts with no matching `done`/`interrupted` AFTER them — calls
+    /// that were in flight when the process or turn died. Positional
+    /// pairing: a `done` only closes the start records that precede it.
+    pub fn journal_unclosed(&self, session_id: &str) -> Vec<serde_json::Value> {
+        let records = self.journal_records(session_id);
+        let mut unclosed = Vec::new();
+        for (i, r) in records.iter().enumerate() {
+            if r.get("k").and_then(serde_json::Value::as_str) != Some("start") {
+                continue;
+            }
+            let id = r.get("call_id").and_then(serde_json::Value::as_str).unwrap_or("");
+            let closed = records[i + 1..].iter().any(|d| {
+                matches!(
+                    d.get("k").and_then(serde_json::Value::as_str),
+                    Some("done") | Some("interrupted")
+                ) && d.get("call_id").and_then(serde_json::Value::as_str) == Some(id)
+            });
+            if !closed {
+                unclosed.push(r.clone());
+            }
+        }
+        unclosed
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     fn store_lock_path(&self) -> PathBuf {
         self.dir.join("store.lock")
     }
@@ -1037,6 +1216,60 @@ mod tests {
             .is_none());
         // Hostile call ids sanitize, hostile session ids refuse.
         assert!(store.write_artifact("../escape", "c", "x").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_journal_roundtrip_unclosed_and_dedup() {
+        let (store, dir) = temp_store("journal");
+        let args = serde_json::json!({"path": "src/main.rs"});
+        // call-1 completes; call-2 starts but never finishes.
+        store.journal_tool_start("s1", "call-1", "read_file", &args);
+        store.journal_tool_done("s1", "call-1", true, "file contents");
+        store.journal_tool_start("s1", "call-2", "bash", &serde_json::json!({"cmd":"ls"}));
+
+        // dedup: all three fields must match — same call_id with a
+        // different tool/args is a recycled id, NOT a replay.
+        assert!(store
+            .journal_lookup_done("s1", "call-1", "read_file", &args)
+            .is_some());
+        assert!(store
+            .journal_lookup_done("s1", "call-1", "bash", &args)
+            .is_none());
+        assert!(store
+            .journal_lookup_done(
+                "s1",
+                "call-1",
+                "read_file",
+                &serde_json::json!({"path":"x"})
+            )
+            .is_none());
+
+        // unclosed = the in-flight call only; done calls don't appear.
+        let unclosed = store.journal_unclosed("s1");
+        assert_eq!(unclosed.len(), 1);
+        assert_eq!(unclosed[0]["call_id"].as_str().unwrap(), "call-2");
+
+        // Recycled call_id: after call-1's done, a `start` for the
+        // same id but a DIFFERENT tool is a new call — it must not
+        // dedup against call-1's outcome and it must appear unclosed.
+        store.journal_tool_start("s1", "call-1", "write_file", &serde_json::json!({"path":"y"}));
+        assert!(store
+            .journal_lookup_done("s1", "call-1", "write_file", &serde_json::json!({"path":"y"}))
+            .is_none());
+        let unclosed = store.journal_unclosed("s1");
+        assert_eq!(unclosed.len(), 2);
+        // But a replay of call-1's ORIGINAL call still dedups — the
+        // last start for the id belongs to write_file now, so this
+        // check is positional: it correctly does NOT match anymore.
+        assert!(store
+            .journal_lookup_done("s1", "call-1", "read_file", &args)
+            .is_none());
+
+        // Reconciliation marks it interrupted → unclosed once-only.
+        store.journal_mark_interrupted("s1", "call-2");
+        store.journal_mark_interrupted("s1", "call-1");
+        assert!(store.journal_unclosed("s1").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

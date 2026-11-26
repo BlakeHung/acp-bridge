@@ -60,7 +60,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    fn ok(text: String) -> Self {
+    pub(crate) fn ok(text: String) -> Self {
         Self {
             text,
             exit_code: None,

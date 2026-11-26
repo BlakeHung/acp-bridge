@@ -844,6 +844,44 @@ pub async fn session_prompt(
         }
     }
 
+    // Tool-journal reconciliation (P3): `start` records with no
+    // `done`/`interrupted` are calls that were in flight when the
+    // process or turn died. Mark them interrupted and put a note in
+    // history naming exactly which calls' side effects are
+    // unverifiable — never silently replayed or claimed complete.
+    if let Some(store) = state.session_store.as_deref() {
+        let unclosed = store.journal_unclosed(session_id);
+        if !unclosed.is_empty() {
+            let mut names = Vec::with_capacity(unclosed.len());
+            for rec in &unclosed {
+                if let Some(id) = rec.get("call_id").and_then(Value::as_str) {
+                    store.journal_mark_interrupted(session_id, id);
+                    let name = rec.get("name").and_then(Value::as_str).unwrap_or("?");
+                    names.push(format!("{name}(`{id}`)"));
+                }
+            }
+            let note = format!(
+                "[bridge: {} earlier tool call(s) never reached a recorded outcome — their side effects are unverified: {}]",
+                names.len(),
+                names.join(", ")
+            );
+            {
+                let mut sessions = state.sessions_write();
+                if let Some(session) = sessions.get_mut(session_id) {
+                    session
+                        .messages
+                        .push(json!({"role": "assistant", "content": &note}));
+                }
+            }
+            notify(Notification::TextChunk(note));
+            info!(
+                session_id,
+                count = names.len(),
+                "reconciled interrupted tool journal entries"
+            );
+        }
+    }
+
     let mut dropped_image_note: Option<String> = None;
     if images_dropped {
         let note = "[note: image content was removed before sending — this endpoint was configured with image support disabled (LLM_SUPPORTS_IMAGE=false).]";
@@ -1054,11 +1092,42 @@ pub async fn session_prompt(
                         .session_store
                         .as_ref()
                         .and_then(|s| s.artifact_dir(session_id));
-                    let result = if let Some(pid) = &permit_id {
+                    // Persistent dedup (P3): same call_id + name + args
+                    // already journaled as done → replay the recorded
+                    // outcome; the side effects already happened and
+                    // must not re-run. All three fields must match —
+                    // models recycle call ids across turns.
+                    let prior_done = state
+                        .session_store
+                        .as_deref()
+                        .and_then(|s| s.journal_lookup_done(session_id, tool_call_id, name, &args));
+                    let result = if let Some(prev) = &prior_done {
+                        let ok = prev.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        let head = prev
+                            .get("result_head")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        notify(Notification::TextChunk(format!(
+                            "\n\n*[journal] `{tool_call_id}` already completed — replaying recorded outcome, side effects not re-run*"
+                        )));
+                        if ok {
+                            tools::ToolResult::ok(format!(
+                                "[deduplicated — call already completed]\n{head}"
+                            ))
+                        } else {
+                            tools::ToolResult::err(
+                                tools::ToolErrorKind::ExecFailed,
+                                format!("[deduplicated — call previously failed] {head}"),
+                            )
+                        }
+                    } else if let Some(pid) = &permit_id {
                         notify(Notification::TextChunk(format!(
                             "\n\n*[policy:permit] consumed {pid} — '{name}' authorized for this call only*"
                         )));
-                        tools::execute_tool(
+                        journaled_execute(
+                            state.session_store.as_deref(),
+                            session_id,
+                            tool_call_id,
                             &working_dir,
                             name,
                             &args,
@@ -1079,7 +1148,10 @@ pub async fn session_prompt(
                                         "\n\n*[policy:audit] {reason} — proceeding (logged; no interactive permission channel configured)*"
                                     )));
                                 }
-                                tools::execute_tool(
+                                journaled_execute(
+                                    state.session_store.as_deref(),
+                                    session_id,
+                                    tool_call_id,
                                     &working_dir,
                                     name,
                                     &args,
@@ -1792,6 +1864,39 @@ fn offload_tool_output(
         path.display()
     ));
     t
+}
+
+/// Execute a tool with journal records around it (P3): `start` before
+/// dispatch, `done` after — so a process/turn dying mid-tool leaves a
+/// provable "was in flight" mark instead of an unknowable gap.
+#[allow(clippy::too_many_arguments)]
+async fn journaled_execute(
+    store: Option<&crate::session_store::SessionStore>,
+    session_id: &str,
+    call_id: &str,
+    working_dir: &std::path::Path,
+    name: &str,
+    args: &Value,
+    timeout_secs: u64,
+    deny_globs: &[String],
+    artifact_root: Option<&std::path::Path>,
+) -> tools::ToolResult {
+    if let Some(s) = store {
+        s.journal_tool_start(session_id, call_id, name, args);
+    }
+    let r = tools::execute_tool(
+        working_dir,
+        name,
+        args,
+        timeout_secs,
+        deny_globs,
+        artifact_root,
+    )
+    .await;
+    if let Some(s) = store {
+        s.journal_tool_done(session_id, call_id, r.error_kind.is_none(), &r.text);
+    }
+    r
 }
 
 /// Cap how many image payloads stay live in history. Every live image
