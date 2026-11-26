@@ -488,7 +488,7 @@ pub async fn execute_tool(
         }
         "web_fetch" => {
             let url = arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            execute_web_fetch(url, timeout_secs).await
+            execute_web_fetch(url, timeout_secs, artifact_root).await
         }
         "git_status" => {
             execute_git(
@@ -1606,16 +1606,61 @@ fn web_fetch_allowed_hosts() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Persist a fetch as a session source record (P3): the reduced body
+/// plus fetch metadata under the session artifact dir, so a fetched
+/// page is citable by path instead of existing only inside a tool
+/// result that later turns may elide.
+fn write_source_record(
+    artifact_root: Option<&Path>,
+    url: &str,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    truncated: bool,
+) -> Option<String> {
+    let root = artifact_root?;
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .unwrap_or_else(|| "unknown".into());
+    let safe_host: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = root.join(format!("source-{safe_host}-{ts}.json"));
+    let record = serde_json::json!({
+        "url": url,
+        "host": host,
+        "status": status,
+        "contentType": content_type,
+        "truncated": truncated,
+        "fetchedAt": ts,
+        "body": body,
+    });
+    std::fs::write(&path, record.to_string())
+        .ok()
+        .map(|_| path.display().to_string())
+}
+
 /// Fetch `url` and return the body as text. HTML responses get a light
 /// reduction (script/style stripped, tags removed, whitespace
 /// collapsed) so the model sees readable content; everything else is
 /// passed through (text/plain, application/json, …).
-///
-/// The body is read in chunks with a hard cap enforced *during* the
-/// download — a slow or oversized response stops feeding memory at
-/// [`MAX_WEB_BODY_BYTES`], keeps the bounded prefix, and flags
-/// `truncated` so the model knows it saw a partial document.
-async fn execute_web_fetch(url: &str, timeout_secs: u64) -> ToolResult {
+async fn execute_web_fetch(
+    url: &str,
+    timeout_secs: u64,
+    artifact_root: Option<&Path>,
+) -> ToolResult {
     if url.is_empty() {
         return ToolResult::err(
             ToolErrorKind::InvalidArgs,
@@ -1774,12 +1819,28 @@ async fn execute_web_fetch(url: &str, timeout_secs: u64) -> ToolResult {
         String::from_utf8_lossy(&bytes).to_string()
     };
 
+    // P3: the fetched page gets a durable source record under the
+    // session artifact dir — the model cites the path and a later
+    // turn can re-read it even after the inline tool result elides.
+    let source_path = write_source_record(
+        artifact_root,
+        url,
+        status.as_u16(),
+        &content_type,
+        &body,
+        body_truncated,
+    );
+
     let mut out = format!(
-        "HTTP {} {}\nContent-Type: {}\n\n",
+        "HTTP {} {}\nContent-Type: {}\n",
         status.as_u16(),
         status.canonical_reason().unwrap_or(""),
         content_type
     );
+    if let Some(p) = &source_path {
+        out.push_str(&format!("Source record: {p}\n"));
+    }
+    out.push('\n');
     if body_truncated {
         out.push_str("[note: body truncated at 5 MB during download]\n\n");
     }
@@ -2239,7 +2300,7 @@ mod tests {
     async fn web_fetch_blocks_when_allowlist_empty() {
         // Default: no allowlist → every request is blocked.
         std::env::remove_var("LLM_WEB_ALLOWLIST");
-        let result = execute_web_fetch("https://example.com/", 30).await;
+        let result = execute_web_fetch("https://example.com/", 30, None).await;
         assert!(
             result.text.contains("LLM_WEB_ALLOWLIST"),
             "expected empty-allowlist block message, got: {}",
@@ -2251,9 +2312,35 @@ mod tests {
     #[tokio::test]
     async fn web_fetch_rejects_non_http_schemes() {
         std::env::set_var("LLM_WEB_ALLOWLIST", "example.com");
-        let result = execute_web_fetch("file:///etc/passwd", 30).await;
+        let result = execute_web_fetch("file:///etc/passwd", 30, None).await;
         assert!(result.text.contains("not allowed"), "got: {}", result.text);
         std::env::remove_var("LLM_WEB_ALLOWLIST");
+    }
+
+    #[test]
+    fn source_record_written_under_artifact_root() {
+        let dir = tmpwd().join("art");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_source_record(
+            Some(dir.as_path()),
+            "https://docs.example.com/page",
+            200,
+            "text/html",
+            "reduced body text",
+            false,
+        )
+        .expect("record written");
+        let p = std::path::PathBuf::from(&path);
+        assert!(p.starts_with(&dir), "record outside artifact root: {path}");
+        let rec: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(
+            rec["url"].as_str().unwrap(),
+            "https://docs.example.com/page"
+        );
+        assert_eq!(rec["body"].as_str().unwrap(), "reduced body text");
+        // No artifact root → no record, no crash.
+        assert!(write_source_record(None, "https://x.com/", 200, "t", "b", false).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

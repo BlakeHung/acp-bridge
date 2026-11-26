@@ -374,12 +374,7 @@ impl AppState {
     /// Enqueue a prompt that arrived mid-turn. `steerable` = text-only
     /// (image prompts must wait for a full turn). `None` when the
     /// queue is already full.
-    pub fn push_steer(
-        &self,
-        session_id: &str,
-        text: String,
-        steerable: bool,
-    ) -> Option<SteerItem> {
+    pub fn push_steer(&self, session_id: &str, text: String, steerable: bool) -> Option<SteerItem> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut queues = self.steer_queues.lock().expect("steer queue lock");
         let q = queues.entry(session_id.to_string()).or_default();
@@ -1015,6 +1010,12 @@ pub async fn session_prompt(
     let tool_failure_streak = state.config.tool_failure_streak;
     let turn_start = std::time::Instant::now();
     let mut evidence = TurnEvidence::default();
+    // GPU residency snapshot (P3): which models the backend is
+    // actually serving right now — evidence, not admission (the
+    // in-flight bound is the admission gate).
+    if state.config.backend() == llm::Backend::Ollama {
+        evidence.backend_models = llm::query_running_models(&state.config).await;
+    }
     // Consecutive identical failures (same tool + args + error). A model
     // re-issuing a failing call verbatim is looping, not working.
     let mut fail_key: Option<String> = None;
@@ -2355,6 +2356,12 @@ pub struct TurnEvidence {
     /// Queued prompts injected mid-turn via the steer queue.
     #[serde(default)]
     pub steers_applied: u32,
+    /// Models resident on the backend at turn time (`/api/ps`,
+    /// Ollama native only) — proof of what the GPU was actually
+    /// serving during this turn. Absent for OpenAI-compatible
+    /// backends and on probe failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_models: Option<Vec<String>>,
     /// Backend-reported phase timings summed across rounds. Only
     /// populated when the backend reports them (Ollama native carries
     /// `load`/`prompt_eval`/`eval` durations in the response; OpenAI-
